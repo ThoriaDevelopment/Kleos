@@ -149,6 +149,14 @@ cython_debug/
 *.db-wal
 *.db.bak
 
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Installer output
+Kleos-Setup.exe
+
 # OS files
 .DS_Store
 Thumbs.db
