@@ -89,7 +89,16 @@ Section Uninstall
   kleos_found:
 
   ; Remove installed files
-  RMDir /r "$INSTDIR\_internal"
+  ; Only delete _internal if it actually looks like a PyInstaller bundle
+  ; (base_library.zip is always present in PyInstaller one-dir builds).
+  ; This prevents wiping an unrelated _internal folder the user may have.
+  IfFileExists "$INSTDIR\_internal\base_library.zip" safe_internal
+    DetailPrint "_internal does not look like a Kleos bundle — skipping."
+    Goto skip_internal
+  safe_internal:
+    RMDir /r "$INSTDIR\_internal"
+  skip_internal:
+
   Delete "$INSTDIR\Kleos.exe"
   Delete "$INSTDIR\uninst.exe"
   RMDir "$INSTDIR"
