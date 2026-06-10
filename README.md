@@ -99,16 +99,12 @@ Key design goals:
 
 ## Installation
 
-### Installer (Planned)
-A Windows installer will be distributed via GitHub Releases.
+### Installer (Recommended)
+Download **`Kleos-Setup.exe`** from the [GitHub Releases](https://github.com/ThoriaDevelopment/Kleos/releases) page and run it. The wizard installs the app to `C:\Program Files\Kleos`, creates Start Menu and Desktop shortcuts, and registers it in Windows Add/Remove Programs. No Python or other dependencies are required.
 
-### Prerequisites (Source)
-- Python 3.12 or newer
-- `pip`
+> **Uninstalling:** The uninstaller removes the application files, shortcuts, and the `%APPDATA%\.kleos` user data folder (databases, cache, and backups).
 
----
-
-## Running from Source
+### Running from Source
 
 1. Clone the repository.
 2. Install dependencies:

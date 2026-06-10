@@ -28,7 +28,14 @@
 ## Getting the App
 
 ### Option 1: Installer (Recommended)
-The easiest way to start using Kleos is to download the installer from the **Releases** page on GitHub. Run the installer and open the app from your Start Menu or desktop shortcut.
+The easiest way to start using Kleos is to download the installer from the **Releases** page on GitHub.
+
+1. Look for the file named **`Kleos-Setup.exe`** and download it.
+2. Double-click the file to run the installer.
+3. Follow the steps in the setup wizard (you can leave the install location as the default).
+4. Once finished, you can open Kleos from your **Start Menu** or the **Desktop shortcut** that was created.
+
+> **Tip:** If you ever want to remove Kleos, you can uninstall it like any other Windows app through *Settings → Apps*.
 
 ### Option 2: Running from Source
 If you prefer, you can also run Kleos directly from the source code. This requires Python to be installed on your computer. You can find the source code on the GitHub repository.
