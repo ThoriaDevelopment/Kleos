@@ -80,11 +80,21 @@ SectionEnd
 ; Uninstaller Section
 ; -------------------------------------------------------------------------
 Section Uninstall
+  ; Safety guard: only delete files if this directory actually contains Kleos.
+  ; This prevents accidental deletion if the install directory was changed
+  ; or if the registry points somewhere unexpected.
+  IfFileExists "$INSTDIR\Kleos.exe" kleos_found
+    DetailPrint "Kleos not found in $INSTDIR — skipping file removal."
+    Goto kleos_files_done
+  kleos_found:
+
   ; Remove installed files
   RMDir /r "$INSTDIR\_internal"
   Delete "$INSTDIR\Kleos.exe"
   Delete "$INSTDIR\uninst.exe"
   RMDir "$INSTDIR"
+
+  kleos_files_done:
 
   ; Remove shortcuts
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
