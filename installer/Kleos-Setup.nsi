@@ -92,6 +92,9 @@ Section Uninstall
   RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
 
+  ; Remove user data (databases, cache, thumbnails, backups)
+  RMDir /r "$APPDATA\.kleos"
+
   ; Remove registry entries
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
   DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"
