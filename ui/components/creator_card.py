@@ -427,7 +427,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._review_dot.setVisible(visible)
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self)
-        menu.setStyleSheet(f'QMenu { background-color: #1C1C22; border: 1px solid #3A3A3A; }QMenu::item { color: #E0E0E0; padding: 6px 20px; }QMenu::item:selected { background-color: #2A2A33; color: #FFFFFF; }')
+        menu.setStyleSheet('QMenu { background-color: #1C1C22; border: 1px solid #3A3A3A; }QMenu::item { color: #E0E0E0; padding: 6px 20px; }QMenu::item:selected { background-color: #2A2A33; color: #FFFFFF; }')
         edit_nick = QAction('Edit Nickname', self)
         edit_nick.triggered.connect(lambda: self.edit_requested.emit(self._creator['id'], 'nickname', self._creator.get('nickname', '')))
         menu.addAction(edit_nick)
