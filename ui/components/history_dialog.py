@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Callable
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import QCheckBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget
@@ -465,26 +464,6 @@ keeping the UI responsive even with 1000+ videos.
                 widget.deleteLater()
         self._rows.clear()
         self._all_media = self._db.get_media(creator_id=self._creator['id'])
-        # Recover any thumbnails whose files are missing from disk by
-        # re-downloading them from the stored thumbnail_url.
-        needs_db_update = False
-        for m in self._all_media:
-            path = m.get('thumbnail_path', '')
-            if path and not (Path(path).exists() and Path(path).stat().st_size > 0):
-                url = m.get('thumbnail_url', '')
-                if url:
-                    new_path = ensure_thumbnail(url)
-                    if new_path:
-                        m['thumbnail_path'] = new_path
-                        needs_db_update = True
-                    else:
-                        m['thumbnail_path'] = ''
-                        needs_db_update = True
-                else:
-                    m['thumbnail_path'] = ''
-                    needs_db_update = True
-        if needs_db_update:
-            self._db.upsert_media_batch(self._all_media)
         self._rendered_count = 0
         self._list_container.blockSignals(True)
         self._scroll.blockSignals(True)
