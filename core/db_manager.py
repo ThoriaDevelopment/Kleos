@@ -1,29 +1,71 @@
 from __future__ import annotations
 import json
 import logging
+import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from .paths import BACKUPS_DIR, STORAGE_DIR
+from .paths import BACKUPS_DIR, GLOBAL_SETTINGS_PATH, STORAGE_DIR
 
 logger = logging.getLogger(__name__)
 MAX_BACKUPS = 3
-_BACKUP_DEBOUNCE_S = 5.0
+_BACKUP_DEBOUNCE_S = 60.0
+
+_GLOBAL_LOCK = threading.Lock()
+_GLOBAL_DEFAULTS: dict[str, str] = {'last_profile': 'default', 'api_keys_json': '{}', 'first_run_complete': ''}
+
+
+def _read_global_settings() -> dict[str, str]:
+    """Read global_settings.json, returning defaults if the file is missing."""
+    if GLOBAL_SETTINGS_PATH.exists():
+        try:
+            with open(GLOBAL_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {**_GLOBAL_DEFAULTS, **data}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return dict(_GLOBAL_DEFAULTS)
+
+
+def _write_global_settings(settings: dict[str, str]) -> None:
+    """Write global_settings.json atomically via temp file + os.replace."""
+    GLOBAL_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(GLOBAL_SETTINGS_PATH.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, str(GLOBAL_SETTINGS_PATH))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 _SCHEMA = '\nCREATE TABLE IF NOT EXISTS settings (\n    key     TEXT PRIMARY KEY,\n    value   TEXT NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS roles (\n    id          INTEGER PRIMARY KEY AUTOINCREMENT,\n    role_name   TEXT    NOT NULL UNIQUE,\n    role_color  TEXT    NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS creators (\n    id            INTEGER PRIMARY KEY AUTOINCREMENT,\n    nickname      TEXT    NOT NULL,\n    platforms     TEXT    NOT NULL DEFAULT \'[]\',\n    role_id       INTEGER NOT NULL,\n    youtube_type  TEXT,\n    youtube_channel_id TEXT,\n    youtube_link  TEXT,\n    twitch_link   TEXT,\n    pfp_url       TEXT,\n    date_added       TEXT    NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')),\n    is_new_activity  INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE RESTRICT\n);\n\nCREATE TABLE IF NOT EXISTS media_content (\n    id              INTEGER PRIMARY KEY AUTOINCREMENT,\n    creator_id      INTEGER NOT NULL,\n    platform        TEXT    NOT NULL CHECK(platform IN (\'youtube\', \'twitch\')),\n    content_id      TEXT    NOT NULL UNIQUE,\n    title           TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_path  TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_url   TEXT    NOT NULL DEFAULT \'\',\n    upload_date     TEXT    NOT NULL DEFAULT \'\',\n    view_count      INTEGER NOT NULL DEFAULT 0,\n    is_verified     INTEGER NOT NULL DEFAULT 0,\n    is_short        INTEGER NOT NULL DEFAULT 0,\n    description     TEXT    NOT NULL DEFAULT \'\',\n    FOREIGN KEY (creator_id) REFERENCES creators(id) ON DELETE CASCADE\n);\n\nCREATE INDEX IF NOT EXISTS idx_media_creator  ON media_content(creator_id);\nCREATE INDEX IF NOT EXISTS idx_media_platform  ON media_content(platform);\nCREATE INDEX IF NOT EXISTS idx_content_id      ON media_content(content_id);\n'
-_DEFAULT_SETTINGS = {'api_keys_json': '{}', 'current_profile': 'default', 'community_description': '', 'auto_verify_model': 'claude-haiku-4-5', 'fetch_video_limit': '50', 'thumbnail_quality': 'low'}
+_SCHEMA_VERSION = 3  # Increment when adding new migrations
+
+# Migrate old invalid Anthropic model IDs to valid API identifiers.
+_MODEL_ID_MIGRATION = {
+    'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+}
+
+_DEFAULT_SETTINGS = {'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'fetch_video_limit': '50', 'thumbnail_quality': 'low'}
 class DatabaseManager:
     """Thread-safe SQLite manager with profile switching and auto-backup."""
-    last_fetch_time: float = 0.0
     def __init__(self, profile: str='default') -> None:
         self._lock = threading.Lock()
         self._conn = None
         self._profile = ''
         self._last_backup_time = 0.0
+        self._last_fetch_time = 0.0
         self.switch_profile(profile)
+        self._migrate_api_keys_to_global()
     def _connect(self, db_path: Path) -> sqlite3.Connection:
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -31,7 +73,37 @@ class DatabaseManager:
         conn.execute('PRAGMA foreign_keys=ON')
         return conn
     def _init_schema(self, conn: sqlite3.Connection) -> None:
+        """Create tables and apply schema migrations atomically.
+
+        Uses PRAGMA user_version to track which migrations have been applied.
+        Column-existence ALTER TABLE guards are retained as a safety net for
+        databases created before version tracking was introduced.
+        """
         conn.executescript(_SCHEMA)
+
+        # Insert default settings that don't yet exist.
+        for key, value in _DEFAULT_SETTINGS.items():
+            conn.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
+        conn.commit()
+
+        # Apply versioned migrations.  Each migration runs inside an
+        # explicit transaction; if it fails, the transaction is rolled
+        # back and further migrations are skipped.
+        current_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        if current_version < _SCHEMA_VERSION:
+            for target_version in range(current_version + 1, _SCHEMA_VERSION + 1):
+                try:
+                    conn.execute('BEGIN')
+                    self._apply_migration(conn, target_version)
+                    conn.execute(f'PRAGMA user_version = {target_version}')
+                    conn.execute('COMMIT')
+                except sqlite3.Error as exc:
+                    conn.execute('ROLLBACK')
+                    logger.warning('Schema migration to v%d failed: %s', target_version, exc)
+                    break
+
+        # Column-existence guards: these are idempotent safety nets for
+        # databases created before PRAGMA user_version was introduced.
         cols = [row['name'] for row in conn.execute('PRAGMA table_info(creators)')]
         if 'youtube_type' not in cols:
             conn.execute('ALTER TABLE creators ADD COLUMN youtube_type TEXT')
@@ -45,6 +117,8 @@ class DatabaseManager:
             conn.execute('ALTER TABLE creators ADD COLUMN pfp_url TEXT')
         if 'twitch_link' not in cols:
             conn.execute('ALTER TABLE creators ADD COLUMN twitch_link TEXT')
+        if 'notes' not in cols:
+            conn.execute("ALTER TABLE creators ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
         media_cols = [row['name'] for row in conn.execute('PRAGMA table_info(media_content)')]
         if 'is_short' not in media_cols:
             conn.execute('ALTER TABLE media_content ADD COLUMN is_short INTEGER NOT NULL DEFAULT 0')
@@ -52,9 +126,30 @@ class DatabaseManager:
             conn.execute('ALTER TABLE media_content ADD COLUMN thumbnail_url TEXT NOT NULL DEFAULT \'\'')
         if 'description' not in media_cols:
             conn.execute('ALTER TABLE media_content ADD COLUMN description TEXT NOT NULL DEFAULT \'\'')
-        for key, value in _DEFAULT_SETTINGS.items():
-            conn.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
         conn.commit()
+
+    @staticmethod
+    def _apply_migration(conn: sqlite3.Connection, version: int) -> None:
+        """Apply a single schema migration for the given *version*.
+
+        Each version maps to a set of SQL statements that are executed
+        inside an explicit transaction by the caller.
+        """
+        if version == 2:
+            # v1→v2: migrate old invalid Anthropic model IDs to valid ones.
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = 'auto_verify_model'"
+            ).fetchone()
+            if row and row['value'] in _MODEL_ID_MIGRATION:
+                conn.execute(
+                    "UPDATE settings SET value = ? WHERE key = 'auto_verify_model'",
+                    (_MODEL_ID_MIGRATION[row['value']],),
+                )
+        if version == 3:
+            # v2→v3: add notes column to creators table.
+            cols = [row['name'] for row in conn.execute('PRAGMA table_info(creators)')]
+            if 'notes' not in cols:
+                conn.execute("ALTER TABLE creators ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
     @property
     def profile(self) -> str:
         return self._profile
@@ -63,6 +158,12 @@ class DatabaseManager:
         """Snapshot of the active profile name for abort-checking by workers."""
         with self._lock:
             return self._profile
+    @property
+    def last_fetch_time(self) -> float:
+        return self._last_fetch_time
+    @last_fetch_time.setter
+    def last_fetch_time(self, value: float) -> None:
+        self._last_fetch_time = value
     def switch_profile(self, profile: str) -> None:
         """Switch to *profile*, creating the database if it doesn't exist.
 
@@ -78,11 +179,16 @@ class DatabaseManager:
             try:
                 new_conn = self._connect(db_path)
                 self._init_schema(new_conn)
-                new_conn.execute("UPDATE settings SET value = ? WHERE key = 'current_profile'", (profile,))
                 new_conn.commit()
                 # Only swap after everything succeeded.
                 self._conn = new_conn
                 self._profile = profile
+                # Persist the active profile name in global settings so the
+                # next launch opens the same profile the user was using.
+                with _GLOBAL_LOCK:
+                    settings = _read_global_settings()
+                    settings['last_profile'] = profile
+                    _write_global_settings(settings)
                 if old_conn is not None:
                     try:
                         old_conn.close()
@@ -114,7 +220,7 @@ class DatabaseManager:
                     except sqlite3.Error:
                         pass
                 profile_snapshot = self._profile
-        ts = f'{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}_{int(time.monotonic() * 1000000) % 1000000:06d}Z'
+        ts = f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")}_{int(time.monotonic() * 1000000) % 1000000:06d}Z'
         src = STORAGE_DIR / f'{profile_snapshot}.db'
         dst = BACKUPS_DIR / f'{profile_snapshot}_{ts}.db.bak'
         def _do_copy():
@@ -133,6 +239,8 @@ class DatabaseManager:
         human-readable message on database errors instead of propagating
         raw ``sqlite3`` exceptions.
         """
+        if self._conn is None:
+            raise RuntimeError('DatabaseManager is closed')
         try:
             with self._lock:
                 cursor = self._conn.execute(sql, params)
@@ -155,6 +263,8 @@ class DatabaseManager:
         return cursor
     def _read(self, sql: str, params: tuple=()) -> list[dict[str, Any]]:
         """Execute a read query and return rows as dicts."""
+        if self._conn is None:
+            raise RuntimeError('DatabaseManager is closed')
         with self._lock:
             cursor = self._conn.execute(sql, params)
             return [dict(row) for row in cursor.fetchall()]
@@ -177,18 +287,43 @@ class DatabaseManager:
         Values are 0 when no data has been fetched yet.
         """
         creators = self.get_creators()
-        result: dict[int, dict[str, int]] = {}
+        result: dict[int, dict[str, int]] = {c['id']: {} for c in creators}
+
+        # Fetch all subscriber/follower settings in two bulk queries
+        # instead of N+1 individual get_setting() calls.
+        yt_rows = self._read(
+            "SELECT key, value FROM settings WHERE key LIKE 'yt_channel_subscribers_%'"
+        )
+        tw_rows = self._read(
+            "SELECT key, value FROM settings WHERE key LIKE 'twitch_followers_%'"
+        )
+
+        for row in yt_rows:
+            try:
+                cid = int(row['key'].rsplit('_', 1)[-1])
+            except (ValueError, IndexError):
+                continue
+            if cid in result:
+                raw = row['value']
+                result[cid]['youtube'] = int(raw) if raw and raw.isdigit() else 0
+
+        for row in tw_rows:
+            try:
+                cid = int(row['key'].rsplit('_', 1)[-1])
+            except (ValueError, IndexError):
+                continue
+            if cid in result:
+                raw = row['value']
+                result[cid]['twitch'] = int(raw) if raw and raw.isdigit() else 0
+
+        # Fill in platform membership and defaults for creators with no data.
         for c in creators:
-            cid = c['id']
             platforms = json.loads(c.get('platforms', '[]'))
-            counts: dict[str, int] = {}
-            if 'youtube' in platforms:
-                raw = self.get_setting(f'yt_channel_subscribers_{cid}')
-                counts['youtube'] = int(raw) if raw and raw.isdigit() else 0
-            if 'twitch' in platforms:
-                raw = self.get_setting(f'twitch_followers_{cid}')
-                counts['twitch'] = int(raw) if raw and raw.isdigit() else 0
-            result[cid] = counts
+            if 'youtube' in platforms and 'youtube' not in result[c['id']]:
+                result[c['id']]['youtube'] = 0
+            if 'twitch' in platforms and 'twitch' not in result[c['id']]:
+                result[c['id']]['twitch'] = 0
+
         return result
     def clear_new_activity(self, creator_id: int) -> None:
         """Clear the new-activity alert flag for a creator (on inspection)."""
@@ -226,6 +361,30 @@ class DatabaseManager:
             return rows[0]['value']
     def set_setting(self, key: str, value: str) -> None:
         self._write('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', (key, value))
+
+    def get_global_setting(self, key: str) -> str | None:
+        """Read a setting from the global JSON file (shared across all profiles)."""
+        with _GLOBAL_LOCK:
+            settings = _read_global_settings()
+        return settings.get(key)
+
+    def set_global_setting(self, key: str, value: str) -> None:
+        """Write a setting to the global JSON file (shared across all profiles)."""
+        with _GLOBAL_LOCK:
+            settings = _read_global_settings()
+            settings[key] = value
+            _write_global_settings(settings)
+
+    def _migrate_api_keys_to_global(self) -> None:
+        """One-time migration: copy api_keys_json from the per-profile DB
+        to the global settings file, if the global file doesn't exist yet."""
+        with _GLOBAL_LOCK:
+            if GLOBAL_SETTINGS_PATH.exists():
+                return  # Already migrated
+            raw = self.get_setting('api_keys_json') or '{}'
+            settings = _read_global_settings()
+            settings['api_keys_json'] = raw
+            _write_global_settings(settings)
     def add_role(self, role_name: str, role_color: str) -> int:
         cur = self._write('INSERT INTO roles (role_name, role_color) VALUES (?, ?)', (role_name, role_color))
         return cur.lastrowid
@@ -256,9 +415,10 @@ class DatabaseManager:
             raise ValueError(f'Role {role_id} is assigned to creators and cannot be deleted.')
         else:
             self._write('DELETE FROM roles WHERE id = ?', (role_id,))
-    def add_creator(self, nickname: str, role_id: int, platforms: list[str] | None=None, youtube_channel_id: str | None=None, youtube_link: str | None=None, twitch_link: str | None=None, pfp_url: str | None=None) -> int:
+    def add_creator(self, nickname: str, role_id: int, platforms: list[str] | None=None, youtube_channel_id: str | None=None, youtube_link: str | None=None, twitch_link: str | None=None, pfp_url: str | None=None, notes: str | None=None) -> int:
         platforms_json = json.dumps(platforms or [])
-        cur = self._write('INSERT INTO creators (nickname, platforms, role_id, youtube_channel_id, youtube_link, twitch_link, pfp_url) VALUES (?, ?, ?, ?, ?, ?, ?)', (nickname, platforms_json, role_id, youtube_channel_id, youtube_link, twitch_link, pfp_url))
+        notes_val = notes or ''
+        cur = self._write('INSERT INTO creators (nickname, platforms, role_id, youtube_channel_id, youtube_link, twitch_link, pfp_url, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (nickname, platforms_json, role_id, youtube_channel_id, youtube_link, twitch_link, pfp_url, notes_val))
         return cur.lastrowid
     def get_creators(self) -> list[dict[str, Any]]:
         return self._read('SELECT * FROM creators ORDER BY id')
@@ -266,7 +426,7 @@ class DatabaseManager:
         rows = self._read('SELECT * FROM creators WHERE id = ?', (creator_id,))
         if rows:
             return rows[0]
-    def update_creator(self, creator_id: int, nickname: str | None=None, platforms: list[str] | None=None, role_id: int | None=None, youtube_channel_id: str | None=None, youtube_link: str | None=None, twitch_link: str | None=None, pfp_url: str | None=None, date_added: str | None=None) -> None:
+    def update_creator(self, creator_id: int, nickname: str | None=None, platforms: list[str] | None=None, role_id: int | None=None, youtube_channel_id: str | None=None, youtube_link: str | None=None, twitch_link: str | None=None, pfp_url: str | None=None, date_added: str | None=None, notes: str | None=None) -> None:
         parts = []
         vals = []
         if nickname is not None:
@@ -293,6 +453,9 @@ class DatabaseManager:
         if date_added is not None:
             parts.append('date_added = ?')
             vals.append(date_added)
+        if notes is not None:
+            parts.append('notes = ?')
+            vals.append(notes)
         if not parts:
             return None
         else:
@@ -300,6 +463,8 @@ class DatabaseManager:
             self._write(f"UPDATE creators SET {', '.join(parts)} WHERE id = ?", tuple(vals))
     def delete_creator(self, creator_id: int) -> None:
         self._write('DELETE FROM creators WHERE id = ?', (creator_id,))
+        for prefix in ('yt_channel_subscribers_', 'yt_channel_views_', 'twitch_followers_'):
+            self._write('DELETE FROM settings WHERE key = ?', (f'{prefix}{creator_id}',))
     def add_media(self, creator_id: int, platform: str, content_id: str, title: str='', thumbnail_path: str='', upload_date: str='', view_count: int=0, is_verified: bool=False, is_short: bool=False, thumbnail_url: str='', description: str='') -> int:
         cur = self._write('INSERT INTO media_content (creator_id, platform, content_id, title, thumbnail_path, thumbnail_url, upload_date, view_count, is_verified, is_short, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (creator_id, platform, content_id, title, thumbnail_path, thumbnail_url, upload_date, view_count, int(is_verified), int(is_short), description))
         return cur.lastrowid
@@ -371,12 +536,12 @@ class DatabaseManager:
                 for cid in new_creator_ids:
                     self._conn.execute('UPDATE creators SET is_new_activity = 1 WHERE id = ?', (cid,))
                 self._conn.commit()
-            except (sqlite3.IntegrityError, sqlite3.Error):
+            except (sqlite3.IntegrityError, sqlite3.Error) as exc:
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
-                raise
+                raise ValueError(f'Database error in batch upsert: {exc}') from exc
         self._backup()
     def set_verified(self, content_id: str, verified: bool) -> None:
         self._write('UPDATE media_content SET is_verified = ? WHERE content_id = ?', (int(verified), content_id))
@@ -403,7 +568,11 @@ class DatabaseManager:
         ``MAX_VARIABLE_NUMBER`` limit (999 on older builds).
         """
         if not current_ids:
-            return 0
+            cur = self._write(
+                'DELETE FROM media_content WHERE creator_id = ? AND platform = ?',
+                (creator_id, platform),
+            )
+            return cur.rowcount
         total = 0
         ids = list(current_ids)
         for i in range(0, len(ids), self._SQL_VARIABLE_LIMIT):
@@ -425,21 +594,25 @@ class DatabaseManager:
         settings (except ``current_profile``).  The ``platforms`` field in
         creator rows is parsed from its JSON-string storage form into a native
         list for readability.
+
+        All reads are performed under a single lock acquisition to produce
+        a consistent snapshot.
         """
-        creators = self._read('SELECT * FROM creators')
-        for c in creators:
-            if 'platforms' in c and isinstance(c['platforms'], str):
-                c['platforms'] = json.loads(c['platforms'])
-        media = self._read('SELECT * FROM media_content')
-        roles = self._read('SELECT * FROM roles')
-        settings = self._read('SELECT * FROM settings')
+        with self._lock:
+            creators = [dict(row) for row in self._conn.execute('SELECT * FROM creators').fetchall()]
+            for c in creators:
+                if 'platforms' in c and isinstance(c['platforms'], str):
+                    c['platforms'] = json.loads(c['platforms'])
+            media = [dict(row) for row in self._conn.execute('SELECT * FROM media_content').fetchall()]
+            roles = [dict(row) for row in self._conn.execute('SELECT * FROM roles').fetchall()]
+            settings_rows = [dict(row) for row in self._conn.execute("SELECT * FROM settings WHERE key NOT IN ('current_profile', 'api_keys_json')").fetchall()]
         return {
             'version': 1,
             'profile': self._profile,
             'creators': creators,
             'media_content': media,
             'roles': roles,
-            'settings': [s for s in settings if s['key'] != 'current_profile'],
+            'settings': settings_rows,
         }
 
     def import_profile(self, data: dict[str, Any], profile_name: str) -> None:
@@ -468,12 +641,13 @@ class DatabaseManager:
                     platforms = json.dumps(platforms)
                 self._write(
                     'INSERT INTO creators (id, nickname, platforms, role_id, youtube_type, '
-                    'youtube_channel_id, youtube_link, twitch_link, pfp_url, date_added, is_new_activity) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'youtube_channel_id, youtube_link, twitch_link, pfp_url, date_added, is_new_activity, notes) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (c['id'], c['nickname'], platforms, c.get('role_id'),
                      c.get('youtube_type'), c.get('youtube_channel_id'),
                      c.get('youtube_link'), c.get('twitch_link'), c.get('pfp_url'),
-                     c.get('date_added'), c.get('is_new_activity', 0)),
+                     c.get('date_added'), c.get('is_new_activity', 0),
+                     c.get('notes', '')),
                 )
             for m in data.get('media_content', []):
                 self._write(
@@ -487,10 +661,10 @@ class DatabaseManager:
                 )
             for s in data.get('settings', []):
                 key = s.get('key', '')
-                if key == 'current_profile':
+                if key in ('current_profile', 'api_keys_json'):
                     continue
                 self._write(
-                    'INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)',
+                    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
                     (key, s.get('value', '')),
                 )
         except Exception:
@@ -534,6 +708,10 @@ class DatabaseManager:
         # Ensure platforms is a list for JSON readability
         creator_copy = dict(creator)
         creator_copy['platforms'] = platforms
+        # Include role name so importing profiles can map by name.
+        role = self.get_role(creator.get('role_id')) if creator.get('role_id') else None
+        if role:
+            creator_copy['role_name'] = role['role_name']
         return {
             'version': 1,
             'type': 'creator',
@@ -557,21 +735,15 @@ class DatabaseManager:
         else:
             platforms_json = platforms
             platforms = json.loads(platforms)
-        # Map role by name, falling back to the first role
-        exported_role_id = c.get('role_id')
+        # Map role by name from the export data, falling back to the first role.
         roles = self.get_roles()
         target_role_id = None
-        if exported_role_id is not None:
-            exported_creator = c
-            # Try to find a role with the same name
-            source_role_name = None
+        source_role_name = c.get('role_name')
+        if source_role_name:
             for r in roles:
-                if r['id'] == exported_role_id:
-                    source_role_name = r['role_name']
+                if r['role_name'] == source_role_name:
+                    target_role_id = r['id']
                     break
-            # The role names may differ between profiles; fall back to first role
-            if roles:
-                target_role_id = roles[0]['id']
         if target_role_id is None and roles:
             target_role_id = roles[0]['id']
         elif target_role_id is None:
@@ -584,6 +756,7 @@ class DatabaseManager:
             youtube_link=c.get('youtube_link'),
             twitch_link=c.get('twitch_link'),
             pfp_url=c.get('pfp_url'),
+            notes=c.get('notes', ''),
         )
         # Import media content
         for m in data.get('media_content', []):
@@ -619,6 +792,21 @@ class DatabaseManager:
         return self
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+def determine_startup_profile() -> str:
+    """Return the profile to open on startup.
+
+    Uses ``last_profile`` from global settings if available, falling back
+    to ``'default'``.  If the remembered profile database doesn't exist,
+    falls back to ``'default'``.
+    """
+    with _GLOBAL_LOCK:
+        settings = _read_global_settings()
+    last = settings.get('last_profile', 'default')
+    if (STORAGE_DIR / f'{last}.db').exists():
+        return last
+    return 'default'
+
 def _run_self_test() -> None:
     """Verify schema creation, CRUD, profile switching, and backup."""
     import tempfile
@@ -628,15 +816,17 @@ def _run_self_test() -> None:
     tmp = Path(tempfile.mkdtemp())
     _paths_mod.STORAGE_DIR = tmp / 'storage'
     _paths_mod.BACKUPS_DIR = tmp / 'storage' / 'backups'
+    _paths_mod.GLOBAL_SETTINGS_PATH = _paths_mod.STORAGE_DIR / 'global_settings.json'
     _self_mod.STORAGE_DIR = _paths_mod.STORAGE_DIR
     _self_mod.BACKUPS_DIR = _paths_mod.BACKUPS_DIR
+    _self_mod.GLOBAL_SETTINGS_PATH = _paths_mod.GLOBAL_SETTINGS_PATH
     print(f'Test dir: {tmp}')
     db = DatabaseManager('default')
     print(f'Active profile: {db.profile}')
     assert db.profile == 'default'
     assert (STORAGE_DIR / 'default.db').exists()
-    db.set_setting('api_keys_json', '{\"yt\": \"key123\"}')
-    assert db.get_setting('api_keys_json') == '{\"yt\": \"key123\"}'
+    db.set_global_setting('api_keys_json', '{\"yt\": \"key123\"}')
+    assert db.get_global_setting('api_keys_json') == '{\"yt\": \"key123\"}'
     rid = db.add_role('Streamer', '#FF5733')
     role = db.get_role(rid)
     assert role['role_name'] == 'Streamer'
@@ -675,6 +865,16 @@ def _run_self_test() -> None:
     except ValueError:
         pass
     db.close()
+    # Test determine_startup_profile
+    assert determine_startup_profile() == 'gaming_team', f'Expected gaming_team, got {determine_startup_profile()}'
+    # Test that switching profiles persists to global settings
+    db2 = DatabaseManager('default')
+    assert determine_startup_profile() == 'default', f'Expected default after switch, got {determine_startup_profile()}'
+    # Test global API keys survive a profile switch
+    db2.set_global_setting('api_keys_json', '{"yt": "test_key_12345"}')
+    db2.switch_profile('gaming_team')
+    assert db2.get_global_setting('api_keys_json') == '{"yt": "test_key_12345"}', 'Global keys should survive profile switch'
+    db2.close()
     shutil.rmtree(tmp)
     print('All self-tests passed.')
 if __name__ == '__main__':

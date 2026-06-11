@@ -5,7 +5,7 @@ from typing import Any
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSplitter, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager
 from ui.app_icon import create_app_icon
 from ui.chart_utils import _ZoomableFigureCanvas
@@ -192,6 +192,11 @@ class AnalyticsWindow(QDialog):
         self._btn_tw.setCheckable(True)
         self._btn_tw.clicked.connect(lambda: self._set_filter('twitch'))
         filter_row.addWidget(self._btn_tw)
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        self._filter_group.addButton(self._btn_all)
+        self._filter_group.addButton(self._btn_yt)
+        self._filter_group.addButton(self._btn_tw)
         filter_row.addStretch(1)
         self._verified_check = QCheckBox('Show All Stats')
         self._verified_check.setChecked(False)
@@ -209,10 +214,29 @@ class AnalyticsWindow(QDialog):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        chart_toggle_row = QHBoxLayout()
+        chart_toggle_row.addWidget(QLabel('Chart:'))
+        self._btn_timeline = QPushButton('Timeline')
+        self._btn_timeline.setCheckable(True)
+        self._btn_timeline.setChecked(True)
+        self._btn_timeline.clicked.connect(lambda: self._chart_stack.setCurrentIndex(0))
+        chart_toggle_row.addWidget(self._btn_timeline)
+        self._btn_bar = QPushButton('Upload Activity')
+        self._btn_bar.setCheckable(True)
+        self._btn_bar.clicked.connect(lambda: self._chart_stack.setCurrentIndex(1))
+        chart_toggle_row.addWidget(self._btn_bar)
+        self._chart_group = QButtonGroup(self)
+        self._chart_group.setExclusive(True)
+        self._chart_group.addButton(self._btn_timeline)
+        self._chart_group.addButton(self._btn_bar)
+        chart_toggle_row.addStretch(1)
+        right_layout.addLayout(chart_toggle_row)
+        self._chart_stack = QStackedWidget()
         self._timeline = _TimelineChart(self._db)
-        right_layout.addWidget(self._timeline, 1)
+        self._chart_stack.addWidget(self._timeline)
         self._bar_chart = _MonthlyBarChart(self._db)
-        right_layout.addWidget(self._bar_chart, 1)
+        self._chart_stack.addWidget(self._bar_chart)
+        right_layout.addWidget(self._chart_stack, 1)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)

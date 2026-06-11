@@ -46,4 +46,5 @@ def build_global_qss() -> str:
         f'QCalendarWidget QAbstractItemView {{ background: {C.BG_LAYER}; color: {C.TEXT_PRIMARY}; selection-background-color: {C.ACCENT}; selection-color: {C.TEXT_ON_ACCENT}; }}\n'
         f'QProgressBar {{ background: {C.BG_RAISED}; border: 1px solid {C.BORDER}; border-radius: 4px; text-align: center; color: {C.TEXT_PRIMARY}; }}\n'
         f'QProgressBar::chunk {{ background: {C.ACCENT}; border-radius: 3px; }}\n'
+        f'QToolTip {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; padding: 4px 8px; border-radius: 4px; }}\n'
     )

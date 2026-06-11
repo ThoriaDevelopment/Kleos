@@ -235,6 +235,8 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
     clicked = pyqtSignal(int)
     refresh_requested = pyqtSignal(int)
     export_creator_requested = pyqtSignal(int)
+    delete_requested = pyqtSignal(int)
+    edit_notes_requested = pyqtSignal(int)
     def __init__(self, creator: dict[str, Any], role: dict[str, Any] | None, last_activity: str, has_new_activity: bool, subscriber_text: str='N/A', parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self._creator = creator
@@ -285,7 +287,10 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._load_avatar()
         grid.addWidget(self._avatar_label, 0, 1)
         grid.setColumnMinimumWidth(1, 32)
-        platforms = json.loads(self._creator.get('platforms', '[]'))
+        try:
+            platforms = json.loads(self._creator.get('platforms', '[]'))
+        except json.JSONDecodeError:
+            platforms = []
         tag_text = _platform_label(platforms)
         self._platform_label = QLabel(tag_text)
         self._platform_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -442,6 +447,13 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         refresh_action.triggered.connect(lambda: self.refresh_requested.emit(self._creator['id']))
         menu.addAction(refresh_action)
         menu.addSeparator()
+        delete_action = QAction('Delete Member', self)
+        delete_action.triggered.connect(lambda: self.delete_requested.emit(self._creator['id']))
+        menu.addAction(delete_action)
+        edit_notes_action = QAction('Edit Notes', self)
+        edit_notes_action.triggered.connect(lambda: self.edit_notes_requested.emit(self._creator['id']))
+        menu.addAction(edit_notes_action)
+        menu.addSeparator()
         export_action = QAction('Export Creator', self)
         export_action.triggered.connect(lambda: self.export_creator_requested.emit(self._creator['id']))
         menu.addAction(export_action)
@@ -485,7 +497,10 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         return self._creator
     @property
     def platforms(self) -> list[str]:
-        return json.loads(self._creator.get('platforms', '[]'))
+        try:
+            return json.loads(self._creator.get('platforms', '[]'))
+        except json.JSONDecodeError:
+            return []
     @property
     def role_id(self) -> int | None:
         return self._creator.get('role_id')

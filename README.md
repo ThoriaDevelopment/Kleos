@@ -55,28 +55,33 @@ Key design goals:
   - Add/remove media members with YouTube, Twitch, or dual-platform support.
   - Custom roles with hex color coding.
   - Nickname, platform tags, join date, and role assignment.
+  - Internal notes per creator (visible in history, included in profile exports).
 
 - **Data Fetching**
   - YouTube Data API v3: channel profile resolution, uploads playlist pagination, video stats, short detection (ISO 8601 duration parse).
   - Twitch Helix: OAuth2 client-credentials flow, user profile lookup, live streams, past broadcasts & highlights (cursor-based pagination).
   - Configurable per-creator video limit (0 = unlimited).
-  - Automatic thumbnail and PFP caching.
+  - Automatic thumbnail and PFP caching with concurrency cap (4 concurrent downloads).
 
 - **Dashboard**
-  - Role-filtered, sortable, searchable card grid.
+  - Role-filtered, sortable, searchable card grid with debounced search (200ms).
   - Subscriber/follower display.
   - New-activity alerts (orange ⚠ badge).
   - Cascade entrance animations and hover physics (lift + shadow).
+  - Lazy card creation — cards render in batches for responsiveness with large rosters.
+  - Keyboard shortcuts: Ctrl+R (Refresh All), Ctrl+N (Add Member), Ctrl+F (Focus Search), Escape (Clear Search).
+  - Tooltips on all toolbar buttons and controls.
 
 - **Per-Creator History**
   - Paginated media list (50 items per page) with lazy thumbnail recovery.
   - Verify / Unverified toggle.
   - Double-click to open content URL in browser.
-  - Per-member timeline (views over time) and monthly upload bar chart.
+  - Per-member notes field (auto-saved with 500ms debounce).
+  - Toggleable interactive charts — Timeline and Upload Activity each get the full tab when selected.
 
 - **Leaderboard & Analytics**
   - Global view-count leaderboard with platform filter.
-  - Interactive trajectory and monthly-upload charts (zoom, pan, reset).
+  - Toggleable interactive trajectory and monthly-upload charts — switch between them with the full panel.
   - Clipboard-ready plain-text reports (weekly / monthly / yearly).
 
 - **Auto-Verification**
@@ -84,16 +89,18 @@ Key design goals:
   - Supports Haiku 4.5, Sonnet 4.6, and Opus 4.8 models.
   - Exponential backoff retry logic for rate limits.
   - Cancelable background worker with progress reporting.
+  - Cooldown timer with live countdown when fetches are rate-limited.
 
 - **Import / Export**
   - Full profile export/import as JSON (versioned schema v1).
-  - Single-creator export/import.
+  - Single-creator export/import (includes notes).
   - Drag-and-drop import support on the main window.
 
 - **Persistence**
-  - Profile-scoped SQLite databases with WAL journaling.
+  - Profile-scoped SQLite databases with WAL journaling (schema v3, with `notes` column).
+  - Global settings stored in `global_settings.json` (API keys shared across profiles, startup profile remembered).
   - Automatic timestamped backups (keeps last 3 per profile).
-  - All API keys stored in the active database's settings table.
+  - First-run wizard on initial launch — multi-step walkthrough (Welcome → API Keys → 8 feature pages with visual mockups).
 
 ---
 
@@ -133,18 +140,22 @@ Open **Settings → API Keys** and provide:
 - **Twitch Client Secret**
 - **Anthropic API Key** (optional, required for Auto-Verify)
 
+API keys are stored globally and shared across all profiles.
+
 Alternatively, set environment variables before launching:
 - `KLEOS_YT_API_KEY`
 - `KLEOS_TWITCH_CLIENT_ID`
 - `KLEOS_TWITCH_CLIENT_SECRET`
 
-### Settings Stored in Database
-- `api_keys_json` – serialized dict of all keys
+### Global Settings (`global_settings.json`)
+- `api_keys_json` – serialized dict of all keys (shared across profiles)
+- `last_profile` – remembered startup profile
+
+### Per-Profile Settings (in each profile's SQLite database)
 - `fetch_video_limit` – integer cap per creator (0 = unlimited)
 - `thumbnail_quality` – `"low"` (cached) or `"high"` (re-fetch)
 - `community_description` – up to 300 words for auto-verify context
-- `auto_verify_model` – `claude-haiku-4-5`, `claude-sonnet-4-6`, or `claude-opus-4-8`
-- `current_profile` – active profile name
+- `auto_verify_model` – `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, or `claude-opus-4-8`
 
 ---
 
@@ -152,7 +163,7 @@ Alternatively, set environment variables before launching:
 
 ```
 Kleos/
-├── main.py                 # Entry point, DWM dark title-bar, app init
+├── main.py                 # Entry point, FirstRunWizard (10-page walkthrough), DWM dark title-bar, app init
 ├── requirements.txt        # Python dependencies
 ├── README.md               # This file
 ├── USERMANUAL.md           # End-user documentation
@@ -161,8 +172,8 @@ Kleos/
 │   ├── __init__.py
 │   ├── api_client.py       # YouTubeClient, TwitchClient, FetchWorker (QThread)
 │   ├── cache_manager.py    # Thumbnail/PFP download and local caching
-│   ├── db_manager.py       # DatabaseManager: SQLite, schema, CRUD, import/export
-│   ├── paths.py            # APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR
+│   ├── db_manager.py       # DatabaseManager: SQLite, schema, CRUD, import/export, global settings
+│   ├── paths.py            # APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR, GLOBAL_SETTINGS_PATH
 │   ├── report_generator.py # Plain-text report generation (clipboard)
 │   └── verify_worker.py    # VerifyWorker (QThread) for Claude auto-verify
 │
@@ -172,16 +183,16 @@ Kleos/
     ├── chart_utils.py        # _ZoomableFigureCanvas mixin (scroll-zoom, drag-pan, dblclk-reset)
     ├── dialog_utils.py       # Dark QMessageBox wrappers, fullscreen helpers
     ├── main_window.py        # MainWindow, GradientCanvasV2, _AddCreatorDialog, _InlineEditDialog
-    ├── analytics_window.py   # AnalyticsWindow: leaderboard + timeline + bar charts
+    ├── analytics_window.py   # AnalyticsWindow: leaderboard + toggleable timeline/bar charts
     ├── settings_dialog.py    # SettingsDialog: API Keys, Verify, Profiles, Roles, Appearance tabs
     ├── theme/
     │   ├── __init__.py       # build_global_qss()
-    │   ├── stylesheet.py       # Global QSS definitions
+    │   ├── stylesheet.py       # Global QSS definitions (includes QToolTip)
     │   └── tokens.py           # Color constants (C.*) and motion constants (M.*)
     └── components/
         ├── __init__.py
         ├── creator_card.py   # CreatorCard widget, relative_time, format_subscriber_count
-        └── history_dialog.py # HistoryDialog: paginated media list, per-member charts
+        └── history_dialog.py # HistoryDialog: paginated media list, notes, toggleable charts
 ```
 
 ---
@@ -192,13 +203,15 @@ Kleos/
 - **Main Thread**: Handles all Qt widgets, animations, and layout.
 - **FetchWorker** (`QThread`): One concurrent fetch at a time. Queries YouTube/Twitch APIs, writes to DB via `upsert_media_batch()`.
 - **VerifyWorker** (`QThread`): Classifies unverified videos via the Anthropic API. Emits progress signals.
+- **ThreadPoolExecutor** (4 workers): Thumbnail downloads in HistoryDialog are capped at 4 concurrent downloads to prevent crashes from missing thumbnails.
 - All workers communicate through Qt signals; the main thread never waits on network IO.
 
 ### Database Layer (`DatabaseManager`)
 - Uses a single SQLite connection per profile with `threading.Lock` for thread safety.
 - WAL mode enabled (`PRAGMA journal_mode=WAL`).
 - Foreign keys enforced (`PRAGMA foreign_keys=ON`).
-- Schema migrations handled imperatively (adding columns if missing).
+- Schema versioning via `PRAGMA user_version` with migrations (currently v3 — includes `notes` column).
+- Global settings (API keys, last profile, first-run flag) stored in `global_settings.json` with atomic writes.
 - Auto-backup runs in a background thread after writes, keeping the last 3 snapshots per profile.
 
 ### Schema
@@ -207,7 +220,7 @@ settings        (key PRIMARY KEY, value)
 roles           (id PRIMARY KEY, role_name UNIQUE, role_color)
 creators        (id PRIMARY KEY, nickname, platforms JSON, role_id FK,
                  youtube_type, youtube_channel_id, youtube_link, twitch_link,
-                 pfp_url, date_added, is_new_activity)
+                 pfp_url, date_added, is_new_activity, notes)
 media_content   (id PRIMARY KEY, creator_id FK, platform CHECK('youtube','twitch'),
                  content_id UNIQUE, title, thumbnail_path, thumbnail_url,
                  upload_date, view_count, is_verified, is_short, description)
@@ -215,16 +228,18 @@ media_content   (id PRIMARY KEY, creator_id FK, platform CHECK('youtube','twitch
 
 ### Caching
 - Thumbnails and profile pictures are downloaded to `%APPDATA%\.kleos\thumbnails`.
-- Images are served from disk; a background thread fetches missing ones lazily.
+- Images are served from disk; a ThreadPoolExecutor (max 4 workers) fetches missing ones concurrently.
+- Download errors are silently caught to prevent crashes from missing thumbnails.
 
 ---
 
 ## Database & Profiles
 
 - **Profile = SQLite file** (`{name}.db` in `STORAGE_DIR`).
-- Switching profiles closes the old connection and opens the new file.
-- Profile export serializes creators, media, roles, and settings into a JSON envelope with `version: 1`.
-- Profile import deserializes into a **new** database file, mapping role names to the first available role in the target profile.
+- Switching profiles closes the old connection and opens the new file. The last-used profile is remembered across sessions via `global_settings.json`.
+- Profile export serializes creators (including notes), media, roles, and settings into a JSON envelope with `version: 1`.
+- Profile import deserializes into a **new** database file, mapping role names to the first available role in the target profile. Uses upsert semantics for settings.
+- API keys are **not** included in profile exports — they are stored globally and shared across all profiles.
 
 ---
 
@@ -253,12 +268,14 @@ The `VerifyWorker` sends each unverified video's title and description to the Cl
 - Temperature locked to `0` for deterministic outputs on Haiku.
 - Max retries: 3 with exponential delays (1s, 2s, 4s) on `RateLimitError`.
 - Authentication and connection errors surface as modal warnings.
+- Cooperative profile guard: if the user switches profiles mid-verification, the worker aborts cleanly.
 
 ---
 
 ## Charts & Visualization
 
 - Built on `matplotlib.backends.backend_qtagg`.
+- **Toggleable charts**: Both the per-creator Stats tab and the global Analytics window offer Timeline and Upload Activity chart modes. Toggle between them using the "Timeline" / "Upload Activity" buttons — the selected chart fills the full panel.
 - `_ZoomableFigureCanvas` mixin provides:
   - **Scroll**: zoom in/out centered on cursor.
   - **Drag**: pan both axes.
@@ -274,7 +291,7 @@ The `VerifyWorker` sends each unverified video's title and description to the Cl
 {
   "version": 1,
   "type": "creator",
-  "creator": { ... },
+  "creator": { ..., "notes": "Internal notes" },
   "media_content": [ ... ],
   "stats": { "youtube_subscribers": ..., "twitch_followers": ... }
 }
@@ -285,19 +302,17 @@ The `VerifyWorker` sends each unverified video's title and description to the Cl
 {
   "version": 1,
   "profile": "name",
-  "creators": [ ... ],
+  "creators": [ ..., "notes": "Internal notes" ],
   "media_content": [ ... ],
   "roles": [ ... ],
   "settings": [ ... ]
 }
 ```
 
-Drag-and-drop `.json` files onto the main window; Kleos introspects the `type` and `version` fields to route the import correctly.
+Notes are included in both creator and profile exports/imports. Drag-and-drop `.json` files onto the main window; Kleos introspects the `type` and `version` fields to route the import correctly.
 
 ---
 
 ## License
 
 Kleos is released under the **MIT License**. See `LICENSE` for details.
-
----

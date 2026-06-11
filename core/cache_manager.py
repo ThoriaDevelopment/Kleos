@@ -52,6 +52,11 @@ def _get_download_lock(url: str) -> threading.Lock:
             _download_locks[url] = threading.Lock()
         return _download_locks[url]
 
+def _release_download_lock(key: str) -> None:
+    """Remove a download lock from the dict after use to prevent unbounded growth."""
+    with _download_locks_lock:
+        _download_locks.pop(key, None)
+
 
 def ensure_thumbnail(url: str) -> Optional[str]:
     """Download *url* to the local cache if missing, then return its path.
@@ -70,28 +75,31 @@ def ensure_thumbnail(url: str) -> Optional[str]:
     if local.exists() and local.stat().st_size > 0:
         return str(local)
     lock = _get_download_lock(url)
-    with lock:
-        # Re-check after acquiring lock — another thread may have downloaded it
-        if local.exists() and local.stat().st_size > 0:
-            return str(local)
-        try:
-            resp = requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
-            resp.raise_for_status()
-            tmp = local.with_suffix(local.suffix + '.tmp')
-            with open(tmp, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            tmp.replace(local)
-            return str(local)
-        except (requests.RequestException, OSError) as exc:
-            logger.warning('Thumbnail download failed for %s: %s', url, exc)
+    try:
+        with lock:
+            # Re-check after acquiring lock — another thread may have downloaded it
+            if local.exists() and local.stat().st_size > 0:
+                return str(local)
             try:
-                tmp = local.with_suffix(local.suffix + '.tmp')
-                if tmp.exists():
-                    tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return None
+                with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
+                    resp.raise_for_status()
+                    tmp = local.with_suffix(local.suffix + '.tmp')
+                    with open(tmp, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    tmp.replace(local)
+                return str(local)
+            except (requests.RequestException, OSError) as exc:
+                logger.warning('Thumbnail download failed for %s: %s', url, exc)
+                try:
+                    tmp = local.with_suffix(local.suffix + '.tmp')
+                    if tmp.exists():
+                        tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+    finally:
+        _release_download_lock(url)
 
 
 def _sanitize_filename(name: str) -> str:
@@ -120,29 +128,33 @@ def ensure_pfp(url: str, nickname: str, creator_id: int | None = None) -> Option
         local = THUMBNAILS_DIR / f'{safe_name}{ext}'
     if local.exists() and local.stat().st_size > 0:
         return str(local)
-    lock = _get_download_lock(url)
-    with lock:
-        # Re-check after acquiring lock — another thread may have downloaded it
-        if local.exists() and local.stat().st_size > 0:
-            return str(local)
-        try:
-            resp = requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
-            resp.raise_for_status()
-            tmp = local.with_suffix(local.suffix + '.tmp')
-            with open(tmp, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            tmp.replace(local)
-            return str(local)
-        except (requests.RequestException, OSError) as exc:
-            logger.warning('PFP download failed for %s: %s', url, exc)
+    lock_key = str(local)  # Lock by destination path, not URL, to prevent races on same file
+    lock = _get_download_lock(lock_key)
+    try:
+        with lock:
+            # Re-check after acquiring lock — another thread may have downloaded it
+            if local.exists() and local.stat().st_size > 0:
+                return str(local)
             try:
-                tmp = local.with_suffix(local.suffix + '.tmp')
-                if tmp.exists():
-                    tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return None
+                with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
+                    resp.raise_for_status()
+                    tmp = local.with_suffix(local.suffix + '.tmp')
+                    with open(tmp, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    tmp.replace(local)
+                return str(local)
+            except (requests.RequestException, OSError) as exc:
+                logger.warning('PFP download failed for %s: %s', url, exc)
+                try:
+                    tmp = local.with_suffix(local.suffix + '.tmp')
+                    if tmp.exists():
+                        tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return None
+    finally:
+        _release_download_lock(lock_key)
 
 
 def prune_cache(max_files: int = 500) -> int:
@@ -159,7 +171,13 @@ def prune_cache(max_files: int = 500) -> int:
     hash_files = [f for f in THUMBNAILS_DIR.iterdir() if f.is_file() and _hash_pattern.match(f.name)]
     if len(hash_files) <= max_files:
         return 0
-    hash_files.sort(key=lambda f: f.stat().st_mtime)
+    def _safe_mtime(f):
+        try:
+            return f.stat().st_mtime
+        except (FileNotFoundError, OSError):
+            return float('inf')
+
+    hash_files.sort(key=_safe_mtime)
     to_remove = hash_files[:len(hash_files) - max_files]
     for f in to_remove:
         f.unlink(missing_ok=True)

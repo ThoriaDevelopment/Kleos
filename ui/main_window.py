@@ -6,8 +6,8 @@ from typing import Any
 from ui.theme import C, M
 from PyQt6 import sip
 from PyQt6.QtCore import QAbstractAnimation, QDate, QEasingCurve, QPoint, QPropertyAnimation, Qt, QTimer, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPalette
-from PyQt6.QtWidgets import QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPalette, QShortcut
+from PyQt6.QtWidgets import QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
 from core.api_client import FetchWorker, load_api_keys
 from core.db_manager import DatabaseManager
 from core.verify_worker import ANTHROPIC_AVAILABLE, VerifyWorker
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import CreatorCard, format_subscriber_count
 from ui.components.history_dialog import HistoryDialog
-from ui.dialog_utils import dark_warning, handle_fullscreen_keypress
+from ui.dialog_utils import dark_question, dark_warning, handle_fullscreen_keypress
 from ui.settings_dialog import SettingsDialog
 from ui.analytics_window import AnalyticsWindow
 class GradientCanvasV2(QWidget):
@@ -232,6 +232,10 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._db = db
         self._cards = {}
+        self._pending_card_data = []
+        self._batch_timer = QTimer(self)
+        self._batch_timer.setSingleShot(True)
+        self._batch_timer.timeout.connect(self._create_next_batch)
         self._fetch_worker = None
         self._verify_worker = None
         self._active_history = None
@@ -240,12 +244,22 @@ class MainWindow(QMainWindow):
         self._search_text = ''
         self._sort_key = 'date_added'
         self._cascade_timers = []
+        self._pending_close = False
+        self._cooldown_timer = QTimer(self)
+        self._cooldown_timer.setInterval(1000)
+        self._cooldown_timer.timeout.connect(self._cooldown_tick)
+        self._cooldown_remaining = 0
+        self._pending_profile = None
         self.setWindowTitle('Kleos — Media Dashboard')
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(800, 520)
         self.resize(960, 640)
         self.setAcceptDrops(True)
         self._build_ui()
+        # Keyboard shortcuts
+        QShortcut(QKeySequence('Ctrl+R'), self, activated=self._on_refresh_all)
+        QShortcut(QKeySequence('Ctrl+N'), self, activated=self._on_add_creator)
+        QShortcut(QKeySequence('Ctrl+F'), self, activated=self._focus_search)
         self.apply_main_window_qss()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_relative_times)
@@ -265,30 +279,41 @@ class MainWindow(QMainWindow):
         top_row1 = QHBoxLayout()
         top_row1.setContentsMargins(16, 8, 16, 2)
         add_btn = QPushButton('+ Add Media Member')
+        add_btn.setToolTip('Add a new media member (Ctrl+N)')
         add_btn.clicked.connect(self._on_add_creator)
         top_row1.addWidget(add_btn)
         top_row1.addSpacing(8)
         self._refresh_all_btn = QPushButton('⟳ Refresh All')
+        self._refresh_all_btn.setToolTip('Refresh all member data from APIs (Ctrl+R)')
+        self._refresh_all_btn._original_text = '⟳ Refresh All'
         self._refresh_all_btn.clicked.connect(self._on_refresh_all)
         top_row1.addWidget(self._refresh_all_btn)
         top_row1.addStretch(1)
         self._verify_btn = QPushButton('✓ Auto-Verify')
+        self._verify_btn.setToolTip('Auto-verify media using AI')
         self._verify_btn.clicked.connect(self._on_auto_verify)
         top_row1.addWidget(self._verify_btn)
         top_row1.addSpacing(8)
         settings_btn = QPushButton('⚙ Settings')
+        settings_btn.setToolTip('Open settings (API keys, profiles, roles)')
         settings_btn.clicked.connect(self._on_settings)
         top_row1.addWidget(settings_btn)
         top_row1.addSpacing(8)
         leaderboard_btn = QPushButton('♛ Leaderboard')
+        leaderboard_btn.setToolTip('View analytics and leaderboard')
         leaderboard_btn.clicked.connect(self._on_leaderboard)
         top_row1.addWidget(leaderboard_btn)
         top_row2 = QHBoxLayout()
         top_row2.setContentsMargins(16, 2, 16, 8)
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText('Search members…')
+        self._search_edit.setToolTip('Search members by name (Ctrl+F)')
         self._search_edit.setFixedWidth(180)
         self._search_edit.textChanged.connect(self._on_search_changed)
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(200)
+        self._search_debounce.timeout.connect(self._apply_filter)
         top_row2.addWidget(self._search_edit)
         top_row2.addSpacing(8)
         self._fetch_status = QLabel('')
@@ -298,6 +323,7 @@ class MainWindow(QMainWindow):
         top_row2.addStretch(1)
         top_row2.addWidget(QLabel('Sort: '))
         self._sort_combo = QComboBox()
+        self._sort_combo.setToolTip('Sort members by date, name, or subscribers')
         self._sort_combo.addItem('Date Added', 'date_added')
         self._sort_combo.addItem('Name', 'name')
         self._sort_combo.addItem('Subscribers', 'subscribers')
@@ -306,12 +332,14 @@ class MainWindow(QMainWindow):
         top_row2.addSpacing(8)
         top_row2.addWidget(QLabel('Filter: '))
         self._filter_combo = QComboBox()
+        self._filter_combo.setToolTip('Filter members by role')
         self._refresh_filter_combo()
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         top_row2.addWidget(self._filter_combo)
         top_row2.addSpacing(8)
         top_row2.addWidget(QLabel('Profile: '))
         self._profile_combo = QComboBox()
+        self._profile_combo.setToolTip('Switch active profile')
         self._refresh_profile_combo()
         self._profile_combo.currentIndexChanged.connect(self._on_profile_switch)
         top_row2.addWidget(self._profile_combo)
@@ -376,8 +404,10 @@ class MainWindow(QMainWindow):
             f'QMainWindow {{ background: #0F0F14; }}\n'
             f'QCheckBox::indicator:checked {{ image: none; }}\n'
         )
+    _CARD_BATCH_SIZE = 20
+
     def _refresh_cards(self) -> None:
-        """Reload creators and cascade-animate cards into view."""
+        """Reload creators and cascade-animate cards into view in batches."""
         _, err = load_api_keys(self._db)
         self._banner.setVisible(err is not None)
         if hasattr(self, '_filter_combo'):
@@ -388,38 +418,73 @@ class MainWindow(QMainWindow):
         for t in self._cascade_timers:
             t.stop()
         self._cascade_timers.clear()
+        self._batch_timer.stop()
         for card in self._cards.values():
             self._card_layout.removeWidget(card)
             card.deleteLater()
         self._cards.clear()
+        self._pending_card_data = []
         last_activity = self._db.bulk_last_activity()
         new_activity_ids = self._db.bulk_new_activity_creators()
         self._sub_counts = self._db.bulk_subscriber_counts()
         sub_counts = self._sub_counts
         creators = self._db.get_creators()
         roles = {r['id']: r for r in self._db.get_roles()}
-        new_cards = []
         for c in creators:
             role = roles.get(c.get('role_id'))
             last_act = last_activity.get(c['id'], '')
             has_new_activity = c['id'] in new_activity_ids
             counts = sub_counts.get(c['id'], {})
             sub_text = format_subscriber_count(counts.get('youtube', 0), counts.get('twitch', 0))
-            card = CreatorCard(c, role, last_act, has_new_activity, sub_text)
-            card.edit_requested.connect(self._on_edit_field)
-            card.clicked.connect(self._on_card_clicked)
-            card.refresh_requested.connect(self._on_refresh_creator)
-            card.export_creator_requested.connect(self._on_export_creator)
+            self._pending_card_data.append((c, role, last_act, has_new_activity, sub_text))
+        # Create first batch immediately
+        first_batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
+        self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
+        first_cards = []
+        for c, role, last_act, has_new, sub_text in first_batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text)
+            self._connect_card_signals(card)
             self._cards[c['id']] = card
             self._card_layout.addWidget(card)
-            new_cards.append(card)
+            first_cards.append(card)
         self._apply_filter()
         self._apply_sort()
         self._card_container.updateGeometry()
         self._scroll.updateGeometry()
         if hasattr(self, '_scroll') and scroll_pos:
                 self._scroll.verticalScrollBar().setValue(scroll_pos)
-        self.cascade_cards(new_cards)
+        self.cascade_cards(first_cards)
+        if self._pending_card_data:
+            self._batch_timer.start(1)
+
+    def _connect_card_signals(self, card: CreatorCard) -> None:
+        """Connect all creator card signals to their handlers."""
+        card.edit_requested.connect(self._on_edit_field)
+        card.clicked.connect(self._on_card_clicked)
+        card.refresh_requested.connect(self._on_refresh_creator)
+        card.export_creator_requested.connect(self._on_export_creator)
+        card.delete_requested.connect(self._on_delete_creator)
+        card.edit_notes_requested.connect(self._on_edit_notes)
+
+    def _create_next_batch(self) -> None:
+        """Create the next batch of creator cards (lazy loading)."""
+        if not self._pending_card_data:
+            return
+        batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
+        self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
+        new_cards = []
+        for c, role, last_act, has_new, sub_text in batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text)
+            self._connect_card_signals(card)
+            self._cards[c['id']] = card
+            self._card_layout.addWidget(card)
+            new_cards.append(card)
+        self._apply_filter()
+        self._apply_sort()
+        if new_cards:
+            self.cascade_cards(new_cards)
+        if self._pending_card_data:
+            self._batch_timer.start(1)
     def cascade_cards(self, cards: list[CreatorCard]) -> None:
         """Fade and slide each card up with M.CARD_STAGGER_MS stagger between rows."""
         ANIM_DURATION = 220
@@ -496,10 +561,32 @@ class MainWindow(QMainWindow):
         if name == self._db.profile:
             return
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            # Defer the profile switch until the fetch worker finishes
+            # to avoid blocking the UI on the DB lock.
             self._fetch_worker.cancel()
+            self._pending_profile = name
+            self._fetch_status.setVisible(True)
+            self._fetch_status.setText(f'Switching to {name}…')
+            self._fetch_worker.finished.connect(self._on_fetch_done_for_profile_switch)
+            return
         self._db.switch_profile(name)
         self._refresh_cards()
         self._refresh_profile_combo()
+
+    def _on_fetch_done_for_profile_switch(self) -> None:
+        """Complete a deferred profile switch after the fetch worker finishes."""
+        if self._fetch_worker is not None:
+            try:
+                self._fetch_worker.finished.disconnect(self._on_fetch_done_for_profile_switch)
+            except RuntimeError:
+                pass
+        profile = self._pending_profile
+        self._pending_profile = None
+        self._fetch_status.setVisible(False)
+        if profile and profile != self._db.profile:
+            self._db.switch_profile(profile)
+            self._refresh_cards()
+            self._refresh_profile_combo()
     def _on_add_creator(self) -> None:
         if not self._db.get_roles():
             dark_warning(self, 'No Roles Available', 'You must create at least one role before adding a media member.\nOpen Settings → Roles to create one.')
@@ -571,10 +658,52 @@ class MainWindow(QMainWindow):
             from ui.dialog_utils import dark_warning
             dark_warning(self, 'Export Failed', str(exc))
 
+    def _on_delete_creator(self, creator_id: int) -> None:
+        """Delete a creator with confirmation."""
+        creator = self._db.get_creator(creator_id)
+        if not creator:
+            return
+        nick = creator.get('nickname', 'Unknown')
+        result = dark_question(self, 'Delete Member',
+            f'Are you sure you want to permanently delete {nick}?')
+        if result == QMessageBox.StandardButton.Yes:
+            self._db.delete_creator(creator_id)
+            self._refresh_cards()
+
+    def _on_edit_notes(self, creator_id: int) -> None:
+        """Open a dialog to edit notes for a creator."""
+        creator = self._db.get_creator(creator_id)
+        if not creator:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'Edit Notes — {creator.get("nickname", "Unknown")}')
+        dlg.setMinimumWidth(400)
+        dlg.setMinimumHeight(250)
+        dlg.setStyleSheet('QDialog { background: #09090C; }')
+        layout = QVBoxLayout(dlg)
+        notes_edit = QTextEdit()
+        notes_edit.setPlainText(creator.get('notes', '') or '')
+        notes_edit.setStyleSheet(
+            'QTextEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; '
+            'border-radius: 4px; padding: 4px; }')
+        layout.addWidget(notes_edit)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._db.update_creator(creator_id, notes=notes_edit.toPlainText())
+            self._refresh_cards()
+
     def _on_search_changed(self, text: str) -> None:
-        """Filter visible cards by nickname substring match."""
+        """Filter visible cards by nickname substring match (debounced)."""
         self._search_text = text.strip().lower()
-        self._apply_filter()
+        self._search_debounce.start()
+
+    def _focus_search(self) -> None:
+        """Focus the search bar and select all text (Ctrl+F shortcut)."""
+        self._search_edit.setFocus()
+        self._search_edit.selectAll()
 
     def _on_sort_changed(self, index: int) -> None:
         """Reorder cards by the selected sort key."""
@@ -624,7 +753,7 @@ class MainWindow(QMainWindow):
                          'Please enter a community description in Settings → Verify first.')
             return
         import json
-        raw = self._db.get_setting('api_keys_json') or '{}'
+        raw = self._db.get_global_setting('api_keys_json') or '{}'
         try:
             parsed = json.loads(raw)
             api_key = parsed.get('anthropic', '').strip() if isinstance(parsed, dict) else ''
@@ -636,8 +765,8 @@ class MainWindow(QMainWindow):
             return
         if self._verify_worker is not None and self._verify_worker.isRunning():
             return
-        model = self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5'
-        model_labels = {'claude-haiku-4-5': 'Haiku 4.5', 'claude-sonnet-4-6': 'Sonnet 4.6', 'claude-opus-4-8': 'Opus 4.8'}
+        model = self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
+        model_labels = {'claude-haiku-4-5-20251001': 'Haiku 4.5', 'claude-sonnet-4-6': 'Sonnet 4.6', 'claude-opus-4-8': 'Opus 4.8'}
         unverified = self._db.get_unverified_media()
         total = len(unverified)
         if total == 0:
@@ -660,6 +789,7 @@ class MainWindow(QMainWindow):
         self._verify_worker.done.connect(self._on_verify_done)
         self._verify_worker.error.connect(self._on_verify_error)
         self._verify_worker.api_key_missing.connect(self._on_verify_api_key_missing)
+        self._verify_worker.aborted.connect(self._on_verify_aborted)
         self._verify_progress_bar.setValue(0)
         self._verify_progress_label.setText('Preparing…')
         self._verify_progress_area.setVisible(True)
@@ -695,7 +825,14 @@ class MainWindow(QMainWindow):
     def _on_verify_cancel(self) -> None:
         if self._verify_worker is not None and self._verify_worker.isRunning():
             self._verify_worker.cancel()
+            self._verify_cancel_btn.setEnabled(False)
         self._verify_progress_label.setText('Cancelling…')
+    def _on_verify_aborted(self) -> None:
+        self._verify_progress_area.setVisible(False)
+        self._verify_btn.setEnabled(True)
+        self._cleanup_verify_worker()
+        dark_warning(self, 'Verification Aborted',
+                     'Auto-verify was stopped because the active profile was switched.')
     def _cleanup_verify_worker(self) -> None:
         """Disconnect signals and clean up the verify worker reference."""
         if self._verify_worker is not None:
@@ -706,17 +843,44 @@ class MainWindow(QMainWindow):
                 (self._verify_worker.done, self._on_verify_done),
                 (self._verify_worker.error, self._on_verify_error),
                 (self._verify_worker.api_key_missing, self._on_verify_api_key_missing),
+                (self._verify_worker.aborted, self._on_verify_aborted),
             ]:
                 try:
                     signal.disconnect(slot)
                 except RuntimeError:
                     pass
             self._verify_worker = None
+        self._verify_cancel_btn.setEnabled(True)
+
+    def _cleanup_fetch_worker(self) -> None:
+        """Disconnect signals and clean up the fetch worker reference."""
+        if self._fetch_worker is not None:
+            for signal, slot in [
+                (self._fetch_worker.finished, self._on_fetch_done),
+                (self._fetch_worker.error, self._on_fetch_error),
+                (self._fetch_worker.api_key_missing, self._on_api_key_missing),
+                (self._fetch_worker.media_fetched, self._on_media_fetched),
+                (self._fetch_worker.profile_changed, self._on_profile_changed_during_fetch),
+                (self._fetch_worker.cooldown_active, self._on_cooldown),
+                (self._fetch_worker.progress, self._on_fetch_progress),
+            ]:
+                try:
+                    signal.disconnect(slot)
+                except RuntimeError:
+                    pass
+            self._fetch_worker = None
+    def _restore_refresh_button(self) -> None:
+        """Re-enable and restore the text of the Refresh All button."""
+        self._refresh_all_btn.setEnabled(True)
+        self._refresh_all_btn.setText(self._refresh_all_btn._original_text)
+
     def _cancel_fetch(self) -> None:
         """Cancel any running fetch worker without blocking the UI."""
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             self._fetch_worker.cancel()
-            self._fetch_status.setVisible(False)
+        self._cooldown_timer.stop()
+        self._fetch_status.setVisible(False)
+        self._cleanup_fetch_worker()
 
     def start_fetch(self, creator_id: int | None=None) -> None:
         """Kick off a background API fetch.
@@ -737,38 +901,51 @@ class MainWindow(QMainWindow):
         self._fetch_status.setVisible(True)
         self._fetch_status.setText('Fetching…')
         self._refresh_all_btn.setEnabled(False)
+        self._refresh_all_btn.setText('⟳ Refreshing…')
         self._fetch_worker.start()
     def _on_fetch_done(self) -> None:
         """Rebuild cards from DB so fresh PFPs and stats appear immediately.
 
-        Only refreshes if data was actually fetched (media_fetched was emitted).
-        Also refreshes the media history dialog if one is open.
+        Always refreshes cards (partial data may have been fetched even if
+        some per-creator errors occurred).  Also refreshes the media history
+        dialog if one is open.
         """
+        # Clean up any deferred profile switch connection.
+        if self._fetch_worker is not None:
+            try:
+                self._fetch_worker.finished.disconnect(self._on_fetch_done_for_profile_switch)
+            except (RuntimeError, TypeError):
+                pass
+        self._cooldown_timer.stop()
         self._fetch_status.setVisible(False)
-        self._refresh_all_btn.setEnabled(True)
+        self._restore_refresh_button()
         if self._data_fetched:
             self._refresh_cards()
-            if self._active_history is not None:
-                try:
-                    self._active_history.refresh_completed()
-                except RuntimeError:
-                    pass
-        self._data_fetched = False
-    def _on_fetch_error(self, msg: str) -> None:
-        logger.warning('Fetch error: %s', msg)
-        self._fetch_status.setVisible(False)
-        self._refresh_all_btn.setEnabled(True)
         if self._active_history is not None:
             try:
                 self._active_history.refresh_completed()
             except RuntimeError:
                 pass
+        self._data_fetched = False
+        self._cleanup_fetch_worker()
+    def _on_fetch_error(self, msg: str) -> None:
+        """Handle a per-creator fetch error.
+
+        These are non-fatal — the worker continues processing other creators.
+        Show the error briefly in the status label, but do NOT restore the
+        button or clean up the worker; _on_fetch_done handles that when the
+        overall fetch completes.
+        """
+        logger.warning('Fetch error: %s', msg)
+        self._fetch_status.setVisible(True)
+        self._fetch_status.setText(f'⚠ {msg}')
     def _on_fetch_progress(self, msg: str) -> None:
         self._fetch_status.setText(msg)
         self._fetch_status.setVisible(True)
     def _on_api_key_missing(self, msg: str) -> None:
         self._banner.setVisible(True)
-        self._refresh_all_btn.setEnabled(True)
+        self._restore_refresh_button()
+        self._cleanup_fetch_worker()
         if self._active_history is not None:
             try:
                 self._active_history.refresh_completed()
@@ -780,19 +957,38 @@ class MainWindow(QMainWindow):
     def _on_cooldown(self, remaining: int) -> None:
         """Called when a fetch is skipped because the cooldown is active."""
         logger.info('Fetch skipped — cooldown active, %ds remaining.', remaining)
-        self._refresh_all_btn.setEnabled(True)
-        self._fetch_status.setVisible(False)
+        self._restore_refresh_button()
+        self._cooldown_remaining = remaining
+        self._fetch_status.setVisible(True)
+        self._fetch_status.setText(f'Cooldown — {remaining}s remaining')
+        self._refresh_all_btn.setEnabled(False)
+        self._cooldown_timer.start()
+        self._cleanup_fetch_worker()
         if self._active_history is not None:
             try:
                 self._active_history.refresh_completed()
             except RuntimeError:
                 return
 
+    def _cooldown_tick(self) -> None:
+        """Count down the cooldown timer and re-enable the Refresh All button when done."""
+        self._cooldown_remaining -= 1
+        if self._cooldown_remaining <= 0:
+            self._cooldown_timer.stop()
+            self._fetch_status.setVisible(False)
+            self._refresh_all_btn.setEnabled(True)
+        else:
+            self._fetch_status.setText(f'Cooldown — {self._cooldown_remaining}s remaining')
+
     def _on_profile_changed_during_fetch(self) -> None:
         """Called when the database profile switches while a fetch is running."""
         self._refresh_cards()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            if self._search_edit.text():
+                self._search_edit.clear()
+                return
         if handle_fullscreen_keypress(self, event):
             return
         super().keyPressEvent(event)
@@ -853,31 +1049,61 @@ class MainWindow(QMainWindow):
         super().dropEvent(event)
 
     def closeEvent(self, event) -> None:
-        self._timer.stop()
-        self._bg_canvas._anim.stop()
-        try:
-            self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
-        except RuntimeError:
-            pass
-        if self._fetch_worker is not None:
-            self._fetch_worker.cancel()
-            self._fetch_worker.wait(5000)
-            self._fetch_worker.finished.connect(self._fetch_worker.deleteLater)
-            for signal, slot in [(self._fetch_worker.finished, self._on_fetch_done), (self._fetch_worker.error, self._on_fetch_error), (self._fetch_worker.api_key_missing, self._on_api_key_missing), (self._fetch_worker.media_fetched, self._on_media_fetched), (self._fetch_worker.profile_changed, self._on_profile_changed_during_fetch), (self._fetch_worker.cooldown_active, self._on_cooldown), (self._fetch_worker.progress, self._on_fetch_progress)]:
+        running_workers = []
+        if self._fetch_worker is not None and self._fetch_worker.isRunning():
+            running_workers.append(self._fetch_worker)
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            running_workers.append(self._verify_worker)
+
+        if not running_workers:
+            self._timer.stop()
+            self._bg_canvas._anim.stop()
+            try:
+                self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
+            except RuntimeError:
+                pass
+            self._db.close()
+            super().closeEvent(event)
+            return
+
+        if self._pending_close:
+            # User clicked close again — force quit.
+            # Don't close the DB here; workers may still be using it.
+            # Python's shutdown will handle cleanup.
+            event.accept()
+            return
+
+        # Defer shutdown: cancel workers and wait for them to finish.
+        self._pending_close = True
+        event.ignore()
+        for worker in running_workers:
+            # Connect finished BEFORE cancel to avoid a race where the worker
+            # finishes between the isRunning() check and the connect() call.
+            worker.finished.connect(self._on_worker_finished_for_close)
+            if not worker.isRunning():
+                # Already finished — handle directly.
                 try:
-                    signal.disconnect(slot)
+                    worker.finished.disconnect(self._on_worker_finished_for_close)
                 except RuntimeError:
                     pass
-            self._fetch_worker = None
-        if self._verify_worker is not None:
-            self._verify_worker.cancel()
-            self._verify_worker.wait(5000)
-            self._verify_worker.finished.connect(self._verify_worker.deleteLater)
-            for signal, slot in [(self._verify_worker.progress, self._on_verify_progress), (self._verify_worker.progress_text, self._on_verify_progress_text), (self._verify_worker.video_verified, self._on_video_verified), (self._verify_worker.done, self._on_verify_done), (self._verify_worker.error, self._on_verify_error), (self._verify_worker.api_key_missing, self._on_verify_api_key_missing)]:
-                try:
-                    signal.disconnect(slot)
-                except RuntimeError:
-                    pass
-            self._verify_worker = None
-        self._db.close()
-        super().closeEvent(event)
+                self._on_worker_finished_for_close()
+            else:
+                worker.cancel()
+        self._fetch_status.setVisible(True)
+        self._fetch_status.setText('Waiting for background tasks…')
+
+    def _on_worker_finished_for_close(self) -> None:
+        """Called when a worker finishes during deferred shutdown."""
+        still_running = (
+            (self._fetch_worker is not None and self._fetch_worker.isRunning())
+            or (self._verify_worker is not None and self._verify_worker.isRunning())
+        )
+        if not still_running:
+            self._timer.stop()
+            self._bg_canvas._anim.stop()
+            try:
+                self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
+            except RuntimeError:
+                pass
+            self._db.close()
+            self.close()

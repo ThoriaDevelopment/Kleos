@@ -14,7 +14,7 @@ class _ApiKeysTab(QWidget):
         self._db = db
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        raw = db.get_setting('api_keys_json') or '{}'
+        raw = db.get_global_setting('api_keys_json') or '{}'
         keys = json.loads(raw) if raw else {}
         self._yt_key = QLineEdit(keys.get('youtube', ''))
         self._yt_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -50,7 +50,7 @@ class _ApiKeysTab(QWidget):
         self._limit_spin.setSpecialValueText('All')
         layout.addWidget(self._limit_spin)
         layout.addStretch(1)
-        note = QLabel('Keys are stored locally in the active database file.')
+        note = QLabel('API keys are shared across all profiles.')
         note.setStyleSheet('color: rgba(224,224,224,0.4); font-size: 10px;')
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -67,13 +67,13 @@ class _ApiKeysTab(QWidget):
                     dark_warning(self, 'Invalid YouTube Key', f'YouTube API keys are 39 characters long (got {len(yt_key)}).\nThe YouTube key was not saved, but Twitch keys were saved.')
                     yt_key = ''
         keys = {'youtube': yt_key, 'twitch_client_id': twitch_cid, 'twitch_client_secret': twitch_secret, 'anthropic': anthropic_key}
-        self._db.set_setting('api_keys_json', json.dumps(keys))
+        self._db.set_global_setting('api_keys_json', json.dumps(keys))
         self._db.set_setting('fetch_video_limit', str(self._limit_spin.value()))
 class _VerifyTab(QWidget):
     """Community description and Claude model selection for auto-verification."""
     _MAX_WORDS = 300
     _MODELS = [
-        ('Haiku 4.5 (fastest, cheapest)', 'claude-haiku-4-5'),
+        ('Haiku 4.5 (fastest, cheapest)', 'claude-haiku-4-5-20251001'),
         ('Sonnet 4.6 (balanced)', 'claude-sonnet-4-6'),
         ('Opus 4.8 (most thorough)', 'claude-opus-4-8'),
     ]
@@ -110,7 +110,7 @@ class _VerifyTab(QWidget):
         model_label.setStyleSheet('font-weight: bold;')
         layout.addWidget(model_label)
         self._model_combo = QComboBox()
-        saved_model = db.get_setting('auto_verify_model') or 'claude-haiku-4-5'
+        saved_model = db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
         for i, (label, model_id) in enumerate(_VerifyTab._MODELS):
             self._model_combo.addItem(label, model_id)
             if model_id == saved_model:
@@ -379,7 +379,7 @@ class _RoleManagerTab(QWidget):
             else:
                 try:
                     self._db.add_role(name, color)
-                except Exception:
+                except ValueError:
                     dark_warning(self, 'Duplicate', f'Role \'{name}\' already exists.')
                     return None
                 self._changed = True

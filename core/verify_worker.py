@@ -64,6 +64,7 @@ class VerifyWorker(QThread):
     done = pyqtSignal(int)
     error = pyqtSignal(str)
     api_key_missing = pyqtSignal()
+    aborted = pyqtSignal()
 
     def __init__(
         self,
@@ -77,6 +78,7 @@ class VerifyWorker(QThread):
         self._community_description = community_description
         self._model = model
         self._cancel = threading.Event()
+        self._expected_profile = ''
 
     def cancel(self) -> None:
         """Request the worker to stop at the next opportunity."""
@@ -93,7 +95,7 @@ class VerifyWorker(QThread):
         # Read the Anthropic API key directly from settings, bypassing
         # load_api_keys which may reject the dict when YouTube/Twitch
         # keys are absent.
-        raw = self._db.get_setting("api_keys_json") or "{}"
+        raw = self._db.get_global_setting("api_keys_json") or "{}"
         try:
             parsed = json.loads(raw)
             api_key = parsed.get("anthropic", "").strip() if isinstance(parsed, dict) else ""
@@ -104,7 +106,7 @@ class VerifyWorker(QThread):
             return
 
         system_prompt = _SYSTEM_PROMPT.format(
-            community_description=self._community_description
+            community_description=self._community_description.replace('{', '{{').replace('}', '}}')
         )
 
         # Only evaluate unverified videos.
@@ -114,13 +116,25 @@ class VerifyWorker(QThread):
             self.done.emit(0)
             return
 
+        # Snapshot the active profile so we can detect mid-run switches.
+        self._expected_profile = self._db.current_profile
+
         client = anthropic.Anthropic(api_key=api_key)
         verified_count = 0
-        use_temperature = self._model == "claude-haiku-4-5"
+        use_temperature = self._model.startswith("claude-haiku")
 
         for i, row in enumerate(unverified, start=1):
             if self._cancel.is_set():
                 break
+
+            # Abort if the user switched profiles mid-verification.
+            if self._db.current_profile != self._expected_profile:
+                logger.warning(
+                    'Profile changed from \'%s\' to \'%s\' during verification — aborting.',
+                    self._expected_profile, self._db.current_profile,
+                )
+                self.aborted.emit()
+                return
 
             self.progress.emit(i, total)
             self.progress_text.emit(f"Verifying {i}/{total} videos…")
@@ -147,6 +161,9 @@ class VerifyWorker(QThread):
             # Call Claude with retry on rate-limit errors.
             response_text = self._call_with_retry(client, create_kwargs, i, title)
             if response_text is None:
+                if self._cancel.is_set():
+                    # Cancelled mid-retry — fall through to done.emit()
+                    break
                 # Fatal error already emitted; abort.
                 return
 
@@ -154,6 +171,16 @@ class VerifyWorker(QThread):
                 break
 
             if response_text.strip().upper().startswith("YES"):
+                # Cooperative guard: verify the profile hasn't changed
+                # before writing to the database, preventing cross-profile
+                # data corruption.
+                if self._db.current_profile != self._expected_profile:
+                    logger.warning(
+                        'Profile changed from \'%s\' to \'%s\' during verification — aborting.',
+                        self._expected_profile, self._db.current_profile,
+                    )
+                    self.aborted.emit()
+                    return
                 self._db.set_verified(content_id, True)
                 self.video_verified.emit(content_id)
                 verified_count += 1

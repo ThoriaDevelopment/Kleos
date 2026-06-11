@@ -5,7 +5,7 @@ from pathlib import Path
 def _app_data_dir() -> Path:
     """Return the platform-appropriate data directory for Kleos.\n\nWindows: %APPDATA%\\.kleos\nOthers:  ~/.kleos\n"""
     if sys.platform == 'win32':
-        base = Path(os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming'))
+        base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
         return base / '.kleos'
     else:
         base = Path.home()
@@ -13,4 +13,5 @@ def _app_data_dir() -> Path:
 APP_DIR: Path = _app_data_dir()
 STORAGE_DIR: Path = APP_DIR / 'storage'
 BACKUPS_DIR: Path = APP_DIR / 'storage' / 'backups'
+GLOBAL_SETTINGS_PATH: Path = STORAGE_DIR / 'global_settings.json'
 THUMBNAILS_DIR: Path = APP_DIR / 'cache' / 'thumbnails'

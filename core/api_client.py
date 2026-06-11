@@ -358,7 +358,7 @@ def _is_valid_yt_key(key: str) -> bool:
     return bool(_YT_KEY_RE.match(key.strip()))
 def load_api_keys(db: DatabaseManager) -> tuple[dict[str, str] | None, str | None]:
     """Read ``api_keys_json`` from the database.\n\nFalls back to the ``KLEOS_YT_API_KEY`` environment variable when the\nstored YouTube key is missing or fails validation.\n\nReturns ``(keys_dict, None)`` on success or ``(None, error_message)``\nwhen keys are missing or malformed so the UI can show a warning.\n"""
-    raw = db.get_setting('api_keys_json')
+    raw = db.get_global_setting('api_keys_json')
     keys = {}
     if raw and raw != '{}':
         try:
@@ -429,6 +429,26 @@ def _parse_youtube_link(link: str) -> tuple[str | None, bool]:
     if re.fullmatch(r'[a-zA-Z0-9_.-]+', link):
         return (link, True)
     return (None, False)
+def _parse_twitch_link(link: str) -> str | None:
+    """Extract a Twitch login name from a stored Twitch link.
+
+    Recognised formats:
+    * ``https://www.twitch.tv/login``
+    * ``https://twitch.tv/login``
+    * ``https://m.twitch.tv/login``
+    * Bare login name
+
+    Returns the login string, or None if the link cannot be parsed.
+    """
+    if not link:
+        return None
+    link = link.strip()
+    m = re.search(r'twitch\.tv/([a-zA-Z0-9_]+)', link)
+    if m:
+        return m.group(1).lower()
+    if re.fullmatch(r'[a-zA-Z0-9_]+', link):
+        return link.lower()
+    return None
 class FetchWorker(QThread):
     """Background thread that fetches media from YouTube/Twitch APIs,\ncaches thumbnails, and upserts results into the database.\n\nCommunicates **exclusively** via signals — no GUI code lives here.\n"""
     error = pyqtSignal(str)
@@ -448,7 +468,7 @@ class FetchWorker(QThread):
         self._cancel.set()
     def run(self) -> None:
         """Entry point executed on the worker thread."""
-        elapsed = time.time() - DatabaseManager.last_fetch_time
+        elapsed = time.time() - self._db.last_fetch_time
         if elapsed < _COOLDOWN_SECONDS:
             remaining = int(_COOLDOWN_SECONDS - elapsed)
             logger.info('Cooldown active — %ds remaining, skipping fetch.', remaining)
@@ -459,7 +479,6 @@ class FetchWorker(QThread):
             self.api_key_missing.emit(err)
             return None
         self._expected_profile = self._db.current_profile
-        DatabaseManager.last_fetch_time = time.time()
         total = 0
         yt_key = keys.get('youtube')
         twitch_client_id = keys.get('twitch_client_id')
@@ -474,6 +493,7 @@ class FetchWorker(QThread):
             if not yt_key and not twitch_client_id:
                 self.api_key_missing.emit('No YouTube or Twitch API keys found. Open Settings.')
                 return
+            self._db.last_fetch_time = time.time()
             self.media_fetched.emit(total)
             prune_cache()
         except Exception as exc:
@@ -618,18 +638,20 @@ data contamination.
             if 'twitch' not in platforms:
                 continue
             self.progress.emit(f"Twitch: fetching {c['nickname']}…")
+            # Resolve Twitch login from twitch_link, falling back to nickname.
+            twitch_login = _parse_twitch_link(c.get('twitch_link') or '') or c['nickname'].lower()
             # Track whether each sub-fetch completed without errors so we
             # never prune based on incomplete data.
             streams_ok = False
-            videos_ok = False
+            videos_ok = True   # Default True: considered completed when skipped
             try:
-                profile = client.get_user_profile(c['nickname'])
+                profile = client.get_user_profile(twitch_login)
             except requests.RequestException as exc:
                 logger.warning('Twitch profile fetch failed for %s: %s', c['nickname'], exc)
                 self.error.emit(f"Twitch profile error ({c['nickname']}): {exc}")
                 profile = None
             if profile:
-                if profile.get('pfp_url') and not c.get('pfp_url'):
+                if profile.get('pfp_url'):
                     local_pfp = ensure_pfp(profile['pfp_url'], c['nickname'], creator_id=c['id'])
                     if local_pfp:
                         self._db.update_creator(c['id'], pfp_url=local_pfp)
@@ -639,7 +661,7 @@ data contamination.
             tw_ids = set()
             # Fetch live/recent streams
             try:
-                streams = client.fetch_streams(c['nickname'])
+                streams = client.fetch_streams(twitch_login)
                 streams_ok = True
             except requests.RequestException as exc:
                 logger.warning('Twitch streams fetch failed for %s: %s', c['nickname'], exc)
@@ -657,8 +679,6 @@ data contamination.
                 })
                 tw_ids.add(s.content_id)
                 count += 1
-            if self._cancel.is_set():
-                return count
             # Fetch past broadcasts and highlights (respecting video limit)
             if profile and profile.get('user_id'):
                 try:
@@ -667,6 +687,7 @@ data contamination.
                     logger.warning('Twitch videos fetch failed for %s: %s', c['nickname'], exc)
                     self.error.emit(f"Twitch videos error ({c['nickname']}): {exc}")
                     videos = []
+                    videos_ok = False
                 for v in videos:
                     if self._cancel.is_set():
                         break
@@ -681,6 +702,9 @@ data contamination.
                     count += 1
             if batch:
                 self._db.upsert_media_batch(batch)
+            # If cancelled mid-creator, save what we have and return.
+            if self._cancel.is_set():
+                return count
             # Only prune stale videos when we fetched ALL videos AND every
             # sub-fetch (streams + videos) completed without error or
             # cancellation.  Pruning on partial data would delete content
