@@ -7,6 +7,7 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QProxyStyle, QStackedWidget, QStyle, QStyleOption, QToolTip, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager, determine_startup_profile
 from core.paths import APP_DIR, BACKUPS_DIR, STORAGE_DIR, THUMBNAILS_DIR
+from ui.app_icon import create_app_icon
 from ui.main_window import MainWindow
 from ui.theme import build_global_qss
 from ui.theme.tokens import C
@@ -330,6 +331,7 @@ class FirstRunWizard(QDialog):
         super().__init__(parent)
         self._db = db
         self.setWindowTitle('Welcome to Kleos')
+        self.setWindowIcon(create_app_icon())
         self.setMinimumWidth(540)
         self.setMinimumHeight(480)
         self.setStyleSheet(self._STYLE)
@@ -916,6 +918,7 @@ def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle(_KleosStyle(app.style()))
     app.setStyleSheet(build_global_qss())
+    app.setWindowIcon(create_app_icon())
     db = DatabaseManager(determine_startup_profile())
 
     # First-run wizard: show only once
