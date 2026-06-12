@@ -1,10 +1,11 @@
 import os
 import sys
+import logging
 # Set tooltip display duration to 3 seconds (must be set before QApplication init)
 os.environ['QT_TOOLTIP_TIMEOUT'] = '3000'
 from PyQt6.QtCore import QEvent, QObject, Qt
 from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QProxyStyle, QStackedWidget, QStyle, QStyleOption, QToolTip, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton, QProxyStyle, QStackedWidget, QStyle, QStyleOption, QToolTip, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager, determine_startup_profile
 from core.paths import APP_DIR, BACKUPS_DIR, STORAGE_DIR, THUMBNAILS_DIR
 from ui.app_icon import create_app_icon
@@ -43,10 +44,21 @@ def _enable_dwm_dark_title_bar(window) -> None:
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
 
 
-def initialize_app_data() -> None:
-    """Ensure the %APPDATA%\\.kleos directory tree exists."""
+logger = logging.getLogger(__name__)
+
+
+def initialize_app_data() -> bool:
+    """Ensure the %APPDATA%\\.kleos directory tree exists.
+
+    Returns True on success, False on failure.
+    """
     for d in [APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.error('Failed to create directory %s: %s', d, exc)
+            return False
+    return True
 
 
 class FirstRunWizard(QDialog):
@@ -907,26 +919,33 @@ class _ToolTipResetFilter(QObject):
     hover-delay entirely."""
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Leave:
+        if event.type() == QEvent.Type.Leave and event.spontaneous():
             if isinstance(obj, QWidget) and obj.toolTip():
                 QToolTip.hideText()
         return False
 
 
 def main() -> None:
-    initialize_app_data()
+    if not initialize_app_data():
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(None, 'Startup Error',
+            'Kleos could not create its data directory.\n'
+            'Please check that you have write access to:\n'
+            f'{APP_DIR}')
+        sys.exit(1)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle(_KleosStyle(app.style()))
     app.setStyleSheet(build_global_qss())
     app.setWindowIcon(create_app_icon())
     db = DatabaseManager(determine_startup_profile())
 
-    # First-run wizard: show only once
+    # First-run wizard: show only once, only mark complete if user accepted
     first_run = db.get_global_setting('first_run_complete')
     if not first_run:
         wizard = FirstRunWizard(db)
-        wizard.exec()
-        db.set_global_setting('first_run_complete', '1')
+        result = wizard.exec()
+        if result == QDialog.DialogCode.Accepted:
+            db.set_global_setting('first_run_complete', '1')
 
     window = MainWindow(db)
     _enable_dwm_dark_title_bar(window)

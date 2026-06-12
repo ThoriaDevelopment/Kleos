@@ -59,13 +59,21 @@ class _ApiKeysTab(QWidget):
         twitch_cid = self._twitch_cid.text().strip()
         twitch_secret = self._twitch_secret.text().strip()
         anthropic_key = self._anthropic_key.text().strip()
-        if yt_key and (not yt_key.startswith('AIza')):
-            dark_warning(self, 'Invalid YouTube Key', 'YouTube API keys must start with \'AIza\'.\nThe YouTube key was not saved, but Twitch keys were saved.')
-            yt_key = ''
-        else:
-            if yt_key and len(yt_key)!= 39:
-                    dark_warning(self, 'Invalid YouTube Key', f'YouTube API keys are 39 characters long (got {len(yt_key)}).\nThe YouTube key was not saved, but Twitch keys were saved.')
-                    yt_key = ''
+        # Load existing keys so we can preserve them on validation failure
+        raw = self._db.get_global_setting('api_keys_json') or '{}'
+        try:
+            existing = json.loads(raw)
+            if not isinstance(existing, dict):
+                existing = {}
+        except json.JSONDecodeError:
+            existing = {}
+        # Validate YouTube key: only update if valid; warn but preserve old value if invalid
+        if yt_key:
+            if not yt_key.startswith('AIza'):
+                dark_warning(self, 'Invalid YouTube Key', 'YouTube API keys must start with \'AIza\'.\nThe YouTube key was not saved; your previous key is preserved.')
+                yt_key = existing.get('youtube', '')
+            elif len(yt_key) != 39:
+                dark_warning(self, 'YouTube Key Warning', f'YouTube API keys are typically 39 characters long (got {len(yt_key)}).\nSaving anyway — verify your key works.')
         keys = {'youtube': yt_key, 'twitch_client_id': twitch_cid, 'twitch_client_secret': twitch_secret, 'anthropic': anthropic_key}
         self._db.set_global_setting('api_keys_json', json.dumps(keys))
         self._db.set_setting('fetch_video_limit', str(self._limit_spin.value()))
@@ -240,13 +248,11 @@ class _ProfilesTab(QWidget):
             else:
                 confirm = dark_question(self, 'Delete Profile', f'Permanently delete profile \'{name}\' and all its data?')
                 if confirm == QMessageBox.StandardButton.Yes:
-                    from core.paths import STORAGE_DIR
-                    for ext in ['', '-wal', '-shm']:
-                        p = STORAGE_DIR / f'{name}.db{ext}'
-                        try:
-                            p.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                    try:
+                        self._db.delete_profile(name)
+                    except ValueError as exc:
+                        dark_warning(self, 'Cannot Delete', str(exc))
+                        return
                     self._refresh_list()
 
     def _on_export(self) -> None:

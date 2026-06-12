@@ -250,6 +250,7 @@ class MainWindow(QMainWindow):
         self._cooldown_timer.timeout.connect(self._cooldown_tick)
         self._cooldown_remaining = 0
         self._pending_profile = None
+        self._pending_import = None
         self.setWindowTitle('Kleos — Media Dashboard')
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(800, 520)
@@ -567,6 +568,11 @@ class MainWindow(QMainWindow):
             self._pending_profile = name
             self._fetch_status.setVisible(True)
             self._fetch_status.setText(f'Switching to {name}…')
+            # Disconnect first to prevent signal accumulation on repeated switches
+            try:
+                self._fetch_worker.finished.disconnect(self._on_fetch_done_for_profile_switch)
+            except (RuntimeError, TypeError):
+                pass
             self._fetch_worker.finished.connect(self._on_fetch_done_for_profile_switch)
             return
         self._db.switch_profile(name)
@@ -587,6 +593,29 @@ class MainWindow(QMainWindow):
             self._db.switch_profile(profile)
             self._refresh_cards()
             self._refresh_profile_combo()
+
+    def _on_fetch_done_for_import(self) -> None:
+        """Complete a deferred profile import after the fetch worker finishes."""
+        if self._fetch_worker is not None:
+            try:
+                self._fetch_worker.finished.disconnect(self._on_fetch_done_for_import)
+            except (RuntimeError, TypeError):
+                pass
+        pending = self._pending_import
+        self._pending_import = None
+        self._fetch_status.setVisible(False)
+        if pending is not None:
+            data, profile_name = pending
+            try:
+                self._db.import_profile(data, profile_name)
+                self._db.switch_profile(profile_name)
+                self._refresh_cards()
+                self._refresh_profile_combo()
+                from ui.dialog_utils import dark_info
+                dark_info(self, 'Profile Imported', f'Profile "{profile_name}" imported and activated.')
+            except Exception as exc:
+                from ui.dialog_utils import dark_warning
+                dark_warning(self, 'Import Failed', str(exc))
     def _on_add_creator(self) -> None:
         if not self._db.get_roles():
             dark_warning(self, 'No Roles Available', 'You must create at least one role before adding a media member.\nOpen Settings → Roles to create one.')
@@ -1029,13 +1058,23 @@ class MainWindow(QMainWindow):
                                 i += 1
                             profile_name = f'{profile_name}_{i}'
                         if self._fetch_worker is not None and self._fetch_worker.isRunning():
+                            # Defer import until fetch worker finishes to avoid DB lock race
                             self._fetch_worker.cancel()
-                        self._db.import_profile(data, profile_name)
-                        self._db.switch_profile(profile_name)
-                        self._refresh_cards()
-                        self._refresh_profile_combo()
-                        from ui.dialog_utils import dark_info
-                        dark_info(self, 'Profile Imported', f'Profile "{profile_name}" imported and activated.')
+                            self._pending_import = (data, profile_name)
+                            self._fetch_status.setVisible(True)
+                            self._fetch_status.setText(f'Importing profile…')
+                            try:
+                                self._fetch_worker.finished.disconnect(self._on_fetch_done_for_profile_switch)
+                            except (RuntimeError, TypeError):
+                                pass
+                            self._fetch_worker.finished.connect(self._on_fetch_done_for_import)
+                        else:
+                            self._db.import_profile(data, profile_name)
+                            self._db.switch_profile(profile_name)
+                            self._refresh_cards()
+                            self._refresh_profile_combo()
+                            from ui.dialog_utils import dark_info
+                            dark_info(self, 'Profile Imported', f'Profile "{profile_name}" imported and activated.')
                         event.acceptProposedAction()
                         return
                     else:
@@ -1057,11 +1096,12 @@ class MainWindow(QMainWindow):
 
         if not running_workers:
             self._timer.stop()
-            self._bg_canvas._anim.stop()
-            try:
-                self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
-            except RuntimeError:
-                pass
+            if not sip.isdeleted(self._bg_canvas) and hasattr(self._bg_canvas, '_anim'):
+                self._bg_canvas._anim.stop()
+                try:
+                    self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
+                except RuntimeError:
+                    pass
             self._db.close()
             super().closeEvent(event)
             return
@@ -1100,10 +1140,21 @@ class MainWindow(QMainWindow):
         )
         if not still_running:
             self._timer.stop()
-            self._bg_canvas._anim.stop()
-            try:
-                self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
-            except RuntimeError:
-                pass
+            if not sip.isdeleted(self._bg_canvas) and hasattr(self._bg_canvas, '_anim'):
+                self._bg_canvas._anim.stop()
+                try:
+                    self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
+                except RuntimeError:
+                    pass
             self._db.close()
             self.close()
+
+    def showEvent(self, event) -> None:
+        """Resume the refresh timer when the window becomes visible."""
+        super().showEvent(event)
+        self._timer.start(60000)
+
+    def hideEvent(self, event) -> None:
+        """Pause the refresh timer when the window is hidden to save CPU."""
+        super().hideEvent(event)
+        self._timer.stop()

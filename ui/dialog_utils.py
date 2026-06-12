@@ -61,6 +61,8 @@ def dark_info(parent: QWidget, title: str, text: str) -> None:
     msg.exec()
 def dark_question(parent: QWidget, title: str, text: str, buttons: QMessageBox.StandardButton=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default: QMessageBox.StandardButton=QMessageBox.StandardButton.No) -> QMessageBox.StandardButton:
     """Show a dark-themed question message box and return the clicked button."""
+    if default and not (default & buttons):
+        default = QMessageBox.StandardButton.No
     msg = QMessageBox(parent)
     msg.setIcon(QMessageBox.Icon.Question)
     msg.setWindowTitle(title)

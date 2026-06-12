@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -15,6 +16,16 @@ from .paths import BACKUPS_DIR, GLOBAL_SETTINGS_PATH, STORAGE_DIR
 logger = logging.getLogger(__name__)
 MAX_BACKUPS = 3
 _BACKUP_DEBOUNCE_S = 60.0
+_PROFILE_RE = re.compile(r'^[A-Za-z0-9 _-]+$')
+
+
+def _validate_profile_name(name: str) -> None:
+    """Raise ValueError if *name* contains path separators or unsafe chars."""
+    if not name or not _PROFILE_RE.match(name):
+        raise ValueError(
+            f'Invalid profile name: {name!r}. '
+            'Use only letters, numbers, spaces, hyphens, and underscores.'
+        )
 
 _GLOBAL_LOCK = threading.Lock()
 _GLOBAL_DEFAULTS: dict[str, str] = {'last_profile': 'default', 'api_keys_json': '{}', 'first_run_complete': ''}
@@ -170,6 +181,7 @@ class DatabaseManager:
         If initialisation fails the old connection is preserved so the
         manager remains usable.
         """
+        _validate_profile_name(profile)
         with self._lock:
             old_conn = self._conn
             old_profile = self._profile
@@ -205,8 +217,42 @@ class DatabaseManager:
     def list_profiles(self) -> list[str]:
         """Return all profile names found in the storage directory."""
         return sorted((p.stem for p in STORAGE_DIR.glob('*.db')))
+
+    def delete_profile(self, profile: str) -> None:
+        """Delete a profile database and its associated files.
+
+        Raises ValueError if *profile* is the currently active profile or
+        contains unsafe characters.
+        """
+        _validate_profile_name(profile)
+        if profile == self._profile:
+            raise ValueError('Cannot delete the active profile. Switch to another profile first.')
+        for ext in ('', '-wal', '-shm'):
+            path = STORAGE_DIR / f'{profile}.db{ext}'
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning('Failed to delete %s: %s', path, exc)
+
+    def get_all_thumbnail_paths(self) -> list[str]:
+        """Return all non-empty thumbnail_path values from media_content."""
+        return [
+            row['thumbnail_path']
+            for row in self._read("SELECT thumbnail_path FROM media_content WHERE thumbnail_path != ''")
+            if row['thumbnail_path']
+        ]
     def _backup(self) -> None:
-        """Create a timestamped backup and prune to MAX_BACKUPS.\n\nCheckpoints the WAL inside the lock first so the .db file contains\nall committed data, then offloads the file copy to a background\nthread so reads aren\'t blocked.\n"""
+        """Create a timestamped backup and prune to MAX_BACKUPS.
+
+        Checkpoints the WAL inside the lock first so the .db file contains
+        all committed data, then offloads the file copy to a background
+        thread so reads aren't blocked.
+
+        Note: the file copy happens outside the lock, so new writes between
+        the checkpoint and the copy are not captured.  This is acceptable
+        for a best-effort point-in-time backup — the backup reflects all
+        data committed before the checkpoint.
+        """
         with self._lock:
             now = time.monotonic()
             if now - self._last_backup_time < _BACKUP_DEBOUNCE_S:
@@ -241,24 +287,22 @@ class DatabaseManager:
         """
         if self._conn is None:
             raise RuntimeError('DatabaseManager is closed')
-        try:
-            with self._lock:
+        with self._lock:
+            try:
                 cursor = self._conn.execute(sql, params)
                 self._conn.commit()
-        except sqlite3.IntegrityError as exc:
-            with self._lock:
+            except sqlite3.IntegrityError as exc:
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
-            raise ValueError(f'Database constraint violation: {exc}') from exc
-        except sqlite3.Error as exc:
-            with self._lock:
+                raise ValueError(f'Database constraint violation: {exc}') from exc
+            except sqlite3.Error as exc:
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
-            raise ValueError(f'Database error: {exc}') from exc
+                raise ValueError(f'Database error: {exc}') from exc
         self._backup()
         return cursor
     def _read(self, sql: str, params: tuple=()) -> list[dict[str, Any]]:
@@ -564,26 +608,42 @@ class DatabaseManager:
         the fresh batch of videos so that only stale (deleted-from-platform)
         entries are removed.
 
-        Chunks the IN clause into batches to stay under SQLite's
-        ``MAX_VARIABLE_NUMBER`` limit (999 on older builds).
+        Uses a temporary table approach to avoid the broken chunked-NOT-IN
+        pattern.  Previously, chunking ``NOT IN (chunk_1)`` then ``NOT IN
+        (chunk_2)`` would delete every row in *chunk_2* (and vice versa)
+        because each chunk only "protected" its own subset.
+
+        Safety: if *current_ids* is empty, this is a no-op.  An empty
+        set almost always means the fetch was incomplete or failed —
+        deleting all media for a creator+platform would be destructive.
+        Callers should handle the empty case explicitly if they truly
+        want to purge all content.
         """
         if not current_ids:
-            cur = self._write(
-                'DELETE FROM media_content WHERE creator_id = ? AND platform = ?',
+            return 0
+        ids = list(current_ids)
+        with self._lock:
+            # Create a temp table of current IDs, then delete rows
+            # NOT in that table.  This avoids the broken chunked-NOT-IN
+            # pattern where each chunk would delete rows from other chunks.
+            self._conn.execute('CREATE TEMP TABLE IF NOT EXISTS _prune_ids (content_id TEXT PRIMARY KEY)')
+            self._conn.execute('DELETE FROM _prune_ids')
+            for i in range(0, len(ids), self._SQL_VARIABLE_LIMIT):
+                chunk = ids[i:i + self._SQL_VARIABLE_LIMIT]
+                placeholders = ','.join('(?)' for _ in chunk)
+                self._conn.execute(
+                    f'INSERT OR IGNORE INTO _prune_ids (content_id) VALUES {placeholders}',
+                    chunk,
+                )
+            cur = self._conn.execute(
+                'DELETE FROM media_content WHERE creator_id = ? AND platform = ? AND content_id NOT IN (SELECT content_id FROM _prune_ids)',
                 (creator_id, platform),
             )
-            return cur.rowcount
-        total = 0
-        ids = list(current_ids)
-        for i in range(0, len(ids), self._SQL_VARIABLE_LIMIT):
-            chunk = ids[i:i + self._SQL_VARIABLE_LIMIT]
-            placeholders = ','.join('?' * len(chunk))
-            cur = self._write(
-                f'DELETE FROM media_content WHERE creator_id = ? AND platform = ? AND content_id NOT IN ({placeholders})',
-                (creator_id, platform, *chunk),
-            )
-            total += cur.rowcount
-        return total
+            rowcount = cur.rowcount
+            self._conn.execute('DELETE FROM _prune_ids')
+            self._conn.commit()
+        self._backup()
+        return rowcount
 
     # ── Profile import / export ──────────────────────────────────────────
 
@@ -623,6 +683,7 @@ class DatabaseManager:
         On failure the new database is deleted and the previous profile is
         restored.
         """
+        _validate_profile_name(profile_name)
         if profile_name in self.list_profiles():
             raise ValueError(f'Profile "{profile_name}" already exists')
         if data.get('version') != 1:

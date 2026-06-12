@@ -43,6 +43,18 @@ RequestExecutionLevel admin
 ; -------------------------------------------------------------------------
 ; Installer Sections
 ; -------------------------------------------------------------------------
+
+; Check for running Kleos instance before installing
+Section "" SEC_PRECHECK
+  ; Try to find a running Kleos process and warn the user
+  FindWindow $0 "Kleos — Media Dashboard" ""
+  StrCmp $0 0 no_kleos_running
+    MessageBox MB_OK|MB_ICONEXCLAMATION \
+      "Kleos appears to be running.$\n$\nPlease close Kleos before installing the update." \
+      /SD IDOK
+  no_kleos_running:
+SectionEnd
+
 Section "MainSection" SEC01
   SetOutPath "$INSTDIR"
   SetOverwrite ifnewer
@@ -111,8 +123,17 @@ Section Uninstall
   RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
 
-  ; Remove user data (databases, cache, thumbnails, backups)
-  RMDir /r "$APPDATA\.kleos"
+  ; Ask user whether to keep their data
+  MessageBox MB_YESNO "Do you want to keep your Kleos data (profiles, settings, thumbnails)?$\n$\nChoose Yes to keep your data for future reinstallations.$\nChoose No to delete all Kleos data permanently." IDYES keep_data
+
+  ; Remove user data (databases, cache, thumbnails, backups) — only if user chose No
+  IfFileExists "$APPDATA\.kleos" delete_data
+    DetailPrint "No Kleos data directory found — skipping."
+    Goto keep_data
+  delete_data:
+    RMDir /r "$APPDATA\.kleos"
+
+  keep_data:
 
   ; Remove registry entries
   DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"

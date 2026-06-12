@@ -69,7 +69,7 @@ class YouTubeClient:
         self._session = requests.Session()
         self._session.mount('https://', _RETRY_ADAPTER)
         self._session.mount('http://', _RETRY_ADAPTER)
-    def fetch_latest(self, channel_id: str, *, uploads_playlist_id: str | None = None, cancel_check=None, max_videos: int | None = None) -> list[YouTubeVideo]:
+    def fetch_latest(self, channel_id: str, *, uploads_playlist_id: str | None = None, cancel_check=None, max_videos: int | None = None) -> tuple[list[YouTubeVideo], bool]:
         """Return videos for *channel_id* via paginated playlistItems.
 
         Uses the channel's uploads playlist (``UU…``) instead of the
@@ -83,6 +83,12 @@ class YouTubeClient:
 
         *cancel_check* is an optional callable that returns True when
         the fetch should be aborted between pages.
+
+        Returns ``(videos, complete)`` where *complete* is True only if
+        every page was fetched without error or early cancellation.
+        On partial failure, returns whatever videos were collected so far
+        with *complete* set to False — callers can save this partial data
+        instead of losing everything.
         """
         playlist_id = uploads_playlist_id
         if not playlist_id:
@@ -90,11 +96,13 @@ class YouTubeClient:
                 playlist_id = 'UU' + channel_id[2:]
             else:
                 logger.warning("Cannot derive uploads playlist from '%s'", channel_id)
-                return []
+                return [], False
         all_videos = []
+        complete = True
         next_page_token = None
         while True:
             if cancel_check and cancel_check():
+                complete = False
                 break
             params = {
                 'key': self._key,
@@ -104,9 +112,19 @@ class YouTubeClient:
             }
             if next_page_token:
                 params['pageToken'] = next_page_token
-            resp = self._session.get(YT_PLAYLIST_ITEMS_URL, params=params, timeout=_REQUEST_TIMEOUT)
-            _diag_response(resp, f'YouTube playlistItems playlist={playlist_id} page={next_page_token!r}')
-            data = resp.json()
+            try:
+                resp = self._session.get(YT_PLAYLIST_ITEMS_URL, params=params, timeout=_REQUEST_TIMEOUT)
+                _diag_response(resp, f'YouTube playlistItems playlist={playlist_id} page={next_page_token!r}')
+            except requests.RequestException as exc:
+                logger.warning('YouTube playlistItems page fetch failed for %s: %s', channel_id, exc)
+                complete = False
+                break
+            try:
+                data = resp.json()
+            except (ValueError, json.JSONDecodeError):
+                logger.warning('YouTube playlistItems returned invalid JSON for %s', channel_id)
+                complete = False
+                break
             items = data.get('items', [])
             video_ids = []
             for it in items:
@@ -135,45 +153,68 @@ class YouTubeClient:
             next_page_token = data.get('nextPageToken')
             if not next_page_token:
                 break
-        return all_videos
+        return all_videos, complete
     def _fetch_stats(self, video_ids: list[str]) -> dict[str, dict]:
-        """Batch-fetch view counts, duration, and content details."""
+        """Batch-fetch view counts, duration, and content details.
+
+        Returns an empty dict on failure so that partial page data can
+        still be saved — videos will just lack view counts and short
+        detection until the next refresh.
+        """
         if not video_ids:
             return {}
-        else:
-            params = {'key': self._key, 'id': ','.join(video_ids), 'part': 'statistics,contentDetails'}
-            resp = self._session.get(YT_VIDEOS_URL, params=params, timeout=_REQUEST_TIMEOUT)
-            _diag_response(resp, 'YouTube video stats')
-            result = {}
-            for v in resp.json().get('items', []):
-                info = v.get('statistics', {})
-                cd = v.get('contentDetails', {})
-                duration = cd.get('duration', '')
-                info['is_short'] = self._is_short_duration(duration)
-                result[v['id']] = info
-            return result
+        result = {}
+        # YouTube API limits to 50 IDs per request, so chunk if needed.
+        for i in range(0, len(video_ids), 50):
+            chunk = video_ids[i:i + 50]
+            try:
+                params = {'key': self._key, 'id': ','.join(chunk), 'part': 'statistics,contentDetails'}
+                resp = self._session.get(YT_VIDEOS_URL, params=params, timeout=_REQUEST_TIMEOUT)
+                _diag_response(resp, 'YouTube video stats')
+                try:
+                    data = resp.json()
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning('YouTube video stats returned invalid JSON')
+                    continue
+                for v in data.get('items', []):
+                    info = v.get('statistics', {})
+                    cd = v.get('contentDetails', {})
+                    duration = cd.get('duration', '')
+                    info['is_short'] = self._is_short_duration(duration)
+                    result[v['id']] = info
+            except requests.RequestException as exc:
+                logger.warning('YouTube video stats fetch failed: %s', exc)
+        return result
     @staticmethod
     def _is_short_duration(iso_duration: str) -> bool:
         """Return True if an ISO 8601 duration represents 60 seconds or less."""
         if not iso_duration:
             return False
-        else:
-            import re as _re
-            m = _re.match('PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+(?:\\.\\d+)?)S)?', iso_duration)
-            if not m:
-                return False
-            else:
-                hours = int(m.group(1) or 0)
-                minutes = int(m.group(2) or 0)
-                seconds = float(m.group(3) or 0)
-                total_seconds = hours * 3600 + minutes * 60 + seconds
-                return total_seconds <= 60
+        m = re.match('PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+(?:\\.\\d+)?)S)?', iso_duration)
+        if not m:
+            return False
+        hours = int(m.group(1) or 0)
+        minutes = int(m.group(2) or 0)
+        seconds = float(m.group(3) or 0)
+        # Unknown/zero duration (e.g. bare "PT") should not be classified as a short
+        if hours == 0 and minutes == 0 and seconds == 0:
+            return False
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        return total_seconds <= 60
     def get_channel_id(self, handle: str) -> str | None:
         """Resolve a ``@handle`` to a channel ID."""
-        params = {'key': self._key, 'part': 'id', 'forHandle': handle.lstrip('@')}
-        resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
-        _diag_response(resp, f'YouTube channel resolve handle={handle}')
-        items = resp.json().get('items', [])
+        try:
+            params = {'key': self._key, 'part': 'id', 'forHandle': handle.lstrip('@')}
+            resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
+            _diag_response(resp, f'YouTube channel resolve handle={handle}')
+        except requests.RequestException as exc:
+            logger.warning('YouTube channel resolve failed for %s: %s', handle, exc)
+            return None
+        try:
+            items = resp.json().get('items', [])
+        except (ValueError, json.JSONDecodeError):
+            logger.warning('YouTube channel resolve returned invalid JSON for handle=%s', handle)
+            return None
         return items[0]['id'] if items else None
     def fetch_channel_profile(self, identifier: str, *, is_handle: bool=False) -> dict[str, Any] | None:
         """Fetch channel metadata including display name, PFP URL, and stats.\n\nWhen *is_handle* is True, *identifier* is treated as a ``@handle``\nand routed through the ``forHandle`` parameter.  Otherwise it is\ntreated as a channel ID and routed through ``id``.\n\nReturns a dict with keys ``channel_id``, ``display_name``,\n``pfp_url``, ``subscriber_count``, ``view_count``, or ``None``\non failure.\n"""
@@ -252,16 +293,26 @@ class TwitchClient:
             raise requests.RequestException('Twitch auth response missing access_token')
         else:
             self._token = token
-            self._token_expiry = time.time() + data.get('expires_in', 3600) - 60
+            # Ensure token is valid for at least 60 seconds from now,
+            # even if expires_in is very small or negative.
+            self._token_expiry = max(time.time() + 60, time.time() + data.get('expires_in', 3600) - 60)
     def _headers(self) -> dict[str, str]:
         self._ensure_token()
         return {'Client-Id': self._client_id, 'Authorization': f'Bearer {self._token}'}
     def fetch_streams(self, user_login: str, first: int = 10) -> list[TwitchStream]:
         """Return recent/live streams for *user_login*, newest first."""
         params = {'user_login': user_login, 'first': str(first)}
-        resp = self._session.get(TWITCH_STREAMS_URL, params=params, headers=self._headers(), timeout=_REQUEST_TIMEOUT)
-        _diag_response(resp, f'Twitch streams login={user_login}')
-        items = resp.json().get('data', [])
+        try:
+            resp = self._session.get(TWITCH_STREAMS_URL, params=params, headers=self._headers(), timeout=_REQUEST_TIMEOUT)
+            _diag_response(resp, f'Twitch streams login={user_login}')
+        except requests.RequestException as exc:
+            logger.warning('Twitch streams request failed for %s: %s', user_login, exc)
+            return []
+        try:
+            items = resp.json().get('data', [])
+        except (ValueError, json.JSONDecodeError):
+            logger.warning('Twitch streams returned invalid JSON for %s', user_login)
+            return []
         results = []
         for s in items:
             thumb = s.get('thumbnail_url', '').replace('{width}', '446').replace('{height}', '251')
@@ -285,7 +336,11 @@ class TwitchClient:
         except requests.RequestException as exc:
             logger.warning('Twitch user profile fetch failed: %s', exc)
             return None
-        items = resp.json().get('data', [])
+        try:
+            items = resp.json().get('data', [])
+        except (ValueError, json.JSONDecodeError):
+            logger.warning('Twitch user profile returned invalid JSON for %s', login)
+            return None
         if not items:
             return None
         user = items[0]
@@ -326,8 +381,14 @@ class TwitchClient:
                 logger.warning('Twitch videos fetch failed for user_id=%s: %s', user_id, exc)
                 complete = False
                 break
-            data = resp.json().get('data', [])
-            for v in data:
+            try:
+                data = resp.json()
+            except (ValueError, json.JSONDecodeError):
+                logger.warning('Twitch videos returned invalid JSON for user_id=%s', user_id)
+                complete = False
+                break
+            items = data.get('data', [])
+            for v in items:
                 thumb = v.get('thumbnail_url', '').replace('{width}', '446').replace('{height}', '251')
                 raw_views = v.get('view_count', 0) or 0
                 try:
@@ -347,7 +408,7 @@ class TwitchClient:
                 all_videos = all_videos[:max_videos]
                 complete = False
                 break
-            pagination = resp.json().get('pagination', {})
+            pagination = data.get('pagination', {})
             cursor = pagination.get('cursor')
             if not cursor:
                 break
@@ -356,6 +417,17 @@ _YT_KEY_RE = re.compile('^AIza[0-9A-Za-z_-]{35}$')
 def _is_valid_yt_key(key: str) -> bool:
     """Return True if *key* looks like a real YouTube Data API v3 key."""
     return bool(_YT_KEY_RE.match(key.strip()))
+
+
+def _safe_parse_platforms(raw: Any) -> list[str]:
+    """Parse a platforms JSON string safely, returning [] on any failure."""
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
 def load_api_keys(db: DatabaseManager) -> tuple[dict[str, str] | None, str | None]:
     """Read ``api_keys_json`` from the database.\n\nFalls back to the ``KLEOS_YT_API_KEY`` environment variable when the\nstored YouTube key is missing or fails validation.\n\nReturns ``(keys_dict, None)`` on success or ``(None, error_message)``\nwhen keys are missing or malformed so the UI can show a warning.\n"""
     raw = db.get_global_setting('api_keys_json')
@@ -495,7 +567,7 @@ class FetchWorker(QThread):
                 return
             self._db.last_fetch_time = time.time()
             self.media_fetched.emit(total)
-            prune_cache()
+            prune_cache(db=self._db)
         except Exception as exc:
             logger.exception('FetchWorker error')
             self.error.emit(str(exc))
@@ -555,7 +627,7 @@ data contamination.
                 return count
             if self._abort_if_profile_changed():
                 return count
-            platforms = json.loads(c.get('platforms', '[]'))
+            platforms = _safe_parse_platforms(c.get('platforms', '[]'))
             if 'youtube' not in platforms:
                 continue
             self.progress.emit(f"YouTube: fetching {c['nickname']}…")
@@ -590,36 +662,40 @@ data contamination.
                 if profile.get('view_count') is not None:
                     self._db.set_setting(f"yt_channel_views_{c['id']}", str(profile['view_count']))
             uploads_pid = profile.get('uploads_playlist_id') if profile else None
+            fetch_complete = False
             try:
-                videos = client.fetch_latest(channel_id, uploads_playlist_id=uploads_pid, cancel_check=self._cancel.is_set, max_videos=max_videos)
+                videos, fetch_complete = client.fetch_latest(channel_id, uploads_playlist_id=uploads_pid, cancel_check=self._cancel.is_set, max_videos=max_videos)
             except requests.RequestException as exc:
                 logger.warning('YouTube fetch failed for %s: %s', c['nickname'], exc)
                 self.error.emit(f"YouTube error ({c['nickname']}): {exc}")
-            else:
-                batch = []
-                yt_ids = set()
-                for v in videos:
-                    if self._cancel.is_set():
-                        break
-                    self._maybe_clear_thumbnail_cache(v.thumbnail_url)
-                    thumb_local = ensure_thumbnail(v.thumbnail_url) or ''
-                    batch.append({
-                        'creator_id': c['id'], 'platform': 'youtube', 'content_id': v.content_id,
-                        'title': v.title, 'thumbnail_path': thumb_local, 'thumbnail_url': v.thumbnail_url,
-                        'upload_date': v.upload_date, 'view_count': v.view_count,
-                        'is_short': v.is_short, 'description': v.description,
-                    })
-                    yt_ids.add(v.content_id)
-                    count += 1
-                if batch:
-                    self._db.upsert_media_batch(batch)
-                # Only prune stale videos when we fetched ALL videos.
-                # With a limit, we only have a partial batch — pruning would
-                # delete videos that still exist on the platform but weren't fetched.
-                # Also skip pruning if the worker was cancelled mid-fetch, since
-                # yt_ids would be incomplete.
-                if max_videos is None and yt_ids and not self._cancel.is_set():
-                    self._db.prune_stale_media(c['id'], 'youtube', yt_ids)
+                videos = []
+            batch = []
+            yt_ids = set()
+            for v in videos:
+                if self._cancel.is_set():
+                    break
+                self._maybe_clear_thumbnail_cache(v.thumbnail_url)
+                thumb_local = ensure_thumbnail(v.thumbnail_url) or ''
+                batch.append({
+                    'creator_id': c['id'], 'platform': 'youtube', 'content_id': v.content_id,
+                    'title': v.title, 'thumbnail_path': thumb_local, 'thumbnail_url': v.thumbnail_url,
+                    'upload_date': v.upload_date, 'view_count': v.view_count,
+                    'is_short': v.is_short, 'description': v.description,
+                })
+                yt_ids.add(v.content_id)
+                count += 1
+            if batch:
+                self._db.upsert_media_batch(batch)
+            # Only prune stale videos when we fetched ALL videos successfully
+            # AND were not cancelled.  With a limit, pruning would delete
+            # videos that still exist on the platform but weren't fetched.
+            # An incomplete fetch (fetch_complete=False) also means yt_ids
+            # is a subset — pruning would delete videos we simply haven't
+            # fetched yet.
+            if max_videos is None and fetch_complete and yt_ids and not self._cancel.is_set():
+                self._db.prune_stale_media(c['id'], 'youtube', yt_ids)
+            elif not fetch_complete and yt_ids:
+                logger.info('YouTube fetch for %s was incomplete (%d videos saved); skipping prune to preserve existing data', c['nickname'], len(yt_ids))
         return count
 
     def _fetch_twitch(self, client_id: str, client_secret: str) -> int:
@@ -634,7 +710,7 @@ data contamination.
                 return count
             if self._abort_if_profile_changed():
                 return count
-            platforms = json.loads(c.get('platforms', '[]'))
+            platforms = _safe_parse_platforms(c.get('platforms', '[]'))
             if 'twitch' not in platforms:
                 continue
             self.progress.emit(f"Twitch: fetching {c['nickname']}…")

@@ -52,13 +52,8 @@ def _get_download_lock(url: str) -> threading.Lock:
             _download_locks[url] = threading.Lock()
         return _download_locks[url]
 
-def _release_download_lock(key: str) -> None:
-    """Remove a download lock from the dict after use to prevent unbounded growth."""
-    with _download_locks_lock:
-        _download_locks.pop(key, None)
 
-
-def ensure_thumbnail(url: str) -> Optional[str]:
+def ensure_thumbnail(url: str, *, force: bool = False) -> Optional[str]:
     """Download *url* to the local cache if missing, then return its path.
 
     Returns the local file path on success, or ``None`` on download failure.
@@ -67,39 +62,39 @@ def ensure_thumbnail(url: str) -> Optional[str]:
 
     Uses a per-URL lock so that concurrent threads downloading the same
     thumbnail don't race on the temporary file.
+
+    When *force* is True, skips the cache-exists check and always
+    re-downloads the thumbnail (used for high-quality refresh).
     """
     if not url:
         return None
     THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
     local = THUMBNAILS_DIR / _url_to_filename(url)
-    if local.exists() and local.stat().st_size > 0:
+    if not force and local.exists() and local.stat().st_size > 0:
         return str(local)
     lock = _get_download_lock(url)
-    try:
-        with lock:
-            # Re-check after acquiring lock — another thread may have downloaded it
-            if local.exists() and local.stat().st_size > 0:
-                return str(local)
+    with lock:
+        # Re-check after acquiring lock — another thread may have downloaded it
+        if not force and local.exists() and local.stat().st_size > 0:
+            return str(local)
+        try:
+            with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
+                resp.raise_for_status()
+                tmp = local.with_suffix(local.suffix + '.tmp')
+                with open(tmp, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                tmp.replace(local)
+            return str(local)
+        except (requests.RequestException, OSError) as exc:
+            logger.warning('Thumbnail download failed for %s: %s', url, exc)
             try:
-                with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
-                    resp.raise_for_status()
-                    tmp = local.with_suffix(local.suffix + '.tmp')
-                    with open(tmp, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    tmp.replace(local)
-                return str(local)
-            except (requests.RequestException, OSError) as exc:
-                logger.warning('Thumbnail download failed for %s: %s', url, exc)
-                try:
-                    tmp = local.with_suffix(local.suffix + '.tmp')
-                    if tmp.exists():
-                        tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return None
-    finally:
-        _release_download_lock(url)
+                tmp = local.with_suffix(local.suffix + '.tmp')
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
 
 
 def _sanitize_filename(name: str) -> str:
@@ -130,66 +125,96 @@ def ensure_pfp(url: str, nickname: str, creator_id: int | None = None) -> Option
         return str(local)
     lock_key = str(local)  # Lock by destination path, not URL, to prevent races on same file
     lock = _get_download_lock(lock_key)
-    try:
-        with lock:
-            # Re-check after acquiring lock — another thread may have downloaded it
-            if local.exists() and local.stat().st_size > 0:
-                return str(local)
+    with lock:
+        # Re-check after acquiring lock — another thread may have downloaded it
+        if local.exists() and local.stat().st_size > 0:
+            return str(local)
+        try:
+            with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
+                resp.raise_for_status()
+                tmp = local.with_suffix(local.suffix + '.tmp')
+                with open(tmp, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                tmp.replace(local)
+            return str(local)
+        except (requests.RequestException, OSError) as exc:
+            logger.warning('PFP download failed for %s: %s', url, exc)
             try:
-                with requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True) as resp:
-                    resp.raise_for_status()
-                    tmp = local.with_suffix(local.suffix + '.tmp')
-                    with open(tmp, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    tmp.replace(local)
-                return str(local)
-            except (requests.RequestException, OSError) as exc:
-                logger.warning('PFP download failed for %s: %s', url, exc)
-                try:
-                    tmp = local.with_suffix(local.suffix + '.tmp')
-                    if tmp.exists():
-                        tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return None
-    finally:
-        _release_download_lock(lock_key)
+                tmp = local.with_suffix(local.suffix + '.tmp')
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
 
 
-def prune_cache(max_files: int = 500) -> int:
-    """Delete oldest cached thumbnails when the cache exceeds *max_files*.
+def prune_cache(db: Any | None = None, max_orphan_files: int = 200) -> int:
+    """Delete cached thumbnails that are no longer referenced in the database.
 
     Only prunes hash-named thumbnail files (``<16-hex-chars>.<ext>``).
-    PFP files (named ``<nickname>_<id>.<ext>``) are kept because they are
-    expensive to re-download and are not redundant content.
+    PFP files (named ``<nickname>_<id>.<ext>``) are always kept.
+
+    When *db* is provided, the function first collects every
+    ``thumbnail_path`` stored in the ``media_content`` table and treats
+    those files as active.  Only hash-named files that are NOT in this
+    active set are considered orphans and eligible for deletion, sorted
+    oldest-first.  At most *max_orphan_files* orphaned files are kept;
+    any excess is removed.
+
+    When *db* is ``None``, falls back to a simple size-based cap of
+    5 000 files so that callers without a database reference still get
+    reasonable pruning.
 
     Returns the number of files removed.
     """
     THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
     _hash_pattern = re.compile(r'^[0-9a-f]{16}\.\w+$')
     hash_files = [f for f in THUMBNAILS_DIR.iterdir() if f.is_file() and _hash_pattern.match(f.name)]
-    if len(hash_files) <= max_files:
-        return 0
-    def _safe_mtime(f):
+
+    def _safe_mtime(f: Path) -> float:
         try:
             return f.stat().st_mtime
         except (FileNotFoundError, OSError):
             return float('inf')
 
-    hash_files.sort(key=_safe_mtime)
-    to_remove = hash_files[:len(hash_files) - max_files]
-    for f in to_remove:
-        f.unlink(missing_ok=True)
-    return len(to_remove)
+    if db is not None:
+        # Database-aware pruning: only delete thumbnails that are no
+        # longer referenced by any media_content row.  Active thumbnails
+        # (those still in use) are never touched.
+        active_paths: set[str] = set()
+        for path in db.get_all_thumbnail_paths():
+            active_paths.add(str(Path(path)))
+
+        orphans = [f for f in hash_files if str(f) not in active_paths]
+        if len(orphans) <= max_orphan_files:
+            return 0
+        orphans.sort(key=_safe_mtime)
+        to_remove = orphans[:len(orphans) - max_orphan_files]
+        for f in to_remove:
+            f.unlink(missing_ok=True)
+        return len(to_remove)
+    else:
+        # Fallback: simple size-based cap for callers without a DB.
+        simple_cap = 5000
+        if len(hash_files) <= simple_cap:
+            return 0
+        hash_files.sort(key=_safe_mtime)
+        to_remove = hash_files[:len(hash_files) - simple_cap]
+        for f in to_remove:
+            f.unlink(missing_ok=True)
+        return len(to_remove)
 
 
 def refresh_thumbnails_high_quality(db: Any) -> int:
     """Re-fetch all thumbnails from their original URLs, overwriting cached versions.
 
-    Iterates all media_content rows, deletes the cached file for each thumbnail
-    URL, and re-downloads from the source.  Updates ``thumbnail_path`` in the
-    database for every successfully refreshed thumbnail.
+    Iterates all media_content rows and re-downloads each thumbnail from the
+    source URL using ``force=True`` to bypass the cache.  Updates
+    ``thumbnail_path`` in the database for every successfully refreshed thumbnail.
+
+    The old cached file is only replaced after the new download succeeds,
+    avoiding data loss if a download fails.
 
     Returns the number of thumbnails successfully refreshed.
     """
@@ -199,14 +224,7 @@ def refresh_thumbnails_high_quality(db: Any) -> int:
         url = m.get('thumbnail_url', '') or ''
         if not url:
             continue
-        # Delete the existing cached file so ensure_thumbnail re-downloads
-        local_path = THUMBNAILS_DIR / _url_to_filename(url)
-        if local_path.exists():
-            try:
-                local_path.unlink()
-            except OSError:
-                pass
-        new_path = ensure_thumbnail(url)
+        new_path = ensure_thumbnail(url, force=True)
         if new_path:
             db._write(
                 'UPDATE media_content SET thumbnail_path = ? WHERE id = ?',

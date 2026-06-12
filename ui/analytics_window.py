@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEvent, Qt, QTimer
 from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSplitter, QStackedWidget, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager
 from ui.app_icon import create_app_icon
@@ -50,11 +50,21 @@ class _TimelineChart(_ZoomableFigureCanvas, FigureCanvas):
     def _render(self) -> None:
         self._fig.clear()
         ax = self._fig.add_subplot(111)
-        verified_clause = 'AND m.is_verified = 1' if self._verified_only else ''
+        conditions = ["m.upload_date != ''"]
+        params: list[Any] = []
+        if self._verified_only:
+            conditions.append('m.is_verified = 1')
         if self._platform:
-            rows = self._db._read(f'SELECT m.upload_date, m.view_count, c.nickname, m.platform FROM media_content m JOIN creators c ON c.id = m.creator_id WHERE m.upload_date != \'\' {verified_clause} AND m.platform = ? ORDER BY m.upload_date ASC', (self._platform,))
-        else:
-            rows = self._db._read(f'SELECT m.upload_date, m.view_count, c.nickname, m.platform FROM media_content m JOIN creators c ON c.id = m.creator_id WHERE m.upload_date != \'\' {verified_clause} ORDER BY m.upload_date ASC')
+            conditions.append('m.platform = ?')
+            params.append(self._platform)
+        conditions.append('m.creator_id = c.id')
+        where = ' AND '.join(conditions)
+        rows = self._db._read(
+            f'SELECT m.upload_date, m.view_count, c.nickname, m.platform '
+            f'FROM media_content m, creators c '
+            f'WHERE {where} ORDER BY m.upload_date ASC',
+            tuple(params),
+        )
         if not rows:
             label = 'No verified content yet' if self._verified_only else 'No content yet'
             ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=12, color='#888')
@@ -115,11 +125,18 @@ class _MonthlyBarChart(_ZoomableFigureCanvas, FigureCanvas):
     def _render(self) -> None:
         self._fig.clear()
         ax = self._fig.add_subplot(111)
-        verified_clause = 'AND is_verified = 1' if self._verified_only else ''
+        conditions = ["upload_date != ''"]
+        params: list[Any] = []
+        if self._verified_only:
+            conditions.append('is_verified = 1')
         if self._platform:
-            rows = self._db._read(f'SELECT upload_date FROM media_content WHERE upload_date != \'\' {verified_clause} AND platform = ? ORDER BY upload_date ASC', (self._platform,))
-        else:
-            rows = self._db._read(f'SELECT upload_date FROM media_content WHERE upload_date != \'\' {verified_clause} ORDER BY upload_date ASC')
+            conditions.append('platform = ?')
+            params.append(self._platform)
+        where = ' AND '.join(conditions)
+        rows = self._db._read(
+            f'SELECT upload_date FROM media_content WHERE {where} ORDER BY upload_date ASC',
+            tuple(params),
+        )
         if not rows:
             label = 'No verified uploads yet' if self._verified_only else 'No uploads yet'
             ax.text(0.5, 0.5, label, ha='center', va='center', fontsize=12, color='#888')
@@ -173,6 +190,26 @@ class AnalyticsWindow(QDialog):
         if handle_fullscreen_keypress(self, event):
             return
         super().keyPressEvent(event)
+
+    def changeEvent(self, event) -> None:
+        """Prevent the parent window from being minimized when this dialog is minimized.
+
+        On Windows, minimizing a QDialog with WindowMinMaxButtonsHint propagates
+        the minimize to the parent window.  We detect this and restore only the
+        parent, while allowing the dialog to stay minimized normally.
+        """
+        if event.type() == QEvent.Type.WindowStateChange and self.windowState() & Qt.WindowState.WindowMinimized:
+            QTimer.singleShot(0, self._restore_parent_from_minimize)
+        super().changeEvent(event)
+
+    def _restore_parent_from_minimize(self) -> None:
+        """Restore the parent window that was minimized as a side-effect."""
+        parent = self.parent()
+        if parent and isinstance(parent, QWidget):
+            parent.setWindowState(Qt.WindowState.WindowNoState)
+            parent.show()
+            parent.raise_()
+            parent.activateWindow()
     def _build_ui(self) -> None:
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(12, 12, 12, 12)
@@ -280,11 +317,21 @@ class AnalyticsWindow(QDialog):
     def _load_leaderboard(self) -> None:
         from ui.components.creator_card import format_subscriber_count
         self._list.clear()
-        verified_clause = ' AND m.is_verified = 1' if self._verified_only else ''
+        # Build the ON clause conditions for the LEFT JOIN
+        on_conditions = ['m.creator_id = c.id']
+        join_params: list[Any] = []
+        if self._verified_only:
+            on_conditions.append('m.is_verified = 1')
         if self._filter_platform:
-            rows = self._db._read(f'SELECT c.id, c.nickname, COALESCE(SUM(m.view_count), 0) AS total_views FROM creators c LEFT JOIN media_content m ON m.creator_id = c.id AND m.platform = ?{verified_clause} GROUP BY c.id ORDER BY total_views DESC', (self._filter_platform,))
-        else:
-            rows = self._db._read(f'SELECT c.id, c.nickname, COALESCE(SUM(m.view_count), 0) AS total_views FROM creators c LEFT JOIN media_content m ON m.creator_id = c.id{verified_clause} GROUP BY c.id ORDER BY total_views DESC')
+            on_conditions.append('m.platform = ?')
+            join_params.append(self._filter_platform)
+        on_clause = ' AND '.join(on_conditions)
+        sql = (
+            f'SELECT c.id, c.nickname, COALESCE(SUM(m.view_count), 0) AS total_views '
+            f'FROM creators c LEFT JOIN media_content m ON {on_clause} '
+            f'GROUP BY c.id ORDER BY total_views DESC'
+        )
+        rows = self._db._read(sql, tuple(join_params))
         sub_counts = self._db.bulk_subscriber_counts()
         for i, row in enumerate(rows, 1):
             cid = row['id']

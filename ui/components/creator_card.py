@@ -1,12 +1,13 @@
 from __future__ import annotations
 import json
+import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from ui.theme import C, M
 from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt, QTimer, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QGridLayout, QLabel, QMenu, QWidget
+from PyQt6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QGridLayout, QLabel, QMenu, QWidget
 if TYPE_CHECKING:
     from core.db_manager import DatabaseManager
 _ACCENT_R, _ACCENT_G, _ACCENT_B = (QColor(C.ACCENT).red(), QColor(C.ACCENT).green(), QColor(C.ACCENT).blue())
@@ -111,19 +112,25 @@ def format_subscriber_count(yt_subs: int = 0, tw_follows: int = 0) -> str:
         parts.append(f'{_compact_number(tw_follows)} flw')
     return '  '.join(parts) if parts else 'N/A'
 def _circular_pixmap(source: QPixmap, size: int) -> QPixmap:
-    """Return a copy of *source* clipped to a circle of *size* × *size*.\n\nThe source image is scaled to fill the circle and centred so the\nsubject (typically a face) stays in frame regardless of aspect ratio.\n"""
+    """Return a copy of *source* clipped to a circle of *size* × *size*.
+
+    The source image is scaled to fill the circle and centred so the
+    subject (typically a face) stays in frame regardless of aspect ratio.
+    """
     scaled = source.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
     out = QPixmap(size, size)
     out.fill(Qt.GlobalColor.transparent)
     painter = QPainter(out)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    path = QPainterPath()
-    path.addEllipse(0, 0, size, size)
-    painter.setClipPath(path)
-    x_offset = (size - scaled.width()) // 2
-    y_offset = (size - scaled.height()) // 2
-    painter.drawPixmap(x_offset, y_offset, scaled)
-    painter.end()
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addEllipse(0, 0, size, size)
+        painter.setClipPath(path)
+        x_offset = (size - scaled.width()) // 2
+        y_offset = (size - scaled.height()) // 2
+        painter.drawPixmap(x_offset, y_offset, scaled)
+    finally:
+        painter.end()
     return out
 def _default_avatar_pixmap(size: int) -> QPixmap:
     """Return a circular pixmap with a generic user silhouette fallback."""
@@ -400,29 +407,34 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
                 event.accept()
                 return None
             else:
-                import math
                 corner_dist = math.hypot(self.width(), self.height())
                 self._ripple.start(event.pos(), corner_dist * 0.8)
-                r = self.geometry()
-                inset = max(1, round((1 - M.PRESS_SCALE) * min(r.width(), r.height()) / 2))
-                shrink_anim = QPropertyAnimation(self, b'geometry', self)
-                shrink_anim.setDuration(50)
-                shrink_anim.setEndValue(r.adjusted(inset, inset, -inset, -inset))
-                shrink_anim.setEasingCurve(QEasingCurve.Type.Linear)
-                shrink_anim.finished.connect(lambda: self._spring_back(r))
-                shrink_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+                # Brief opacity dip for press feedback (avoids layout flicker from geometry animation)
+                press_effect = QGraphicsOpacityEffect(self)
+                press_effect.setOpacity(0.7)
+                self.setGraphicsEffect(press_effect)
+                release_anim = QPropertyAnimation(press_effect, b'opacity', self)
+                release_anim.setDuration(120)
+                release_anim.setStartValue(0.7)
+                release_anim.setEndValue(1.0)
+                release_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+                release_anim.finished.connect(self._restore_effect)
+                release_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
                 try:
                     super().mousePressEvent(event)
                 except RuntimeError:
                     event.accept()
-    def _spring_back(self, original_geometry) -> None:
+
+    def _restore_effect(self) -> None:
+        """Restore the shadow effect after the press animation finishes."""
         if sip.isdeleted(self):
-            return None
-        spring_anim = QPropertyAnimation(self, b'geometry', self)
-        spring_anim.setDuration(120)
-        spring_anim.setEndValue(original_geometry)
-        spring_anim.setEasingCurve(QEasingCurve.Type.OutBack)
-        spring_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+            return
+        if not self._shadow or sip.isdeleted(self._shadow):
+            self._shadow = QGraphicsDropShadowEffect(self)
+            self._shadow.setBlurRadius(0)
+            self._shadow.setOffset(0, 2)
+            self._shadow.setColor(_SHADOW_INIT)
+        self.setGraphicsEffect(self._shadow)
     def refresh_times(self) -> None:
         self._activity_label.setText(relative_time(self._last_activity_iso))
         date_added = self._creator.get('date_added', '')

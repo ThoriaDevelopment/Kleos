@@ -9,7 +9,7 @@ from typing import Any, Callable
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6 import sip
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from core.cache_manager import ensure_thumbnail
@@ -136,6 +136,8 @@ class _ContentRow(QFrame):
 
     def _on_thumb_future(self, future) -> None:
         """Callback when a thumbnail download completes via the thread pool."""
+        if sip.isdeleted(self):
+            return
         try:
             new_path = future.result()
         except Exception:
@@ -361,6 +363,29 @@ keeping the UI responsive even with 1000+ videos.
         if handle_fullscreen_keypress(self, event):
             return
         super().keyPressEvent(event)
+
+    def changeEvent(self, event) -> None:
+        """Prevent the parent window from being minimized when this dialog is minimized.
+
+        On Windows, minimizing a QDialog with WindowMinMaxButtonsHint propagates
+        the minimize to the parent window.  We detect this and restore only the
+        parent, while allowing the dialog to stay minimized normally.
+        """
+        if event.type() == QEvent.Type.WindowStateChange and self.windowState() & Qt.WindowState.WindowMinimized:
+            # The dialog is being minimized.  On Windows, this also minimizes
+            # the parent window.  Restore only the parent so the main dashboard
+            # stays visible behind the minimized dialog.
+            QTimer.singleShot(0, self._restore_parent_from_minimize)
+        super().changeEvent(event)
+
+    def _restore_parent_from_minimize(self) -> None:
+        """Restore the parent window that was minimized as a side-effect."""
+        parent = self.parent()
+        if parent and isinstance(parent, QWidget):
+            parent.setWindowState(Qt.WindowState.WindowNoState)
+            parent.show()
+            parent.raise_()
+            parent.activateWindow()
     def _build_ui(self) -> None:
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(16, 12, 16, 12)
