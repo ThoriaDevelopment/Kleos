@@ -28,7 +28,6 @@ MANIFEST
 
 # PyInstaller
 *.manifest
-*.spec
 
 # Installer logs
 pip-log.txt
@@ -152,7 +151,6 @@ cython_debug/
 # PyInstaller build artifacts
 build/
 dist/
-*.spec
 
 # Installer output
 Kleos-Setup.exe

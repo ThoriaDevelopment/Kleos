@@ -7,7 +7,7 @@
 ; Configuration
 ; -------------------------------------------------------------------------
 !define PRODUCT_NAME        "Kleos"
-!define PRODUCT_VERSION     "1.2.0"
+!define PRODUCT_VERSION     "1.2.2"
 !define PRODUCT_PUBLISHER   "ThoriaDevelopment"
 !define PRODUCT_WEB_SITE    "https://github.com/ThoriaDevelopment/Kleos"
 !define PRODUCT_DIR_REGKEY  "Software\Microsoft\Windows\CurrentVersion\App Paths\Kleos.exe"
