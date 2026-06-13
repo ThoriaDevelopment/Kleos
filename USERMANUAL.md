@@ -57,7 +57,7 @@ When you open Kleos for the first time, a **welcome wizard** will appear. It wal
    - 🎬 **Add Members** — How to add creators and assign roles.
    - 📊 **View History** — Double-click a card to see media history and stats.
    - 🖱️ **Right-Click Menu** — Quick access to edit, notes, delete, and more.
-   - ✅ **Verify Content** — Mark videos as community content or use Auto-Verify.
+   - ✅ **Verify Content** — Mark videos as community content, use Auto-Verify (AI), or Keyword Verify.
    - 👑 **Leaderboard & Analytics** — Rankings, charts, and reports.
    - 🔍 **Search & Filter** — Find members, sort, and filter by role.
    - 📝 **Creator Notes** — Internal notes that are auto-saved and exported.
@@ -82,7 +82,7 @@ Here is a quick example of how to get the key for YouTube:
 10. Go to the **API Keys** tab and paste the key into the **YouTube API Key** box.
 11. Click **OK** to save.
 
-You only have to do this once. If you also want Twitch data, the Twitch Client ID and Secret follow a similar process on the Twitch Developer portal. The Anthropic key is only needed if you plan to use Auto-Verify later.
+You only have to do this once. If you also want Twitch data, the Twitch Client ID and Secret follow a similar process on the Twitch Developer portal. The Anthropic key is only needed if you plan to use Auto-Verify with Claude models, and the Gemini key is only needed if you plan to use Auto-Verify with Gemini models. For Keyword Verify, no API key is needed at all.
 
 > **Note:** API keys are stored globally and shared across all your profiles, so you only need to enter them once.
 
@@ -96,7 +96,7 @@ The main window is your home base. It shows every person in your community as a 
 
 - **+ Add Media Member** — Opens a form to add someone new.
 - **⟳ Refresh All** — Fetches the latest videos, streams, stats, and thumbnails for everyone at once.
-- **✓ Auto-Verify** — Runs an automatic check on unverified videos to see if they belong in your community.
+- **✓ Verify** — Opens a dialog to verify videos using keywords or AI.
 - **⚙ Settings** — Opens the settings panel for keys, profiles, roles, appearance, and notifications.
 - **♛ Leaderboard** — Opens the global analytics and ranking window.
 
@@ -256,18 +256,39 @@ Inside any member's *Media History* window, you'll see a button on every row:
 
 Simply click the button to toggle it.
 
-### Auto-Verify
-If you have an Anthropic API key saved in Settings, you can let Kleos verify videos automatically:
+### Verify
 
-1. Go to **Settings → Verify** and write a short **Community Description**. This tells the assistant what your community is about (for example, "A Minecraft survival community focused on redstone engineering"). Keep it under 300 words.
-2. Choose a **Claude Model**:
-   - **Haiku 4.5** — Fastest and cheapest.
-   - **Sonnet 4.6** — Balanced speed and accuracy.
-   - **Opus 4.8** — Most thorough.
-3. Back on the main dashboard, click **✓ Auto-Verify**.
-4. Kleos will ask for confirmation, then begin checking every unverified video against your description. Videos that match will be marked as verified automatically.
+Click **✓ Verify** on the main dashboard to open the verification dialog. You'll see two options:
+
+#### AI Verification
+
+If you have an Anthropic API key (for Claude models) or a Gemini API key (for Google models) saved in Settings, you can let Kleos verify videos automatically:
+
+1. Click **✓ Verify**, then choose **AI Verify**.
+2. Choose a provider: **Gemini** or **Claude**.
+3. Choose a model:
+   - **Anthropic Claude:** Haiku 4.5 (fastest), Sonnet 4.6 (balanced), Opus 4.8 (most thorough)
+   - **Google Gemini (free tier):** 2.5 Flash (fast), 2.5 Pro (balanced), 2.5 Flash Lite (lightweight), 3.5 Flash (latest)
+4. Kleos will begin checking every unverified video against your community description. Videos that match will be marked as verified automatically.
+
+**Note:** Before using AI verification, go to **Settings → Verify** and write a short **Community Description** (under 300 words). This tells the AI what your community is about.
 
 A progress bar appears at the top of the dashboard so you can see how far along the process is. You can press **Cancel** anytime to stop.
+
+#### Keyword Verification
+
+If you don't want to use AI, you can verify videos by keyword instead:
+
+1. Click **✓ Verify**, then choose **Keyword Verify**.
+2. Edit the keywords in the text field (pre-filled from Settings → Verify). Enter comma-separated keywords (for example: `arch.mc, ArchMC, ArchMC Network, mc.arch.lol`).
+3. Click **Start Verification**. Kleos will check every unverified video — if **any** keyword appears as a whole word in the video's title or description, the video is marked as verified.
+
+**How keyword matching works:**
+- Matching is **case-insensitive**: `arch.mc` matches "ARCH.MC" and "Arch.Mc".
+- Keywords match as **whole words only**: `arch.mc` matches "Arch.mc server" but not "search.mc".
+- **Multi-word keywords** allow flexible spacing: `ArchMC Network` matches "ArchMC Network", "ArchMC  Network", etc.
+
+A progress bar appears during keyword verification and you can press **Cancel** to stop at any time.
 
 ---
 
@@ -436,19 +457,21 @@ If you want previously-triggered alerts to fire again (for example, after a data
 The Settings window is split into tabs for easy navigation.
 
 ### API Keys
-Here you enter the credentials that let Kleos talk to YouTube and Twitch:
+Here you enter the credentials that let Kleos talk to YouTube and Twitch, as well as the AI providers for Auto-Verify:
 - **YouTube API Key** — Required to fetch YouTube videos and channel stats.
 - **Twitch Client ID & Secret** — Required to fetch Twitch streams and videos.
-- **Anthropic API Key** — Required to use the Auto-Verify feature.
+- **Anthropic API Key** — Required to use Auto-Verify with Claude models.
+- **Gemini API Key** — Required to use Auto-Verify with Gemini models.
 
 API keys are stored globally and shared across all profiles, so you only need to enter them once.
 
 There is also a **Videos per creator** spinner. Set this to limit how many recent videos Kleos fetches per person. Set it to **All** (0) if you want the entire history.
 
 ### Verify
-This tab is home to the Auto-Verify feature:
-- **Community Description** — Describe what your community is about in 300 words or fewer.
-- **Claude Model** — Pick the intelligence level you want for automatic verification.
+This tab is home to the verification features:
+- **Community Description** — Describe what your community is about in 300 words or fewer (used by AI Auto-Verify).
+- **AI Model** — Pick the AI model and provider you want for automatic verification. Choose from Anthropic Claude (Haiku 4.5, Sonnet 4.6, Opus 4.8) or Google Gemini (2.5 Flash, 2.5 Pro, 2.5 Flash Lite, 3.5 Flash).
+- **Verification Keywords** — Comma-separated keywords for Keyword Verification (no AI needed). Keywords are matched as case-insensitive whole words against video titles and descriptions.
 
 ### Profiles
 See [Working with Profiles](#working-with-profiles) above.
@@ -551,7 +574,7 @@ Inside any member's Media History window, you can also sort and filter the conte
 - **Tooltips:** Hover over any toolbar button or control to see a short description.
 - **Cooldown Timer:** After a Refresh All, there is a short cooldown period. A countdown timer in the status bar shows how many seconds remain before you can refresh again.
 - **New Activity Alert:** The orange ⚠ on a card disappears automatically when you open that member's Media History window.
-- **Cancel Long Operations:** Both **Refresh All** and **Auto-Verify** can be cancelled if you change your mind or need to do something else urgently.
+- **Cancel Long Operations:** **Refresh All** and **Verify** (both AI and keyword modes) can be cancelled if you change your mind or need to do something else urgently. AI verification works with both Anthropic Claude and Google Gemini — choose the provider and model in the verification dialog.
 - **Drag & Drop Import:** Keep a folder of creator or profile exports handy on your desktop. Dragging them straight onto Kleos is the fastest way to import.
 - **Right-Click Context Menu:** Right-click any creator card to quickly edit fields, change role, manage tags, delete the member, add notes, or export their data.
 - **Creator Notes:** Every member has a notes field. Access it from the right-click menu (**Edit Notes**) or directly in the Media History header. Notes auto-save as you type with a "Saving…" → "Saved ✓" indicator.

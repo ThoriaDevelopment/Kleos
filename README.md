@@ -17,9 +17,10 @@
 9. [Database & Profiles](#database--profiles)
 10. [API Integration](#api-integration)
 11. [Auto-Verification](#auto-verification)
-12. [Charts & Visualization](#charts--visualization)
-13. [Import / Export](#import--export)
-14. [License](#license)
+12. [Keyword Verification](#keyword-verification)
+13. [Charts & Visualization](#charts--visualization)
+14. [Import / Export](#import--export)
+15. [License](#license)
 
 ---
 
@@ -44,7 +45,7 @@ Key design goals:
 | Database | SQLite (WAL mode, dual-connection architecture) |
 | Charts | matplotlib (backend_qtagg) |
 | HTTP | requests (with urllib3 retry adapter) |
-| AI Verification | anthropic SDK (optional) |
+| AI Verification | anthropic SDK (optional), google-genai SDK (optional) |
 | Packaging | PyInstaller (planned) |
 
 ---
@@ -105,11 +106,11 @@ Key design goals:
   - Notifications slide in from the top-right corner and auto-dismiss.
   - Reset triggered alerts from Settings to re-trigger them.
 
-- **Auto-Verification**
-  - Anthropic Claude API integration for YES/NO classification of unverified videos against a user-supplied community description.
-  - Supports Haiku 4.5, Sonnet 4.6, and Opus 4.8 models.
-  - Exponential backoff retry logic for rate limits.
-  - Cancelable background worker with progress reporting.
+- **Verification (Unified)**
+  - Single **✓ Verify** button opens a card-based wizard to choose a verification method.
+  - **AI Verification**: Classifies unverified videos against a user-supplied community description using Anthropic Claude or Google Gemini models. Supports Haiku 4.5, Sonnet 4.6, Opus 4.8 (Claude) and 2.5 Flash, 2.5 Pro, 2.5 Flash Lite, 3.5 Flash (Gemini). Exponential backoff retry logic for rate limits.
+  - **Keyword Verification**: No-AI alternative that matches user-defined keywords against video titles and descriptions. Case-insensitive whole-word matching. Multi-word keywords allow flexible whitespace. Comma-separated keyword input.
+  - Cancelable background workers with progress reporting.
   - Cooldown timer with live countdown when fetches are rate-limited.
 
 - **Import / Export**
@@ -151,10 +152,12 @@ Download **`Kleos-Setup.exe`** from the [GitHub Releases](https://github.com/Tho
    python -m main
    ```
 
-Optional: for auto-verification, install the Anthropic SDK (already covered by `requirements.txt`):
+Optional: for auto-verification, install the AI SDKs (already covered by `requirements.txt`):
 ```bash
 pip install anthropic>=0.40.0
+pip install google-genai>=1.0.0
 ```
+You only need one of these — install the SDK for the provider you plan to use.
 
 ---
 
@@ -166,7 +169,8 @@ Open **Settings → API Keys** and provide:
 - **YouTube Data API v3 Key** (39 characters, starts with `AIza`)
 - **Twitch Client ID**
 - **Twitch Client Secret**
-- **Anthropic API Key** (optional, required for Auto-Verify)
+- **Anthropic API Key** (optional, required for Auto-Verify with Claude models)
+- **Gemini API Key** (optional, required for Auto-Verify with Gemini models)
 
 API keys are stored globally and shared across all profiles.
 
@@ -183,7 +187,8 @@ Alternatively, set environment variables before launching:
 - `fetch_video_limit` – integer cap per creator (0 = unlimited)
 - `thumbnail_quality` – `"low"` (cached) or `"high"` (re-fetch)
 - `community_description` – up to 300 words for auto-verify context
-- `auto_verify_model` – `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, or `claude-opus-4-8`
+- `auto_verify_model` – AI model for auto-verify. Claude: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-8`. Gemini: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-3.5-flash`
+- `verify_keywords` – comma-separated keywords for keyword-based verification (no AI required)
 - `notification_view_thresholds` – comma-separated view counts that trigger alerts (default: `10000,100000,1000000`)
 
 ---
@@ -205,7 +210,10 @@ Kleos/
 │   ├── html_export.py      # Self-contained HTML community dashboard generator
 │   ├── paths.py            # APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR, GLOBAL_SETTINGS_PATH
 │   ├── report_generator.py # Plain-text report generation (clipboard)
-│   └── verify_worker.py    # VerifyWorker (QThread) for Claude auto-verify
+│   └── verify_worker.py    # VerifyWorker (QThread) for Claude/Gemini auto-verify
+│   └── keyword_verify.py   # KeywordVerifyWorker (QThread) for keyword-based verify
+├── ui/
+│   ├── __init__.py
 │
 └── ui/
     ├── __init__.py
@@ -216,6 +224,7 @@ Kleos/
     ├── analytics_window.py   # AnalyticsWindow: leaderboard, charts, HTML export
     ├── notification.py       # NotificationToast: slide-in toast with auto-dismiss
     ├── settings_dialog.py    # SettingsDialog: API Keys, Verify, Profiles, Roles, Appearance, Notifications tabs
+    ├── verify_dialog.py      # VerifyDialog: card-based verification method wizard
     ├── theme/
     │   ├── __init__.py       # build_global_qss()
     │   ├── stylesheet.py     # build_dialog_qss() centralized dark-theme QSS
@@ -234,7 +243,9 @@ Kleos/
 ### Threading Model
 - **Main Thread**: Handles all Qt widgets, animations, and layout.
 - **FetchWorker** (`QThread`): One concurrent fetch at a time. Queries YouTube/Twitch APIs, writes to DB via `upsert_media_batch()`.
-- **VerifyWorker** (`QThread`): Classifies unverified videos via the Anthropic API. Emits progress signals.
+- **VerifyWorker** (`QThread`): Classifies unverified videos via the Anthropic or Gemini API. Emits progress signals.
+- **KeywordVerifyWorker** (`QThread`): Verifies videos by matching keywords against titles and descriptions. No AI required.
+- **VerifyDialog** (`QDialog`): Card-based wizard for selecting verification method (Keyword or AI), provider (Gemini or Claude), and model.
 - **ThreadPoolExecutor** (4 workers): Thumbnail downloads in HistoryDialog are capped at 4 concurrent downloads to prevent crashes from missing thumbnails.
 - All workers communicate through Qt signals; the main thread never waits on network IO.
 
@@ -297,14 +308,55 @@ alerts          (id PRIMARY KEY AUTOINCREMENT, creator_id FK, alert_type, thresh
 
 ## Auto-Verification
 
-The `VerifyWorker` sends each unverified video's title and description to the Claude API with the following system prompt:
+Clicking **✓ Verify** on the main dashboard opens a card-based wizard dialog where you choose a verification method:
+
+1. **Keyword Verification** — match videos by keywords (no AI needed)
+2. **AI Verification** — classify videos using Claude or Gemini models
+
+For AI verification, you then choose a provider (Gemini or Claude) and a model. For keyword verification, you can edit keywords directly in the dialog before starting.
+
+The `VerifyWorker` sends each unverified video's title and description to an AI API (Anthropic Claude or Google Gemini) with the following system prompt:
 
 > You are a content moderator for an online community... Respond with ONLY "YES" or "NO".
 
+The provider is selected automatically based on the model ID prefix:
+- Models starting with `claude-` → Anthropic Claude API
+- Models starting with `gemini-` → Google Gemini API
+
+**Anthropic Claude:**
 - Temperature locked to `0` for deterministic outputs on Haiku.
 - Max retries: 3 with exponential delays (1s, 2s, 4s) on `RateLimitError`.
-- Authentication and connection errors surface as modal warnings.
+- Authentication, connection, and timeout errors surface as modal warnings.
+
+**Google Gemini:**
+- Temperature locked to `0` for deterministic classification on all models.
+- Max retries: 3 with exponential delays (1s, 2s, 4s) on HTTP 429 (rate limit).
+- Authentication errors (401/403) and connection errors surface as modal warnings.
+- Free-tier models available: Gemini 2.5 Flash, 2.5 Pro, 2.5 Flash Lite, 3.5 Flash.
+
+**Both providers:**
 - Cooperative profile guard: if the user switches profiles mid-verification, the worker aborts cleanly.
+- Cancelable via the Cancel button in the progress bar area.
+
+---
+
+## Keyword Verification
+
+Kleos offers **Keyword Verification** as a no-AI alternative — it matches user-defined keywords against video titles and descriptions.
+
+The `KeywordVerifyWorker` reads a comma-separated list of keywords from the per-profile `verify_keywords` setting. Each keyword is compiled into a case-insensitive whole-word regex pattern:
+
+- **Single-word keywords** like `arch.mc` match as `\barch\.mc\b` — they will match "Arch.mc server" but not "search.mc".
+- **Multi-word keywords** like `ArchMC Network` match as `\bArchMC\s+Network\b` — flexible whitespace is allowed between words.
+- Matching is case-insensitive: `arch.mc` matches "ARCH.MC" and "Arch.Mc".
+
+If **any** keyword matches the title **or** description of an unverified video, that video is automatically marked as verified.
+
+**Usage:**
+1. Click **✓ Verify** on the main dashboard, then choose **Keyword Verification**.
+2. Edit keywords in the dialog (pre-filled from Settings → Verify), then click **Start Verification**.
+
+Like AI verification, keyword verification runs in a background `QThread`, shows a progress bar, and can be cancelled at any time. It also respects the cooperative profile guard.
 
 ---
 

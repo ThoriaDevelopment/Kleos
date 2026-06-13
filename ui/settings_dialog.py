@@ -33,6 +33,10 @@ class _ApiKeysTab(QWidget):
         self._anthropic_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._anthropic_key.setPlaceholderText('sk-ant-…')
         form.addRow('Anthropic API Key:', self._anthropic_key)
+        self._gemini_key = QLineEdit(keys.get('gemini', ''))
+        self._gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._gemini_key.setPlaceholderText('AIzaSy…')
+        form.addRow('Gemini API Key:', self._gemini_key)
         layout.addLayout(form)
         layout.addSpacing(12)
         limit_label = QLabel('Videos per creator:')
@@ -61,6 +65,7 @@ class _ApiKeysTab(QWidget):
         twitch_cid = self._twitch_cid.text().strip()
         twitch_secret = self._twitch_secret.text().strip()
         anthropic_key = self._anthropic_key.text().strip()
+        gemini_key = self._gemini_key.text().strip()
         # Load existing keys so we can preserve them on validation failure
         raw = self._db.get_global_setting('api_keys_json') or '{}'
         try:
@@ -76,16 +81,20 @@ class _ApiKeysTab(QWidget):
                 yt_key = existing.get('youtube', '')
             elif len(yt_key) != 39:
                 dark_warning(self, 'YouTube Key Warning', f'YouTube API keys are typically 39 characters long (got {len(yt_key)}).\nSaving anyway — verify your key works.')
-        keys = {'youtube': yt_key, 'twitch_client_id': twitch_cid, 'twitch_client_secret': twitch_secret, 'anthropic': anthropic_key}
+        keys = {'youtube': yt_key, 'twitch_client_id': twitch_cid, 'twitch_client_secret': twitch_secret, 'anthropic': anthropic_key, 'gemini': gemini_key}
         self._db.set_global_setting('api_keys_json', json.dumps(keys))
         self._db.set_setting('fetch_video_limit', str(self._limit_spin.value()))
 class _VerifyTab(QWidget):
-    """Community description and Claude model selection for auto-verification."""
+    """Community description, AI model selection, and keyword verification settings."""
     _MAX_WORDS = 300
     _MODELS = [
         ('Haiku 4.5 (fastest, cheapest)', 'claude-haiku-4-5-20251001'),
         ('Sonnet 4.6 (balanced)', 'claude-sonnet-4-6'),
         ('Opus 4.8 (most thorough)', 'claude-opus-4-8'),
+        ('Gemini 2.5 Flash (fast)', 'gemini-2.5-flash'),
+        ('Gemini 2.5 Pro (balanced)', 'gemini-2.5-pro'),
+        ('Gemini 2.5 Flash Lite (lightweight)', 'gemini-2.5-flash-lite'),
+        ('Gemini 3.5 Flash (latest)', 'gemini-3.5-flash'),
     ]
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None) -> None:
         super().__init__(parent)
@@ -96,7 +105,7 @@ class _VerifyTab(QWidget):
         layout.addWidget(desc_label)
         desc_hint = QLabel(
             f'Describe your community in {_VerifyTab._MAX_WORDS} words or fewer. '
-            'Claude will use this to decide which videos to verify.'
+            'The AI will use this to decide which videos to verify.'
         )
         desc_hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px;')
         desc_hint.setWordWrap(True)
@@ -116,7 +125,7 @@ class _VerifyTab(QWidget):
         self._update_word_count()
         layout.addWidget(self._word_label)
         layout.addSpacing(12)
-        model_label = QLabel('Claude Model:')
+        model_label = QLabel('AI Model:')
         model_label.setStyleSheet('font-weight: bold;')
         layout.addWidget(model_label)
         self._model_combo = QComboBox()
@@ -126,6 +135,23 @@ class _VerifyTab(QWidget):
             if model_id == saved_model:
                 self._model_combo.setCurrentIndex(i)
         layout.addWidget(self._model_combo)
+        layout.addSpacing(12)
+        kw_label = QLabel('Verification Keywords:')
+        kw_label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(kw_label)
+        kw_hint = QLabel(
+            'Enter keywords separated by commas. Videos whose title or description '
+            'contain any keyword as a whole word will be auto-verified. '
+            'Matching is case-insensitive. This does not use AI.'
+        )
+        kw_hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px;')
+        kw_hint.setWordWrap(True)
+        layout.addWidget(kw_hint)
+        self._keywords_edit = QLineEdit()
+        saved_keywords = db.get_setting('verify_keywords') or ''
+        self._keywords_edit.setText(saved_keywords)
+        self._keywords_edit.setPlaceholderText('e.g. arch.mc, ArchMC, ArchMC Network, mc.arch.lol')
+        layout.addWidget(self._keywords_edit)
         layout.addStretch(1)
     def _update_word_count(self) -> None:
         text = self._desc_edit.toPlainText()
@@ -144,6 +170,7 @@ class _VerifyTab(QWidget):
             return False
         self._db.set_setting('community_description', text)
         self._db.set_setting('auto_verify_model', self._model_combo.currentData())
+        self._db.set_setting('verify_keywords', self._keywords_edit.text().strip())
         return True
 class _ProfilesTab(QWidget):
     """Create, rename, and switch between database profiles."""

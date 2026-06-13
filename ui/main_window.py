@@ -12,7 +12,9 @@ from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QLinearGradient, QPa
 from PyQt6.QtWidgets import QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
 from core.api_client import FetchWorker, load_api_keys
 from core.db_manager import DatabaseManager
-from core.verify_worker import ANTHROPIC_AVAILABLE, VerifyWorker
+from core.keyword_verify import KeywordVerifyWorker
+from core.verify_worker import ANTHROPIC_AVAILABLE, GEMINI_AVAILABLE, VerifyWorker
+from ui.verify_dialog import VerifyDialog, VerifyResult
 logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import CreatorCard, format_subscriber_count
@@ -280,6 +282,7 @@ class MainWindow(QMainWindow):
         self._batch_timer.timeout.connect(self._create_next_batch)
         self._fetch_worker = None
         self._verify_worker = None
+        self._keyword_worker = None
         self._active_history = None
         self._active_filter_role_id = None
         self._data_fetched = False
@@ -333,9 +336,9 @@ class MainWindow(QMainWindow):
         self._refresh_all_btn.clicked.connect(self._on_refresh_all)
         top_row1.addWidget(self._refresh_all_btn)
         top_row1.addStretch(1)
-        self._verify_btn = QPushButton('✓ Auto-Verify')
-        self._verify_btn.setToolTip('Auto-verify media using AI')
-        self._verify_btn.clicked.connect(self._on_auto_verify)
+        self._verify_btn = QPushButton('✓ Verify')
+        self._verify_btn.setToolTip('Verify media using keywords or AI')
+        self._verify_btn.clicked.connect(self._on_verify)
         top_row1.addWidget(self._verify_btn)
         top_row1.addSpacing(8)
         settings_btn = QPushButton('⚙ Settings')
@@ -901,47 +904,56 @@ class MainWindow(QMainWindow):
         """Open the analytics & leaderboard window."""
         dlg = AnalyticsWindow(self._db, self)
         dlg.exec()
-    def _on_auto_verify(self) -> None:
-        """Kick off auto-verification of unverified media via the Claude API."""
-        if not ANTHROPIC_AVAILABLE:
-            dark_warning(self, 'Package Missing',
-                         "The 'anthropic' Python package is not installed.\n"
-                         "Install it with: pip install anthropic")
+    def _on_verify(self) -> None:
+        """Open the Verify dialog and dispatch based on the user's choice."""
+        if (self._verify_worker is not None and self._verify_worker.isRunning()) or \
+           (self._keyword_worker is not None and self._keyword_worker.isRunning()):
             return
+        dlg = VerifyDialog(self._db, self)
+        dlg.exec()
+        if dlg.result == VerifyResult.KEYWORD:
+            self._start_keyword_verify(dlg.keywords)
+        elif dlg.result == VerifyResult.AI:
+            self._start_ai_verify(dlg.selected_model)
+
+    def _start_ai_verify(self, model: str) -> None:
+        """Launch AI verification with the given model."""
+        is_gemini = model.startswith('gemini-')
+        if is_gemini:
+            if not GEMINI_AVAILABLE:
+                dark_warning(self, 'Package Missing',
+                             "The 'google-genai' Python package is not installed.\n"
+                             "Install it with: pip install google-genai")
+                return
+        else:
+            if not ANTHROPIC_AVAILABLE:
+                dark_warning(self, 'Package Missing',
+                             "The 'anthropic' Python package is not installed.\n"
+                             "Install it with: pip install anthropic")
+                return
         community_desc = (self._db.get_setting('community_description') or '').strip()
         if not community_desc:
             dark_warning(self, 'No Community Description',
                          'Please enter a community description in Settings → Verify first.')
             return
-        import json
         raw = self._db.get_global_setting('api_keys_json') or '{}'
         try:
             parsed = json.loads(raw)
-            api_key = parsed.get('anthropic', '').strip() if isinstance(parsed, dict) else ''
+            key_field = 'gemini' if is_gemini else 'anthropic'
+            api_key = parsed.get(key_field, '').strip() if isinstance(parsed, dict) else ''
         except (json.JSONDecodeError, AttributeError):
             api_key = ''
         if not api_key:
-            dark_warning(self, 'No Anthropic API Key',
-                         'Please enter your Anthropic API key in Settings → API Keys first.')
+            provider = 'Gemini' if is_gemini else 'Anthropic'
+            dark_warning(self, f'No {provider} API Key',
+                         f'Please enter your {provider} API key in Settings → API Keys first.')
             return
         if self._verify_worker is not None and self._verify_worker.isRunning():
             return
-        model = self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
-        model_labels = {'claude-haiku-4-5-20251001': 'Haiku 4.5', 'claude-sonnet-4-6': 'Sonnet 4.6', 'claude-opus-4-8': 'Opus 4.8'}
         unverified = self._db.get_unverified_media()
         total = len(unverified)
         if total == 0:
-            from ui.dialog_utils import dark_info
             dark_info(self, 'All Verified', 'All videos are already verified.')
-            return
-        from ui.dialog_utils import dark_question
-        model_label = model_labels.get(model, model)
-        confirm = dark_question(
-            self, 'Auto-Verify',
-            f'This will verify {total} unverified video{"s" if total != 1 else ""} '
-            f'using {model_label}.\n\nContinue?'
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
             return
         self._verify_worker = VerifyWorker(self._db, community_desc, model)
         self._verify_worker.progress.connect(self._on_verify_progress)
@@ -956,6 +968,34 @@ class MainWindow(QMainWindow):
         self._verify_progress_area.setVisible(True)
         self._verify_btn.setEnabled(False)
         self._verify_worker.start()
+
+    def _start_keyword_verify(self, keywords_str: str) -> None:
+        """Launch keyword verification with the given keywords."""
+        keywords = [kw.strip() for kw in keywords_str.split(',') if kw.strip()]
+        if not keywords:
+            dark_warning(self, 'No Keywords Set',
+                         'Please enter at least one keyword, or go back and choose AI verification.')
+            return
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            return
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            return
+        unverified = self._db.get_unverified_media()
+        total = len(unverified)
+        if total == 0:
+            dark_info(self, 'All Verified', 'All videos are already verified.')
+            return
+        self._keyword_worker = KeywordVerifyWorker(self._db, keywords)
+        self._keyword_worker.progress.connect(self._on_verify_progress)
+        self._keyword_worker.progress_text.connect(self._on_keyword_verify_progress_text)
+        self._keyword_worker.video_verified.connect(self._on_video_verified)
+        self._keyword_worker.done.connect(self._on_keyword_verify_done)
+        self._keyword_worker.aborted.connect(self._on_keyword_verify_aborted)
+        self._verify_progress_bar.setValue(0)
+        self._verify_progress_label.setText('Preparing…')
+        self._verify_progress_area.setVisible(True)
+        self._verify_btn.setEnabled(False)
+        self._keyword_worker.start()
     def _on_verify_progress(self, current: int, total: int) -> None:
         if total > 0:
             self._verify_progress_bar.setValue(int(current / total * 100))
@@ -981,11 +1021,16 @@ class MainWindow(QMainWindow):
         self._verify_progress_area.setVisible(False)
         self._verify_btn.setEnabled(True)
         self._cleanup_verify_worker()
-        dark_warning(self, 'No Anthropic API Key',
-                     'Please enter your Anthropic API key in Settings → API Keys.')
+        model = self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
+        provider = 'Gemini' if model.startswith('gemini-') else 'Anthropic'
+        dark_warning(self, f'No {provider} API Key',
+                     f'Please enter your {provider} API key in Settings → API Keys.')
     def _on_verify_cancel(self) -> None:
         if self._verify_worker is not None and self._verify_worker.isRunning():
             self._verify_worker.cancel()
+            self._verify_cancel_btn.setEnabled(False)
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            self._keyword_worker.cancel()
             self._verify_cancel_btn.setEnabled(False)
         self._verify_progress_label.setText('Cancelling…')
     def _on_verify_aborted(self) -> None:
@@ -1011,6 +1056,42 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
             self._verify_worker = None
+        self._verify_cancel_btn.setEnabled(True)
+
+    # ── Keyword Verification Handlers ───────────────────────────────────
+
+    def _on_keyword_verify_progress_text(self, msg: str) -> None:
+        self._verify_progress_label.setText(msg)
+
+    def _on_keyword_verify_done(self, verified_count: int, total: int) -> None:
+        self._verify_progress_area.setVisible(False)
+        self._verify_btn.setEnabled(True)
+        self._cleanup_keyword_worker()
+        dark_info(self, 'Keyword Verify Complete',
+                  f'Keyword-matched {verified_count} of {total} video{"s" if total != 1 else ""}.')
+
+    def _on_keyword_verify_aborted(self) -> None:
+        self._verify_progress_area.setVisible(False)
+        self._verify_btn.setEnabled(True)
+        self._cleanup_keyword_worker()
+        dark_warning(self, 'Verification Aborted',
+                     'Keyword verification was stopped because the active profile was switched.')
+
+    def _cleanup_keyword_worker(self) -> None:
+        """Disconnect signals and clean up the keyword verify worker reference."""
+        if self._keyword_worker is not None:
+            for signal, slot in [
+                (self._keyword_worker.progress, self._on_verify_progress),
+                (self._keyword_worker.progress_text, self._on_keyword_verify_progress_text),
+                (self._keyword_worker.video_verified, self._on_video_verified),
+                (self._keyword_worker.done, self._on_keyword_verify_done),
+                (self._keyword_worker.aborted, self._on_keyword_verify_aborted),
+            ]:
+                try:
+                    signal.disconnect(slot)
+                except RuntimeError:
+                    pass
+            self._keyword_worker = None
         self._verify_cancel_btn.setEnabled(True)
 
     def _cleanup_fetch_worker(self) -> None:

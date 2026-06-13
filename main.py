@@ -633,7 +633,9 @@ class FirstRunWizard(QDialog):
 
         desc = QLabel(
             'Mark videos as "In Community" to include them in reports and leaderboards. '
-            'Use the verify button on each row, or run Auto-Verify to let AI check them all.'
+            'Use the verify button on each row, or click ✓ Verify on the toolbar to choose '
+            'between Keyword Verification (match by keywords, no AI needed) and AI Verification '
+            '(let Claude or Gemini check them all).'
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)

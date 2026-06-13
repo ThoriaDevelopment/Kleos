@@ -66,7 +66,7 @@ _MODEL_ID_MIGRATION = {
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
 }
 
-_DEFAULT_SETTINGS = {'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notification_view_thresholds': '10000,100000,1000000'}
+_DEFAULT_SETTINGS = {'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'verify_keywords': '', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notification_view_thresholds': '10000,100000,1000000'}
 class DatabaseManager:
     """Thread-safe SQLite manager with profile switching and auto-backup.
 
@@ -1004,7 +1004,6 @@ class DatabaseManager:
             'creator': creator_copy,
             'media_content': media,
             'stats': stats,
-            'community_description': self.get_setting('community_description') or '',
         }
 
     def import_creator(self, data: dict[str, Any]) -> int:
@@ -1046,10 +1045,6 @@ class DatabaseManager:
             notes=c.get('notes', ''),
             tags=c.get('tags') if isinstance(c.get('tags'), list) else None,
         )
-        # Import community description if present and current profile has none
-        imported_desc = data.get('community_description', '')
-        if imported_desc and not (self.get_setting('community_description') or '').strip():
-            self.set_setting('community_description', imported_desc)
         # Import media content
         for m in data.get('media_content', []):
             self.add_media(
