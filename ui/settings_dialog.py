@@ -7,6 +7,8 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager
 from ui.dialog_utils import dark_info, dark_question, dark_warning
+from ui.theme.stylesheet import build_dialog_qss
+from ui.theme.tokens import C, theme_manager, THEMES, THEME_NAMES
 class _ApiKeysTab(QWidget):
     """Input fields for YouTube Data API v3 and Twitch Helix credentials."""
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None) -> None:
@@ -37,7 +39,7 @@ class _ApiKeysTab(QWidget):
         limit_label.setStyleSheet('font-weight: bold;')
         layout.addWidget(limit_label)
         limit_hint = QLabel('Maximum videos to fetch per creator. Set to 0 for all.')
-        limit_hint.setStyleSheet('color: rgba(224,224,224,0.4); font-size: 11px;')
+        limit_hint.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px;')
         limit_hint.setWordWrap(True)
         layout.addWidget(limit_hint)
         self._limit_spin = QSpinBox()
@@ -51,7 +53,7 @@ class _ApiKeysTab(QWidget):
         layout.addWidget(self._limit_spin)
         layout.addStretch(1)
         note = QLabel('API keys are shared across all profiles.')
-        note.setStyleSheet('color: rgba(224,224,224,0.4); font-size: 10px;')
+        note.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 10px;')
         note.setWordWrap(True)
         layout.addWidget(note)
     def save(self) -> None:
@@ -96,7 +98,7 @@ class _VerifyTab(QWidget):
             f'Describe your community in {_VerifyTab._MAX_WORDS} words or fewer. '
             'Claude will use this to decide which videos to verify.'
         )
-        desc_hint.setStyleSheet('color: rgba(224,224,224,0.5); font-size: 11px;')
+        desc_hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px;')
         desc_hint.setWordWrap(True)
         layout.addWidget(desc_hint)
         self._desc_edit = QTextEdit()
@@ -128,7 +130,7 @@ class _VerifyTab(QWidget):
     def _update_word_count(self) -> None:
         text = self._desc_edit.toPlainText()
         word_count = len(text.split()) if text.strip() else 0
-        color = '#FF6B35' if word_count > _VerifyTab._MAX_WORDS else 'rgba(224,224,224,0.5)'
+        color = C.DANGER if word_count > _VerifyTab._MAX_WORDS else C.TEXT_MUTED
         self._word_label.setText(f'{word_count} / {_VerifyTab._MAX_WORDS} words')
         self._word_label.setStyleSheet(f'color: {color}; font-size: 11px;')
     def save(self) -> bool:
@@ -154,7 +156,7 @@ class _ProfilesTab(QWidget):
         h_current = QHBoxLayout()
         h_current.addWidget(QLabel('Active Profile:'))
         self._current_label = QLabel(db.profile)
-        self._current_label.setStyleSheet('font-weight: bold; color: #4A90D9; background: transparent;')
+        self._current_label.setStyleSheet(f'font-weight: bold; color: {C.ACCENT}; background: transparent;')
         h_current.addWidget(self._current_label)
         h_current.addStretch(1)
         layout.addLayout(h_current)
@@ -172,7 +174,11 @@ class _ProfilesTab(QWidget):
         switch_btn.clicked.connect(self._on_switch)
         btn_row.addWidget(switch_btn)
         delete_btn = QPushButton('Delete')
-        delete_btn.setStyleSheet('QPushButton { color: #FF6B35; background: #2E2E2E; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #4A4A4A; }')
+        delete_btn.setStyleSheet(
+            f'QPushButton {{ color: {C.DANGER}; background: {C.BG_RAISED}; border: 1px solid {C.BORDER};'
+            f'   border-radius: 4px; padding: 6px 14px; }}'
+            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+        )
         delete_btn.clicked.connect(self._on_delete)
         btn_row.addWidget(delete_btn)
         layout.addLayout(btn_row)
@@ -354,9 +360,16 @@ class _RoleManagerTab(QWidget):
         form.addWidget(add_btn)
         layout.addLayout(form)
         del_btn = QPushButton('Delete Selected Role')
-        del_btn.setStyleSheet('QPushButton { color: #FF6B35; background: #2E2E2E; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #4A4A4A; }')
+        del_btn.setStyleSheet(
+            f'QPushButton {{ color: {C.DANGER}; background: {C.BG_RAISED}; border: 1px solid {C.BORDER};'
+            f'   border-radius: 4px; padding: 6px 14px; }}'
+            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+        )
         del_btn.clicked.connect(self._on_delete)
         layout.addWidget(del_btn)
+        edit_btn = QPushButton('Edit Selected Role')
+        edit_btn.clicked.connect(self._on_edit)
+        layout.addWidget(edit_btn)
         layout.addStretch(1)
     def _refresh_list(self) -> None:
         self._list.clear()
@@ -406,15 +419,91 @@ class _RoleManagerTab(QWidget):
                 self._db.delete_role(role_id)
                 self._changed = True
                 self._refresh_list()
+
+    def _on_edit(self) -> None:
+        """Open a dialog to edit the selected role's name and color."""
+        item = self._list.currentItem()
+        if not item:
+            return
+        role_id = item.data(Qt.ItemDataRole.UserRole)
+        role = self._db.get_role(role_id)
+        if not role:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Edit Role')
+        dlg.setMinimumWidth(300)
+        dlg.setStyleSheet(build_dialog_qss())
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        name_edit = QLineEdit(role['role_name'])
+        color_hex = QLineEdit(role['role_color'])
+        color_hex.setFixedWidth(90)
+        color_hex.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        form.addRow('Name:', name_edit)
+        color_row = QHBoxLayout()
+        color_row.addWidget(color_hex, 1)
+        pick_btn = QPushButton('Pick Color')
+        pick_btn.setFixedWidth(90)
+        def pick():
+            current = QColor(color_hex.text())
+            if not current.isValid():
+                current = QColor('#4A90D9')
+            color = QColorDialog.getColor(current, dlg, 'Choose Role Color')
+            if color.isValid():
+                color_hex.setText(color.name())
+        pick_btn.clicked.connect(pick)
+        color_row.addWidget(pick_btn)
+        form.addRow('Color:', color_row)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_name = name_edit.text().strip()
+            new_color = color_hex.text().strip()
+            if not new_name:
+                dark_warning(self, 'Missing Name', 'Enter a role name.')
+                return
+            if not QColor(new_color).isValid():
+                dark_warning(self, 'Invalid Color', 'Choose a valid hex color.')
+                return
+            self._db.update_role(role_id, role_name=new_name, role_color=new_color)
+            self._changed = True
+            self._refresh_list()
     @property
     def changed(self) -> bool:
         return self._changed
 class _AppearanceTab(QWidget):
-    """Appearance settings: thumbnail quality toggle."""
+    """Appearance settings: theme selector and thumbnail quality toggle."""
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self._db = db
         layout = QVBoxLayout(self)
+
+        # ── Theme selector ────────────────────────────────────────────
+        theme_label = QLabel('Theme:')
+        theme_label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(theme_label)
+
+        self._theme_combo = QComboBox()
+        for key, name in THEME_NAMES.items():
+            self._theme_combo.addItem(name, key)
+        saved_theme = db.get_setting('theme') or 'default'
+        idx = self._theme_combo.findData(saved_theme)
+        if idx >= 0:
+            self._theme_combo.setCurrentIndex(idx)
+        self._theme_combo.currentIndexChanged.connect(self._update_preview)
+        layout.addWidget(self._theme_combo)
+
+        self._theme_preview = QLabel()
+        self._theme_preview.setWordWrap(True)
+        self._update_preview()
+        layout.addWidget(self._theme_preview)
+
+        layout.addSpacing(16)
+
+        # ── Thumbnail quality ─────────────────────────────────────────
         thumb_label = QLabel('Thumbnail Quality:')
         thumb_label.setStyleSheet('font-weight: bold;')
         layout.addWidget(thumb_label)
@@ -430,12 +519,99 @@ class _AppearanceTab(QWidget):
             'Low quality uses cached thumbnails (fast).\n'
             'High quality re-downloads thumbnails from original URLs (slower, better resolution).'
         )
-        thumb_hint.setStyleSheet('color: rgba(224,224,224,0.4); font-size: 11px;')
+        thumb_hint.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px;')
         thumb_hint.setWordWrap(True)
         layout.addWidget(thumb_hint)
         layout.addStretch(1)
+
+    def _update_preview(self) -> None:
+        """Update the colour-swatch preview when the theme selection changes."""
+        key = self._theme_combo.currentData()
+        if not key or key not in THEMES:
+            return
+        t = THEMES[key]
+        self._theme_preview.setText(
+            f'<span style="color:{t["ACCENT"]}">■</span> Accent '
+            f'<span style="color:{t["TEXT_PRIMARY"]}">■</span> Text '
+            f'<span style="color:{t["DANGER"]}">■</span> Danger '
+            f'<span style="color:{t["SUCCESS"]}">■</span> Success '
+            f'<span style="color:{t["BG_DEEP"]}">■</span> Deep '
+            f'<span style="color:{t["BG_RAISED"]}">■</span> Raised'
+        )
+
     def save(self) -> None:
+        self._db.set_setting('theme', self._theme_combo.currentData())
         self._db.set_setting('thumbnail_quality', self._thumb_combo.currentData())
+
+
+class _NotificationsTab(QWidget):
+    """Notification settings: view count thresholds and subscriber milestones."""
+    def __init__(self, db: DatabaseManager, parent: QWidget | None=None) -> None:
+        super().__init__(parent)
+        self._db = db
+        layout = QVBoxLayout(self)
+
+        # View count thresholds
+        view_label = QLabel('View Count Alert Thresholds:')
+        view_label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(view_label)
+
+        view_desc = QLabel(
+            'Comma-separated view count thresholds.\n'
+            'You\'ll be notified when a creator\'s total views cross each threshold.'
+        )
+        view_desc.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px;')
+        view_desc.setWordWrap(True)
+        layout.addWidget(view_desc)
+
+        saved_thresholds = db.get_setting('notification_view_thresholds') or '10000,100000,1000000'
+        self._thresholds_edit = QLineEdit(saved_thresholds)
+        self._thresholds_edit.setPlaceholderText('e.g. 10000,100000,1000000')
+        layout.addWidget(self._thresholds_edit)
+
+        layout.addSpacing(16)
+
+        # Subscriber milestones (informational)
+        sub_label = QLabel('Subscriber Milestones:')
+        sub_label.setStyleSheet('font-weight: bold;')
+        layout.addWidget(sub_label)
+
+        milestones = QLabel(
+            'You\'ll automatically be notified when a creator reaches:\n'
+            '1K · 5K · 10K · 25K · 50K · 75K · 100K · 250K · 500K · 750K · 1M subscribers'
+        )
+        milestones.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px;')
+        milestones.setWordWrap(True)
+        layout.addWidget(milestones)
+
+        layout.addSpacing(16)
+
+        # Reset alerts button
+        reset_btn = QPushButton('Reset All Triggered Alerts')
+        reset_btn.setToolTip('Clear all previously triggered alerts so they can fire again')
+        reset_btn.clicked.connect(self._on_reset_alerts)
+        layout.addWidget(reset_btn)
+
+        layout.addStretch(1)
+
+    def _on_reset_alerts(self) -> None:
+        self._db.clear_alerts()
+        dark_info(self, 'Alerts Reset', 'All triggered alerts have been cleared.')
+
+    def save(self) -> None:
+        text = self._thresholds_edit.text().strip()
+        # Validate: must be comma-separated positive integers
+        if text:
+            try:
+                values = [int(t.strip()) for t in text.split(',') if t.strip()]
+                assert all(v > 0 for v in values)
+            except (ValueError, AssertionError):
+                dark_warning(self, 'Invalid Thresholds',
+                             'Enter comma-separated positive numbers (e.g. 10000,100000,1000000)')
+                return
+        self._db.set_setting('notification_view_thresholds', text)
+
+
 class SettingsDialog(QDialog):
     """Multi-tab settings dialog: API Keys, Profiles, Role Manager."""
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None, cancel_fetch: Any=None) -> None:
@@ -444,7 +620,11 @@ class SettingsDialog(QDialog):
         self._cancel_fetch = cancel_fetch
         self.setWindowTitle('Settings')
         self.setMinimumSize(520, 420)
-        self.setStyleSheet('QDialog { background: #1A1A1A; }QLabel { color: #E0E0E0; }QTabWidget::pane { border: 1px solid #3A3A3A; background: #222222; }QTabBar::tab { background: #222222; color: #aaa; padding: 8px 20px;   border: 1px solid #3A3A3A; border-bottom: none; border-radius: 4px 4px 0 0; }QTabBar::tab:selected { background: #2E2E2E; color: #E0E0E0; }QLineEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 4px 8px; }QLineEdit::placeholder { color: rgba(224,224,224,0.4); }QTextEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 4px 8px; }QComboBox { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 4px 8px; }QComboBox QAbstractItemView { background: #1C1C22; color: #E0E0E0; border: 1px solid #3A3A3A; selection-background-color: #2A2A33; }QListWidget { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; }QListWidget::item:selected { background: #3A3A3A; }QPushButton { background: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #4A4A4A; }QDialogButtonBox { background: transparent; }')
+        self.setStyleSheet(
+            build_dialog_qss()
+            + f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}\n'
+            f'QDialogButtonBox {{ background: transparent; }}\n'
+        )
         layout = QVBoxLayout(self)
         self._tabs = QTabWidget()
         self._api_tab = _ApiKeysTab(db)
@@ -452,11 +632,13 @@ class SettingsDialog(QDialog):
         self._profiles_tab = _ProfilesTab(db, cancel_fetch=self._cancel_fetch)
         self._roles_tab = _RoleManagerTab(db)
         self._appearance_tab = _AppearanceTab(db)
+        self._notifications_tab = _NotificationsTab(db)
         self._tabs.addTab(self._api_tab, 'API Keys')
         self._tabs.addTab(self._verify_tab, 'Verify')
         self._tabs.addTab(self._profiles_tab, 'Profiles')
         self._tabs.addTab(self._roles_tab, 'Roles')
         self._tabs.addTab(self._appearance_tab, 'Appearance')
+        self._tabs.addTab(self._notifications_tab, 'Notifications')
         layout.addWidget(self._tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_save)
@@ -467,6 +649,11 @@ class SettingsDialog(QDialog):
         if not self._verify_tab.save():
             return
         self._appearance_tab.save()
+        self._notifications_tab.save()
+        # Apply theme change immediately if it changed
+        new_theme = self._appearance_tab._theme_combo.currentData()
+        if new_theme != theme_manager.current:
+            theme_manager.apply(new_theme)
         self.accept()
     @property
     def profile_changed(self) -> bool:

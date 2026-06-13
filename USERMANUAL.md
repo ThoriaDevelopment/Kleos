@@ -16,13 +16,17 @@
 8. [Verification](#verification)
 9. [Leaderboard & Analytics](#leaderboard--analytics)
 10. [Generating Reports](#generating-reports)
-11. [Working with Profiles](#working-with-profiles)
-12. [Roles](#roles)
-13. [Settings](#settings)
-14. [Importing & Exporting Creators](#importing--exporting-creators)
-15. [Importing & Exporting Profiles](#importing--exporting-profiles)
-16. [Search, Sort & Filter](#search-sort--filter)
-17. [Tips & Shortcuts](#tips--shortcuts)
+11. [Exporting a Community Page](#exporting-a-community-page)
+12. [Per-Creator Reports & HTML](#per-creator-reports--html)
+13. [Working with Profiles](#working-with-profiles)
+14. [Roles](#roles)
+15. [Tags & Labels](#tags--labels)
+16. [Milestone Notifications](#milestone-notifications)
+17. [Settings](#settings)
+18. [Importing & Exporting Creators](#importing--exporting-creators)
+19. [Importing & Exporting Profiles](#importing--exporting-profiles)
+20. [Search, Sort & Filter](#search-sort--filter)
+21. [Tips & Shortcuts](#tips--shortcuts)
 
 ---
 
@@ -93,16 +97,19 @@ The main window is your home base. It shows every person in your community as a 
 - **+ Add Media Member** — Opens a form to add someone new.
 - **⟳ Refresh All** — Fetches the latest videos, streams, stats, and thumbnails for everyone at once.
 - **✓ Auto-Verify** — Runs an automatic check on unverified videos to see if they belong in your community.
-- **⚙ Settings** — Opens the settings panel for keys, profiles, roles, and appearance.
+- **⚙ Settings** — Opens the settings panel for keys, profiles, roles, appearance, and notifications.
 - **♛ Leaderboard** — Opens the global analytics and ranking window.
 
 Below those buttons you'll find:
-- A **Search** box to quickly find someone by nickname.
+- A **Search** box to quickly find someone by nickname or tag.
 - A **Sort** dropdown (Date Added, Name, or Subscribers).
 - A **Filter** dropdown to show only people with a certain role.
 - A **Profile** dropdown to switch between different saved lists.
 
 All buttons have tooltips — hover over any button to see what it does.
+
+### Empty State
+If your community is empty (no members added yet), the dashboard shows a friendly empty state with a 🎬 icon, a message, and an **"+ Add Media Member"** button to get you started right away.
 
 The background of the dashboard gently shifts between soft colors, giving the app a calm, modern feel.
 
@@ -132,19 +139,29 @@ Each person in your community appears as a card. From left to right, a card show
 - **Avatar** — Their channel profile picture (fetched automatically once data comes in).
 - **Platform Tag** — Tells you at a glance if they are a "Creator" (YouTube), "Streamer" (Twitch), or "Streamer / Creator" (both).
 - **Subscribers / Followers** — Compact numbers like `1.2M subs` or `450K flw`.
+- **Activity Sparkline** — A row of 7 small dots to the right of the subscriber count. Each dot represents one week of upload activity. Bigger, brighter dots mean more uploads that week. Dim dots mean little or no activity. This gives you a quick visual sense of how active a creator has been recently.
 - **Activity Alert** — An orange ⚠ icon appears when new content has been detected since the last time you looked at their history.
 - **Last Activity** — How long ago their most recent video or stream went live.
+- **Tags** — Small colored chip labels below the main card content, showing any tags you've assigned.
 - **Duration** — How long this person has been in your community (based on the date you added them).
 
 The left edge of each card is colored according to their role, so you can spot groups instantly.
 
 Cards react smoothly when you move your mouse over them, lifting slightly and glowing softly.
 
+### Keyboard Navigation
+- **Tab** to move focus onto the card grid.
+- **Up / Down arrows** to move between cards.
+- **Enter** to open the selected member's history.
+- A blue focus ring appears around the card that currently has keyboard focus.
+
 ### Right-Click Context Menu
 Right-click any card to access these actions:
 - **Edit Nickname** — Change the display name.
 - **Edit Platforms** — Toggle YouTube/Twitch.
 - **Edit Date Added** — Change the join date.
+- **Change Role** — Submenu listing all roles; pick one to reassign this member's role.
+- **Manage Tags** — Add or remove tags/labels on this member.
 - **Refresh Data** — Re-fetch this creator's data from the APIs.
 - **Delete Member** — Remove the creator (with confirmation).
 - **Edit Notes** — Add or edit internal notes about this creator.
@@ -154,10 +171,16 @@ Right-click any card to access these actions:
 
 ## Opening a Member's History & Stats
 
-To dive deeper into a single person, **double-click their card**. A new window titled *Media History* will open. This window has two tabs.
+To dive deeper into a single person, **double-click their card** (or select it and press **Enter**). A new window titled *Media History* will open. This window has two tabs.
 
 ### Media Tab
-Here you see every video or stream Kleos has fetched for this person, arranged from newest to oldest. Each row shows:
+Here you see every video or stream Kleos has fetched for this person. At the top of the media list you'll find controls:
+
+- **Sort** — Choose from Date (newest), Date (oldest), Title A-Z, or Views (high-low).
+- **Filter** — Choose from All, Verified only, Shorts only, Videos only, or Streams only.
+- **Search** — Type to filter content by title. Search activates after a brief pause (debounced).
+
+Each content row shows:
 - A **thumbnail** image.
 - The **title** of the video or stream.
 - How long ago it was **uploaded** or went live.
@@ -168,22 +191,45 @@ At the bottom of the list you'll see a count like "Showing 50 of 120" and a **Lo
 
 If you **double-click** any row, it will open that video or stream directly in your web browser.
 
+#### Content Type Override
+Sometimes Kleos misclassifies content — for example, a premiere might show up as a stream, or a short video might not be detected as a Short. You can fix this by **right-clicking** any content row and choosing:
+- **Set as Video** — Mark this content as a regular video.
+- **Set as Short** — Mark this content as a short.
+- **Set as Stream** — Mark this content as a stream.
+- **Reset to Auto-Detect** — Remove the override and let Kleos classify it automatically again.
+
+Overrides are saved permanently and persist across data refreshes. A small pencil indicator (✎) appears next to the type badge on overridden items so you can tell which ones you've manually set.
+
 The top of the window also shows:
 - Their **nickname** and **subscriber / follower counts**.
 - When their **last verified content** was published.
-- A **notes** text area where you can write internal comments about this member. Notes are auto-saved as you type.
+- A **notes** text area where you can write internal comments about this member. Notes are auto-saved as you type — you'll see a **"Saving…"** indicator that changes to **"Saved ✓"** and then fades away.
 - Buttons to **Refresh Content**, **Delete Member**, or **Export** this member's data.
 
 ### Stats Tab
-This tab shows interactive charts for the selected member. Use the **Timeline** and **Upload Activity** toggle buttons at the top to switch between:
+This tab shows interactive charts for the selected member. The charts are loaded on demand — they only render when you first click the Stats tab, keeping the initial window load fast.
+
+At the top you'll find filter controls:
+- **Verified only** — Check this to include only verified content in the charts. Unchecked shows all content.
+- **Type** — Choose from All types, Shorts, Videos, or Streams to filter by content type.
+- **Range** — Choose from All time, Last year, Last month, or Last week to narrow the date range.
+
+Use the **Timeline** and **Upload Activity** toggle buttons to switch between:
 - **Timeline** — A line chart showing their view trajectory over time.
 - **Upload Activity** — A bar chart showing how many pieces of content they uploaded each month.
 
 The selected chart fills the entire tab area for a clearer, larger view.
 
-You can check the box labeled **Show Non-Verified Content** to include everything in these charts, or leave it unchecked to see only verified content.
-
 Both charts can be zoomed in and out with your mouse wheel, panned by clicking and dragging, and reset by double-clicking.
+
+Below the charts is a report row where you can generate a report or export an HTML dashboard scoped to this creator:
+- **Period** — Choose Weekly, Monthly, Yearly, or All time.
+- **Verified only** — Whether the report counts only verified content.
+- **Type** — Filter the report by content type (All types, Shorts, Videos, Streams).
+- **Copy Report** — Generates a plain-text report and copies it to your clipboard.
+- **Export HTML** — Generates a self-contained HTML dashboard page for this creator and saves it to a file.
+
+See the [Per-Creator Reports & HTML](#per-creator-reports--html) section for more details.
 
 ---
 
@@ -195,7 +241,7 @@ There are two ways to edit notes:
 1. **Right-click a creator card** on the dashboard and choose **Edit Notes**.
 2. **Open their Media History** window — the notes text area appears in the header at the top.
 
-Notes are auto-saved with a short debounce (half a second after you stop typing), so you never lose your work. They are included when you export a profile or a creator, so collaborators can see your notes too.
+Notes are auto-saved with a short debounce (half a second after you stop typing), so you never lose your work. A **"Saving…"** → **"Saved ✓"** indicator appears next to the notes field to confirm. Notes are included when you export a profile or a creator, so collaborators can see your notes too.
 
 ---
 
@@ -229,43 +275,70 @@ A progress bar appears at the top of the dashboard so you can see how far along 
 
 Click the **♛ Leaderboard** button on the main dashboard to open the global analytics window. This is where you see how your entire community is performing.
 
-### Leaderboard Panel (Left Side)
-The left side shows a ranked list of all your members based on total views. Each line looks like:
+### Filter Controls
+At the top of the window you'll find filter controls:
+- **Verified only** — Check this to include only verified content in the charts. Unchecked shows all content.
+- **Type** — Choose from All types, Shorts, Videos, or Streams to filter by content type.
+- **Range** — Choose from All time, Last year, Last month, or Last week to narrow the date range.
 
-```
-1. Nickname — 1,250,000 views | 1.2M subs
-```
-
-You can filter this list using the buttons at the top:
-- **All** — Everyone.
-- **YouTube** — Only YouTube creators.
-- **Streamers** — Only Twitch streamers.
-
-There is also a checkbox:
-- **Show All Stats** — When checked, the leaderboard and charts count *every* piece of content, not just verified ones.
-
-### Charts Panel (Right Side)
+### Charts
 Use the **Timeline** and **Upload Activity** toggle buttons to switch between:
 - **View Trajectory** — A line chart showing how views have accumulated across your community over time.
 - **Monthly Upload Activity** — A bar chart showing how many videos or streams were uploaded each month.
 
-The selected chart fills the entire right panel for a larger, clearer view. Like the individual stats charts, you can zoom with the scroll wheel, pan by dragging, and reset by double-clicking. The charts update automatically when you change the platform filter or the verified-only toggle.
+The selected chart fills the main area for a larger, clearer view. Like the individual stats charts, you can zoom with the scroll wheel, pan by dragging, and reset by double-clicking. The charts update automatically when you change any of the filters.
 
 ---
 
 ## Generating Reports
 
-At the bottom of the Leaderboard window, you'll find a report generator:
+At the bottom of the Analytics window, you'll find a report generator:
 
-1. Choose a time period: **Monthly**, **Weekly**, or **Yearly**.
+1. Choose a time period: **Monthly**, **Weekly**, **Yearly**, or **All time**.
 2. Optionally choose a **Role** to narrow the report to a specific group.
-3. Click **Copy Report**.
+3. Optionally check **Verified only** to count only verified content.
+4. Optionally choose a **Type** filter (All types, Shorts, Videos, Streams).
+5. Click **Copy Report**.
 
 Kleos builds a clean, plain-text summary and copies it directly to your clipboard. You can then paste it into Discord, a forum post, a text document, or anywhere else you like. The report includes:
 - The date range covered.
 - Total uploads and total views for that period.
 - A ranked leaderboard of everyone included.
 - Subscriber and follower counts where available.
+
+---
+
+## Exporting a Community Page
+
+Also in the Analytics window, next to **Copy Report**, you'll find an **Export HTML** button. This generates a self-contained HTML page — a beautiful, dark-themed community dashboard that you can share with anyone.
+
+1. Choose the time period and role filter (same as for reports).
+2. Optionally check **Verified only** and choose a **Type** filter.
+3. Click **Export HTML**.
+4. Choose where to save the file.
+
+The resulting HTML file includes:
+- Your community name and description.
+- A card for each creator with their role badge, platform tag, subscriber count, and view stats.
+- An interactive timeline chart showing view trajectories over time.
+- A monthly upload activity bar chart.
+- A totals summary table.
+- A footer with the generation timestamp.
+
+The file is completely self-contained — all CSS and charts are embedded as inline SVG — so you can send it as-is, host it on a web server, or drop it in a shared drive. No internet connection is needed to view it.
+
+---
+
+## Per-Creator Reports & HTML
+
+Inside any member's **Media History → Stats** tab, you'll find a report row at the bottom that works the same way as the global report, but scoped to that single creator:
+
+1. Choose a time period: **Monthly**, **Weekly**, **Yearly**, or **All time**.
+2. Optionally check **Verified only** to count only verified content.
+3. Optionally choose a **Type** filter (All types, Shorts, Videos, Streams).
+4. Click **Copy Report** to copy a plain-text summary to your clipboard, or **Export HTML** to save a self-contained HTML dashboard page for that creator.
+
+The per-creator HTML export includes the same chart types (timeline and monthly uploads), a creator card, and a totals summary — all filtered to that member's data only.
 
 ---
 
@@ -303,11 +376,58 @@ To manage roles, open **Settings → Roles**.
 2. Either type a color code or click **Pick Color** to choose one visually.
 3. Click **Add Role**.
 
+### Editing a Role
+1. Select a role in the list.
+2. Click **Edit Selected Role**.
+3. Change the name or color and click **OK**.
+
 ### Deleting a Role
 1. Select a role in the list.
 2. Click **Delete Selected Role**.
 
 You can only delete a role if no member is currently using it. If anyone is still assigned to it, Kleos will warn you and show you who needs to be reassigned first.
+
+### Changing a Member's Role
+You can also change a member's role directly from the dashboard:
+1. **Right-click** the member's card.
+2. Hover over **Change Role** in the context menu.
+3. Select the new role from the submenu.
+
+---
+
+## Tags & Labels
+
+Tags let you organize and quickly identify members with custom labels. Tags appear as small colored chips below the main card content.
+
+### Adding and Removing Tags
+1. **Right-click** a creator card and choose **Manage Tags**.
+2. In the tag manager dialog:
+   - Type a tag name and click **Add** to create a new tag.
+   - Click the **×** button next to any tag to remove it.
+3. Click **OK** to save your changes.
+
+Tags are also searchable — type a tag name in the main dashboard search box and all members with that tag will appear.
+
+---
+
+## Milestone Notifications
+
+Kleos automatically notifies you when your creators hit important milestones:
+
+### Subscriber Milestones
+When a creator crosses any of these subscriber thresholds, you'll see a toast notification slide in from the top-right corner:
+- 1K · 5K · 10K · 25K · 50K · 75K · 100K · 250K · 500K · 750K · 1M subscribers
+
+These milestones are fixed and automatic — no configuration needed.
+
+### View Count Alerts
+You can configure custom view-count thresholds. By default, Kleos alerts you when a creator's total views cross 10,000, 100,000, and 1,000,000. To change these:
+1. Open **Settings → Notifications**.
+2. Edit the comma-separated list in **View Count Alert Thresholds** (for example: `5000,50000,500000`).
+3. Click **OK** to save.
+
+### Resetting Alerts
+If you want previously-triggered alerts to fire again (for example, after a data refresh), open **Settings → Notifications** and click **Reset All Triggered Alerts**.
 
 ---
 
@@ -339,11 +459,16 @@ See [Roles](#roles) above.
 ### Appearance
 - **Thumbnail Quality** — Choose between Low (uses cached thumbnails, faster) or High (re-downloads original thumbnails, sharper but slower).
 
+### Notifications
+- **View Count Alert Thresholds** — Comma-separated numbers (for example, `10000,100000,1000000`). Kleos will notify you when a creator's total views cross each threshold.
+- **Subscriber Milestones** — Informational display showing the fixed milestones (1K, 5K, etc.).
+- **Reset All Triggered Alerts** — Clears all previously-triggered alerts so they can fire again on the next data refresh.
+
 ---
 
 ## Importing & Exporting Creators
 
-You can share individual members between computers or friends by exporting them as small files. Notes are included in the export.
+You can share individual members between computers or friends by exporting them as small files. Notes and tags are included in the export.
 
 ### Exporting a Creator
 There are three ways to export a single member:
@@ -358,20 +483,25 @@ There are two ways to bring a creator file into Kleos:
 1. **Drag and drop** the `.json` file directly onto the main dashboard. Kleos will detect it and add the member to your current profile.
 2. Go to **Settings → Profiles** and click **Import Creator**. Browse to the `.json` file and select it.
 
-The imported creator will appear immediately in your dashboard with all their history and notes intact.
+### Merging Duplicate Creators
+If you import a creator whose YouTube or Twitch link matches someone already in your community, Kleos will ask:
+> "A creator with this link already exists. Merge media into the existing creator?"
+
+- **Yes** — The imported content (videos, streams) will be merged into the existing creator. No duplicate will be created.
+- **No** — The import is skipped and the existing creator remains unchanged.
 
 ---
 
 ## Importing & Exporting Profiles
 
-Profiles can be exported as single files too, making it easy to back up your entire community or move it to another computer. Notes are included in profile exports.
+Profiles can be exported as single files too, making it easy to back up your entire community or move it to another computer. Notes, tags, and community descriptions are included in profile exports.
 
 ### Exporting a Profile
 1. Open **Settings → Profiles**.
 2. Click **Export Profile**.
 3. Choose a safe location and filename. The file will be saved as `.json`.
 
-This file contains every member (with notes), every video, every role, and all settings for that profile. **API keys are not included** — they are stored globally and shared across profiles.
+This file contains every member (with notes, tags, and community description), every video, every role, and all settings for that profile. **API keys are not included** — they are stored globally and shared across profiles.
 
 ### Importing a Profile
 There are two ways to import a profile:
@@ -387,7 +517,7 @@ There are two ways to import a profile:
 These tools are located just below the top button row on the main dashboard.
 
 ### Search
-Type into the **Search members…** box (or press **Ctrl+F** to focus it). The list filters after a short pause, showing only nicknames that contain what you typed. Press **Escape** to clear the search.
+Type into the **Search members…** box (or press **Ctrl+F** to focus it). The list filters after a short pause, showing only members whose nickname or tags contain what you typed. Press **Escape** to clear the search.
 
 ### Sort
 Use the **Sort** dropdown to reorder the cards:
@@ -397,6 +527,13 @@ Use the **Sort** dropdown to reorder the cards:
 
 ### Filter
 Use the **Filter** dropdown to show only members with a specific role, or choose **All Roles** to see everyone.
+
+### History Sort & Filter
+Inside any member's Media History window, you can also sort and filter the content list:
+- **Sort** — Date (newest), Date (oldest), Title A-Z, Views (high-low).
+- **Filter** — All, Verified only, Shorts only, Videos only, Streams only.
+- **Search** — Type to search content by title.
+- **Right-click → Content Type Override** — If Kleos misclassified a video, right-click the row and choose "Set as Video," "Set as Short," or "Set as Stream." You can also "Reset to Auto-Detect" to undo the override. Overrides are saved permanently and survive data refreshes.
 
 ---
 
@@ -408,14 +545,22 @@ Use the **Filter** dropdown to show only members with a specific role, or choose
   - **Ctrl+F** — Focus the search bar and select all text.
   - **Escape** — Clear the search box (if it has text), or toggle fullscreen (if the search is empty).
   - **F11** — Toggle fullscreen mode.
+  - **Tab** — Move focus onto the card grid.
+  - **Up / Down arrows** — Navigate between cards when one is focused.
+  - **Enter** — Open the focused card's Media History.
 - **Tooltips:** Hover over any toolbar button or control to see a short description.
 - **Cooldown Timer:** After a Refresh All, there is a short cooldown period. A countdown timer in the status bar shows how many seconds remain before you can refresh again.
 - **New Activity Alert:** The orange ⚠ on a card disappears automatically when you open that member's Media History window.
 - **Cancel Long Operations:** Both **Refresh All** and **Auto-Verify** can be cancelled if you change your mind or need to do something else urgently.
 - **Drag & Drop Import:** Keep a folder of creator or profile exports handy on your desktop. Dragging them straight onto Kleos is the fastest way to import.
-- **Right-Click Context Menu:** Right-click any creator card to quickly edit fields, delete the member, add notes, or export their data.
-- **Creator Notes:** Every member has a notes field. Access it from the right-click menu (**Edit Notes**) or directly in the Media History header. Notes auto-save as you type.
-- **Maximize:** The Leaderboard and Media History windows can be maximized using the standard window buttons in the title bar.
+- **Right-Click Context Menu:** Right-click any creator card to quickly edit fields, change role, manage tags, delete the member, add notes, or export their data.
+- **Creator Notes:** Every member has a notes field. Access it from the right-click menu (**Edit Notes**) or directly in the Media History header. Notes auto-save as you type with a "Saving…" → "Saved ✓" indicator.
+- **Tags:** Use tags to label and group members. They show up as small chips on cards and are searchable from the main search box.
+- **Activity Sparkline:** The 7 dots on each card show weekly upload activity at a glance — brighter and bigger dots mean more activity that week.
+- **Milestone Alerts:** Watch for toast notifications in the top-right corner when creators hit subscriber milestones or view count thresholds.
+- **HTML Export:** Use the **Export HTML** button in the Analytics window or any member's Stats tab to create a shareable community dashboard page.
+- **Content Type Override:** Right-click any content row in a member's Media History to manually set its type (Video, Short, Stream) if Kleos misclassified it. Overrides persist across data refreshes.
+- **Maximize:** The Analytics and Media History windows can be maximized using the standard maximize button in the title bar.
 
 ---
 

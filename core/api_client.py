@@ -39,14 +39,15 @@ def _diag_response(resp: requests.Response, context: str) -> None:
         logger.warning('%s — HTTP %d %s: %s', context, resp.status_code, resp.reason, body[:500])
         resp.raise_for_status()
 class YouTubeVideo:
-    __slots__ = ('content_id', 'title', 'thumbnail_url', 'upload_date', 'view_count', 'is_short', 'description')
-    def __init__(self, content_id: str, title: str, thumbnail_url: str, upload_date: str, view_count: int, is_short: bool, description: str='') -> None:
+    __slots__ = ('content_id', 'title', 'thumbnail_url', 'upload_date', 'view_count', 'is_short', 'is_stream', 'description')
+    def __init__(self, content_id: str, title: str, thumbnail_url: str, upload_date: str, view_count: int, is_short: bool, is_stream: bool = False, description: str = '') -> None:
         self.content_id = content_id
         self.title = title
         self.thumbnail_url = thumbnail_url
         self.upload_date = upload_date
         self.view_count = view_count
         self.is_short = is_short
+        self.is_stream = is_stream
         self.description = description
     def as_dict(self) -> dict[str, Any]:
         return {s: getattr(self, s) for s in self.__slots__}
@@ -146,7 +147,9 @@ class YouTubeClient:
                     video_views = int(raw_views)
                 except (ValueError, TypeError):
                     video_views = 0
-                all_videos.append(YouTubeVideo(content_id=vid, title=snip.get('title', ''), thumbnail_url=thumb, upload_date=snip.get('publishedAt', ''), view_count=video_views, is_short=stat.get('is_short', False), description=snip.get('description', '')))
+                is_stream_from_snippet = snip.get('liveBroadcastContent', 'none') in ('live', 'upcoming')
+                is_stream = stat.get('is_stream', is_stream_from_snippet)
+                all_videos.append(YouTubeVideo(content_id=vid, title=snip.get('title', ''), thumbnail_url=thumb, upload_date=snip.get('publishedAt', ''), view_count=video_views, is_short=stat.get('is_short', False), is_stream=is_stream, description=snip.get('description', '')))
             if max_videos is not None and len(all_videos) >= max_videos:
                 all_videos = all_videos[:max_videos]
                 break
@@ -168,7 +171,7 @@ class YouTubeClient:
         for i in range(0, len(video_ids), 50):
             chunk = video_ids[i:i + 50]
             try:
-                params = {'key': self._key, 'id': ','.join(chunk), 'part': 'statistics,contentDetails'}
+                params = {'key': self._key, 'id': ','.join(chunk), 'part': 'statistics,contentDetails,liveStreamingDetails'}
                 resp = self._session.get(YT_VIDEOS_URL, params=params, timeout=_REQUEST_TIMEOUT)
                 _diag_response(resp, 'YouTube video stats')
                 try:
@@ -181,13 +184,24 @@ class YouTubeClient:
                     cd = v.get('contentDetails', {})
                     duration = cd.get('duration', '')
                     info['is_short'] = self._is_short_duration(duration)
+                    # Detect streams: a YouTube video is a stream if it has
+                    # liveStreamingDetails (present on both live and archived
+                    # streams) or has zero/empty duration (currently live).
+                    is_zero_duration = not duration or duration == 'PT0S'
+                    info['is_stream'] = v.get('liveStreamingDetails') is not None or (is_zero_duration and not info['is_short'])
                     result[v['id']] = info
             except requests.RequestException as exc:
                 logger.warning('YouTube video stats fetch failed: %s', exc)
         return result
     @staticmethod
     def _is_short_duration(iso_duration: str) -> bool:
-        """Return True if an ISO 8601 duration represents 60 seconds or less."""
+        """Return True if an ISO 8601 duration represents 90 seconds or less.
+
+        YouTube officially caps Shorts at 60s, but creators frequently upload
+        videos at 61-90s that are still presented as Shorts on the platform.
+        Using 90s captures these borderline cases while still excluding
+        regular videos and streams.
+        """
         if not iso_duration:
             return False
         m = re.match('PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+(?:\\.\\d+)?)S)?', iso_duration)
@@ -200,7 +214,7 @@ class YouTubeClient:
         if hours == 0 and minutes == 0 and seconds == 0:
             return False
         total_seconds = hours * 3600 + minutes * 60 + seconds
-        return total_seconds <= 60
+        return total_seconds <= 90
     def get_channel_id(self, handle: str) -> str | None:
         """Resolve a ``@handle`` to a channel ID."""
         try:
@@ -680,7 +694,7 @@ data contamination.
                     'creator_id': c['id'], 'platform': 'youtube', 'content_id': v.content_id,
                     'title': v.title, 'thumbnail_path': thumb_local, 'thumbnail_url': v.thumbnail_url,
                     'upload_date': v.upload_date, 'view_count': v.view_count,
-                    'is_short': v.is_short, 'description': v.description,
+                    'is_short': v.is_short, 'is_stream': v.is_stream, 'description': v.description,
                 })
                 yt_ids.add(v.content_id)
                 count += 1
@@ -751,7 +765,7 @@ data contamination.
                 batch.append({
                     'creator_id': c['id'], 'platform': 'twitch', 'content_id': s.content_id,
                     'title': s.title, 'thumbnail_path': thumb_local, 'thumbnail_url': s.thumbnail_url,
-                    'upload_date': s.started_at, 'view_count': s.viewer_count, 'description': '',
+                    'upload_date': s.started_at, 'view_count': s.viewer_count, 'is_short': False, 'is_stream': True, 'description': '',
                 })
                 tw_ids.add(s.content_id)
                 count += 1
@@ -772,7 +786,7 @@ data contamination.
                     batch.append({
                         'creator_id': c['id'], 'platform': 'twitch', 'content_id': v.content_id,
                         'title': v.title, 'thumbnail_path': thumb_local, 'thumbnail_url': v.thumbnail_url,
-                        'upload_date': v.started_at, 'view_count': v.viewer_count, 'description': v.description,
+                        'upload_date': v.started_at, 'view_count': v.viewer_count, 'is_short': False, 'is_stream': True, 'description': v.description,
                     })
                     tw_ids.add(v.content_id)
                     count += 1

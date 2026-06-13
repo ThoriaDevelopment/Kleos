@@ -6,10 +6,14 @@ auto-recreating directories and re-downloading missing files.
 
 Uses per-URL locks to prevent concurrent downloads of the same thumbnail
 from racing on the temporary file, which caused PermissionError on Windows.
+
+Thumbnails are pre-scaled to 320×180 (2× display size for HiDPI) at
+download time to reduce disk usage and memory consumption.
 """
 from __future__ import annotations
 import hashlib
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -19,6 +23,9 @@ import requests
 from .paths import THUMBNAILS_DIR
 logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT = 15
+# Pre-scaling dimensions: 2× the display size (160×90) for HiDPI screens.
+_THUMB_SCALE_W = 320
+_THUMB_SCALE_H = 180
 # Per-URL locks prevent concurrent downloads of the same thumbnail.
 # Without this, two threads can write to the same .tmp file and race
 # on os.replace(), causing PermissionError on Windows.
@@ -53,10 +60,62 @@ def _get_download_lock(url: str) -> threading.Lock:
         return _download_locks[url]
 
 
+def _scale_and_save(tmp_path: Path, dest_path: Path) -> bool:
+    """Scale the image at *tmp_path* to _THUMB_SCALE_W × _THUMB_SCALE_H
+    and save to *dest_path*.
+
+    Uses QImage for scaling since PyQt6 is always available.  Falls back to
+    a simple file copy if scaling fails.
+
+    Returns True on success (scaled or copied), False on total failure.
+    """
+    try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage
+        img = QImage(str(tmp_path))
+        if img.isNull():
+            # Not a valid image — fall back to copying as-is
+            os.replace(str(tmp_path), str(dest_path))
+            return True
+        scaled = img.scaled(
+            _THUMB_SCALE_W, _THUMB_SCALE_H,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        # Determine format from the destination extension
+        ext = dest_path.suffix.lower()
+        fmt = 'PNG' if ext == '.png' else 'JPG'
+        if scaled.save(str(dest_path), fmt, quality=85):
+            # Successfully saved scaled image; remove the temp file
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        else:
+            # Save failed — fall back to moving the original
+            os.replace(str(tmp_path), str(dest_path))
+            return True
+    except ImportError:
+        # PyQt6 not available (shouldn't happen in the app, but be safe)
+        os.replace(str(tmp_path), str(dest_path))
+        return True
+    except Exception as exc:
+        logger.warning('Thumbnail scaling failed, using original: %s', exc)
+        try:
+            os.replace(str(tmp_path), str(dest_path))
+            return True
+        except OSError:
+            return False
+
+
 def ensure_thumbnail(url: str, *, force: bool = False) -> Optional[str]:
     """Download *url* to the local cache if missing, then return its path.
 
-    Returns the local file path on success, or ``None`` on download failure.
+    The downloaded thumbnail is pre-scaled to 320×180 to reduce disk usage
+    and memory consumption.  Returns the local file path on success, or
+    ``None`` on download failure.
+
     Safe to call when the cache directory has been deleted mid-run — the
     directory is re-created automatically and the image re-downloaded.
 
@@ -64,7 +123,8 @@ def ensure_thumbnail(url: str, *, force: bool = False) -> Optional[str]:
     thumbnail don't race on the temporary file.
 
     When *force* is True, skips the cache-exists check and always
-    re-downloads the thumbnail (used for high-quality refresh).
+    re-downloads the thumbnail (used for high-quality refresh).  Forced
+    downloads are NOT scaled to preserve original quality.
     """
     if not url:
         return None
@@ -84,7 +144,12 @@ def ensure_thumbnail(url: str, *, force: bool = False) -> Optional[str]:
                 with open(tmp, 'wb') as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
+            if force:
+                # High-quality refresh: keep original resolution
                 tmp.replace(local)
+            else:
+                # Normal download: scale to display size
+                _scale_and_save(tmp, local)
             return str(local)
         except (requests.RequestException, OSError) as exc:
             logger.warning('Thumbnail download failed for %s: %s', url, exc)

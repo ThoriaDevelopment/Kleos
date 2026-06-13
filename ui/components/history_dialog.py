@@ -3,15 +3,15 @@ import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt6 import sip
-from PyQt6.QtCore import QEvent, QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap
-from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from core.cache_manager import ensure_thumbnail
 from core.db_manager import DatabaseManager
 from ui.app_icon import create_app_icon
@@ -19,21 +19,46 @@ from ui.components.creator_card import relative_time, format_subscriber_count
 from ui.dialog_utils import dark_question, enable_window_maximize, handle_fullscreen_keypress
 from ui.chart_utils import _ZoomableFigureCanvas
 from ui.theme import C
-_DIALOG_QSS = 'QDialog { background: #1A1A1A; }QLabel  { color: #E0E0E0; background: transparent; }QScrollArea { border: none; background: #1E1E1E; }QScrollArea > QWidget > QWidget { background: #1E1E1E; }QPushButton { background: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A;   border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #4A4A4A; }QFrame { background: #1E1E1E; border: none; }QMenu { background-color: #252525; border: 1px solid #3A3A3A; }QMenu::item { color: #E0E0E0; padding: 6px 20px; }QMenu::item:selected { background-color: #2A2A33; color: #FFFFFF; }QTabWidget::pane { border: 1px solid #3A3A3A; background: #1E1E1E; }QTabBar::tab { background: #222222; color: #aaa; padding: 8px 20px;   border: 1px solid #3A3A3A; border-bottom: none; border-radius: 4px 4px 0 0; }QTabBar::tab:selected { background: #2E2E2E; color: #E0E0E0; }QCheckBox { color: #E0E0E0; spacing: 6px; }QCheckBox::indicator { width: 16px; height: 16px; border-radius: 3px; }QCheckBox::indicator:unchecked { background: #222222; border: 1px solid #E0E0E0; }QCheckBox::indicator:checked { background: #3A5A8C; border: 1px solid #3A5A8C; }'
-_HEADER_QSS = 'QFrame#historyHeader { background: #222222; border-radius: 8px; border: none; }QFrame#historyHeader QLabel { color: #E0E0E0; background: transparent; }'
-_ROW_QSS = '_ContentRow { background: #222222; border-radius: 6px; border: none; }_ContentRow:hover { background: #2A2A2A; }_ContentRow QLabel { background: transparent; color: #E0E0E0; }_ContentRow QWidget { background: transparent; }'
-_MPL_STYLE = {'figure.facecolor': '#1A1A1A', 'axes.facecolor': '#222222', 'axes.edgecolor': '#3A3A3A', 'axes.labelcolor': '#E0E0E0', 'xtick.color': '#aaa', 'ytick.color': '#aaa', 'text.color': '#E0E0E0', 'grid.color': '#3A3A3A', 'grid.alpha': 0.5, 'lines.color': '#4A90D9'}
+from ui.theme.stylesheet import build_dialog_qss
+def _header_qss() -> str:
+    """Return header QSS using current theme tokens."""
+    return (
+        f'QFrame#historyHeader {{ background: {C.CARD_BG}; border-radius: 8px; border: none; }}'
+        f'QFrame#historyHeader QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
+    )
+
+def _row_qss() -> str:
+    """Return content-row QSS using current theme tokens."""
+    return (
+        f'_ContentRow {{ background: {C.CARD_BG}; border-radius: 6px; border: none; }}'
+        f'_ContentRow:hover {{ background: {C.BG_HOVER}; }}'
+        f'_ContentRow QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}'
+        f'_ContentRow QWidget {{ background: transparent; }}'
+    )
+def _mpl_style() -> dict:
+    """Return matplotlib style dict using current theme tokens."""
+    return {
+        'figure.facecolor': C.DIALOG_BG, 'axes.facecolor': C.INPUT_BG,
+        'axes.edgecolor': C.BORDER, 'axes.labelcolor': C.TEXT_PRIMARY,
+        'xtick.color': C.TEXT_SECONDARY, 'ytick.color': C.TEXT_SECONDARY,
+        'text.color': C.TEXT_PRIMARY, 'grid.color': C.BORDER,
+        'grid.alpha': 0.5, 'lines.color': C.ACCENT,
+    }
+
 def _apply_style(fig: Figure) -> None:
-    fig.patch.set_facecolor(_MPL_STYLE['figure.facecolor'])
+    s = _mpl_style()
+    fig.patch.set_facecolor(s['figure.facecolor'])
+    fig.patch.set_edgecolor(s['figure.facecolor'])
+    fig.patch.set_linewidth(0)
     for ax in fig.axes:
-        ax.set_facecolor(_MPL_STYLE['axes.facecolor'])
-        ax.tick_params(colors=_MPL_STYLE['xtick.color'])
-        ax.xaxis.label.set_color(_MPL_STYLE['axes.labelcolor'])
-        ax.yaxis.label.set_color(_MPL_STYLE['axes.labelcolor'])
-        ax.title.set_color(_MPL_STYLE['text.color'])
+        ax.set_facecolor(s['axes.facecolor'])
+        ax.tick_params(colors=s['xtick.color'])
+        ax.xaxis.label.set_color(s['axes.labelcolor'])
+        ax.yaxis.label.set_color(s['axes.labelcolor'])
+        ax.title.set_color(s['text.color'])
         for spine in ax.spines.values():
-            spine.set_color(_MPL_STYLE['axes.edgecolor'])
-        ax.grid(True, color=_MPL_STYLE['grid.color'], alpha=_MPL_STYLE['grid.alpha'])
+            spine.set_color(s['axes.edgecolor'])
+        ax.grid(True, color=s['grid.color'], alpha=s['grid.alpha'])
 def _content_url(platform: str, content_id: str, channel_name: str = '') -> str:
     if platform == 'youtube':
         return f'https://www.youtube.com/watch?v={content_id}'
@@ -50,11 +75,12 @@ def _content_url(platform: str, content_id: str, channel_name: str = '') -> str:
             return ''
 def _placeholder_pixmap(w: int=120, h: int=68) -> QPixmap:
     px = QPixmap(w, h)
-    px.fill(QColor('#1A1A1A'))
+    px.fill(QColor(C.DIALOG_BG))
     return px
 class _ContentRow(QFrame):
     """One row in the history list representing a single piece of media."""
     thumbnail_loaded = pyqtSignal(str)
+    content_type_changed = pyqtSignal()
     def __init__(self, media: dict[str, Any], db: DatabaseManager, on_verified_changed: Callable[[], None], parent: QWidget | None=None, *, channel_name: str = '', thumb_pool: ThreadPoolExecutor | None=None) -> None:
         super().__init__(parent)
         self._media = dict(media)
@@ -68,7 +94,14 @@ class _ContentRow(QFrame):
         self.setMinimumHeight(80)
         self.setMaximumHeight(100)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet('QFrame { background: #222222; border-radius: 6px; border: none; }QFrame:hover { background: #2A2A2A; }QLabel { background: transparent; color: #E0E0E0; }QWidget { background: transparent; }')
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        self.setStyleSheet(
+            f'QFrame {{ background: {C.CARD_BG}; border-radius: 6px; border: none; }}'
+            f'QFrame:hover {{ background: {C.BG_HOVER}; }}'
+            f'QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}'
+            f'QWidget {{ background: transparent; }}'
+        )
         self._build_ui()
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
@@ -78,11 +111,13 @@ class _ContentRow(QFrame):
         self._thumb_label = QLabel()
         self._thumb_label.setFixedSize(120, 68)
         self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_label.setStyleSheet('background: #1A1A1A; border-radius: 4px;')
+        self._thumb_label.setStyleSheet(f'background: {C.DIALOG_BG}; border-radius: 4px;')
         self._load_thumbnail(thumb_path)
         layout.addWidget(self._thumb_label)
         mid = QVBoxLayout()
         mid.setSpacing(2)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
         title_text = self._media.get('title', 'Untitled')
         self._title_label = QLabel(title_text)
         self._title_label.setWordWrap(True)
@@ -90,11 +125,16 @@ class _ContentRow(QFrame):
         title_font = QFont()
         title_font.setPointSize(10)
         self._title_label.setFont(title_font)
-        self._title_label.setStyleSheet('color: #E0E0E0; background: transparent;')
-        mid.addWidget(self._title_label)
+        self._title_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
+        title_row.addWidget(self._title_label, 1)
+        self._type_badge = QLabel()
+        self._type_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_type_badge()
+        title_row.addWidget(self._type_badge)
+        mid.addLayout(title_row)
         upload_date = self._media.get('upload_date', '')
         self._age_label = QLabel(relative_time(upload_date))
-        self._age_label.setStyleSheet('color: #E0E0E0; font-size: 10px; background: transparent;')
+        self._age_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 10px; background: transparent;')
         mid.addWidget(self._age_label)
         layout.addLayout(mid, 1)
         verified = bool(self._media.get('is_verified', 0))
@@ -112,7 +152,7 @@ class _ContentRow(QFrame):
         self._views_label.setFont(views_font)
         self._views_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._views_label.setMinimumWidth(80)
-        self._views_label.setStyleSheet('color: #E0E0E0; background: transparent;')
+        self._views_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
         layout.addWidget(self._views_label)
     def _load_thumbnail(self, path: str) -> None:
         if path and Path(path).exists() and (Path(path).stat().st_size > 0):
@@ -160,10 +200,16 @@ class _ContentRow(QFrame):
     def _set_verify_style(self, verified: bool) -> None:
         if verified:
             self._verify_btn.setText('In Community')
-            self._verify_btn.setStyleSheet('QPushButton { background: #2E7D32; color: #fff; border: none; border-radius: 4px; font-size: 11px; }QPushButton:hover { background: #388E3C; }')
+            self._verify_btn.setStyleSheet(
+                f'QPushButton {{ background: {C.VERIFY_GREEN}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 4px; font-size: 11px; }}'
+                f'QPushButton:hover {{ background: {C.VERIFY_GREEN_HOVER}; }}'
+            )
         else:
             self._verify_btn.setText('Verify')
-            self._verify_btn.setStyleSheet('QPushButton { background: #4a4a4a; color: #E0E0E0; border: 1px solid #666; border-radius: 4px; font-size: 11px; }QPushButton:hover { background: #555; }')
+            self._verify_btn.setStyleSheet(
+                f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.TEXT_MUTED}; border-radius: 4px; font-size: 11px; }}'
+                f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+            )
     def _toggle_verified(self) -> None:
         current = bool(self._media.get('is_verified', 0))
         new_val = not current
@@ -174,6 +220,88 @@ class _ContentRow(QFrame):
             self._set_verify_style(new_val)
             if self._on_verified_changed:
                 self._on_verified_changed()
+
+    def _effective_type(self) -> str:
+        """Return the effective content type: 'short', 'stream', or 'video'."""
+        override = self._media.get('type_override')
+        if override:
+            return override
+        if self._media.get('is_stream'):
+            return 'stream'
+        if self._media.get('is_short'):
+            return 'short'
+        return 'video'
+
+    def _update_type_badge(self) -> None:
+        """Refresh the type badge label to reflect current state."""
+        ct = self._effective_type()
+        override = self._media.get('type_override')
+        labels = {'short': 'Short', 'stream': 'Stream', 'video': 'Video'}
+        text = labels.get(ct, 'Video')
+        if override:
+            text += ' ✎'  # pencil indicator for manual override
+        self._type_badge.setText(text)
+        colors = {
+            'short': (C.ACCENT_BLUE, C.ACCENT_BLUE_BORDER),
+            'stream': (C.DANGER, C.DANGER_RED_BORDER if hasattr(C, 'DANGER_RED_BORDER') else C.BORDER),
+            'video': (C.BG_HOVER, C.BORDER),
+        }
+        bg, border = colors.get(ct, (C.BG_HOVER, C.BORDER))
+        self._type_badge.setStyleSheet(
+            f'QLabel {{ background: {bg}; color: {C.TEXT_PRIMARY}; border: 1px solid {border};'
+            f' border-radius: 3px; padding: 1px 5px; font-size: 9px; background: {bg}; }}'
+        )
+
+    def _show_context_menu(self, pos) -> None:
+        """Show a context menu for setting the content type."""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f'QMenu {{ background-color: {C.BG_RAISED}; border: 1px solid {C.BORDER}; }}'
+            f'QMenu::item {{ color: {C.TEXT_PRIMARY}; padding: 6px 20px; }}'
+            f'QMenu::item:selected {{ background-color: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; }}'
+        )
+        ct = self._effective_type()
+        content_id = self._media.get('content_id', '')
+        if not content_id:
+            menu.exec(self.mapToGlobal(pos))
+            return
+
+        act_video = menu.addAction('Set as Video')
+        act_video.setCheckable(True)
+        act_video.setChecked(ct == 'video')
+        act_short = menu.addAction('Set as Short')
+        act_short.setCheckable(True)
+        act_short.setChecked(ct == 'short')
+        act_stream = menu.addAction('Set as Stream')
+        act_stream.setCheckable(True)
+        act_stream.setChecked(ct == 'stream')
+        menu.addSeparator()
+        act_reset = menu.addAction('Reset to Auto-Detect')
+        act_reset.setEnabled(bool(self._media.get('type_override')))
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_video:
+            self._db.set_type_override(content_id, 'video')
+            self._media['is_short'] = 0
+            self._media['is_stream'] = 0
+            self._media['type_override'] = 'video'
+        elif chosen == act_short:
+            self._db.set_type_override(content_id, 'short')
+            self._media['is_short'] = 1
+            self._media['is_stream'] = 0
+            self._media['type_override'] = 'short'
+        elif chosen == act_stream:
+            self._db.set_type_override(content_id, 'stream')
+            self._media['is_short'] = 0
+            self._media['is_stream'] = 1
+            self._media['type_override'] = 'stream'
+        elif chosen == act_reset:
+            self._db.set_type_override(content_id, None)
+            self._media['type_override'] = None
+            # Note: is_short/is_stream will be corrected on next refetch
+        self._update_type_badge()
+        self.content_type_changed.emit()
     def refresh_time(self) -> None:
         self._age_label.setText(relative_time(self._media.get('upload_date', '')))
     def mouseDoubleClickEvent(self, event) -> None:
@@ -185,30 +313,73 @@ class _CreatorTimelineChart(_ZoomableFigureCanvas, FigureCanvas):
 
     Supports scroll-to-zoom, drag-to-pan, and double-click-to-reset.
     """
-    def __init__(self, db: DatabaseManager, creator_id: int, parent: QWidget | None=None) -> None:
+
+    def __init__(self, db: DatabaseManager, creator_id: int, parent: QWidget | None = None) -> None:
         self._fig = Figure(figsize=(5, 2.5), dpi=100)
         super().__init__(self._fig)
         self._db = db
         self._creator_id = creator_id
         self._verified_only = True
+        self._content_type = None
+        self._time_range = None
         self._pan_active = False
         self._home_xlim = None
         self._home_ylim = None
         self.setParent(parent)
         self.setMinimumHeight(200)
+        self.setStyleSheet('background: transparent;')
         self._render()
+
     def set_verified_only(self, verified_only: bool) -> None:
         """Toggle verification filter and re-render."""
         self._verified_only = verified_only
         self._render()
+
+    def set_content_type(self, content_type: str | None) -> None:
+        """Set content-type filter (None=all, 'short', 'video', 'stream') and re-render."""
+        self._content_type = content_type
+        self._render()
+
+    def set_time_range(self, time_range: str | None) -> None:
+        """Set time-range filter (None=all, 'week', 'month', 'year') and re-render."""
+        self._time_range = time_range
+        self._render()
+
     def _render(self) -> None:
         self._fig.clear()
         ax = self._fig.add_subplot(111)
+        conditions = ["upload_date != ''", "creator_id = ?"]
+        params: list[Any] = [self._creator_id]
         if self._verified_only:
-            rows = self._db._read('SELECT upload_date, view_count FROM media_content WHERE creator_id = ? AND is_verified = 1 AND upload_date != \'\' ORDER BY upload_date ASC', (self._creator_id,))
-        else:
-            rows = self._db._read('SELECT upload_date, view_count FROM media_content WHERE creator_id = ? AND upload_date != \'\' ORDER BY upload_date ASC', (self._creator_id,))
-        label = 'Verified Content' if self._verified_only else 'All Content'
+            conditions.append('is_verified = 1')
+        ct = self._content_type
+        if ct == 'short':
+            conditions.append('is_short = 1')
+        elif ct == 'video':
+            conditions.append('is_short = 0')
+            conditions.append('is_stream = 0')
+        elif ct == 'stream':
+            conditions.append('is_stream = 1')
+        if self._time_range:
+            now = datetime.now(timezone.utc)
+            if self._time_range == 'week':
+                since = now - timedelta(weeks=1)
+            elif self._time_range == 'month':
+                since = now - timedelta(days=30)
+            elif self._time_range == 'year':
+                since = now - timedelta(days=365)
+            else:
+                since = None
+            if since:
+                conditions.append('upload_date >= ?')
+                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        where = ' AND '.join(conditions)
+        rows = self._db._read(
+            f'SELECT upload_date, view_count FROM media_content WHERE {where} ORDER BY upload_date ASC',
+            tuple(params),
+        )
+        type_labels: dict[str | None, str] = {None: 'Content', 'short': 'Shorts', 'video': 'Videos', 'stream': 'Streams'}
+        label = f"{'Verified' if self._verified_only else 'All'} {type_labels.get(self._content_type, 'Content')}"
         if not rows:
             ax.text(0.5, 0.5, f'No {label.lower()} yet', ha='center', va='center', fontsize=12, color='#888')
             _apply_style(self._fig)
@@ -230,7 +401,7 @@ class _CreatorTimelineChart(_ZoomableFigureCanvas, FigureCanvas):
                 self.draw()
                 self._save_home_limits()
             else:
-                ax.plot(dates, views, marker='o', markersize=4, color='#4A90D9', linewidth=1.5)
+                ax.plot(dates, views, marker='o', markersize=4, color=C.ACCENT, linewidth=1.5)
                 ax.set_xlabel('Date')
                 ax.set_ylabel('Views')
                 ax.set_title(f'{label} — View Trajectory')
@@ -243,30 +414,73 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
 
     Supports scroll-to-zoom, drag-to-pan, and double-click-to-reset.
     """
-    def __init__(self, db: DatabaseManager, creator_id: int, parent: QWidget | None=None) -> None:
+
+    def __init__(self, db: DatabaseManager, creator_id: int, parent: QWidget | None = None) -> None:
         self._fig = Figure(figsize=(5, 2.5), dpi=100)
         super().__init__(self._fig)
         self._db = db
         self._creator_id = creator_id
         self._verified_only = True
+        self._content_type = None
+        self._time_range = None
         self._pan_active = False
         self._home_xlim = None
         self._home_ylim = None
         self.setParent(parent)
         self.setMinimumHeight(200)
+        self.setStyleSheet('background: transparent;')
         self._render()
+
     def set_verified_only(self, verified_only: bool) -> None:
         """Toggle verification filter and re-render."""
         self._verified_only = verified_only
         self._render()
+
+    def set_content_type(self, content_type: str | None) -> None:
+        """Set content-type filter (None=all, 'short', 'video', 'stream') and re-render."""
+        self._content_type = content_type
+        self._render()
+
+    def set_time_range(self, time_range: str | None) -> None:
+        """Set time-range filter (None=all, 'week', 'month', 'year') and re-render."""
+        self._time_range = time_range
+        self._render()
+
     def _render(self) -> None:
         self._fig.clear()
         ax = self._fig.add_subplot(111)
+        conditions = ["upload_date != ''", "creator_id = ?"]
+        params: list[Any] = [self._creator_id]
         if self._verified_only:
-            rows = self._db._read('SELECT upload_date FROM media_content WHERE creator_id = ? AND is_verified = 1 AND upload_date != \'\' ORDER BY upload_date ASC', (self._creator_id,))
-        else:
-            rows = self._db._read('SELECT upload_date FROM media_content WHERE creator_id = ? AND upload_date != \'\' ORDER BY upload_date ASC', (self._creator_id,))
-        label = 'Verified Uploads' if self._verified_only else 'All Uploads'
+            conditions.append('is_verified = 1')
+        ct = self._content_type
+        if ct == 'short':
+            conditions.append('is_short = 1')
+        elif ct == 'video':
+            conditions.append('is_short = 0')
+            conditions.append('is_stream = 0')
+        elif ct == 'stream':
+            conditions.append('is_stream = 1')
+        if self._time_range:
+            now = datetime.now(timezone.utc)
+            if self._time_range == 'week':
+                since = now - timedelta(weeks=1)
+            elif self._time_range == 'month':
+                since = now - timedelta(days=30)
+            elif self._time_range == 'year':
+                since = now - timedelta(days=365)
+            else:
+                since = None
+            if since:
+                conditions.append('upload_date >= ?')
+                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        where = ' AND '.join(conditions)
+        rows = self._db._read(
+            f'SELECT upload_date FROM media_content WHERE {where} ORDER BY upload_date ASC',
+            tuple(params),
+        )
+        type_labels: dict[str | None, str] = {None: 'Uploads', 'short': 'Shorts', 'video': 'Videos', 'stream': 'Streams'}
+        label = f"{'Verified' if self._verified_only else 'All'} {type_labels.get(self._content_type, 'Uploads')}"
         if not rows:
             ax.text(0.5, 0.5, f'No {label.lower()} yet', ha='center', va='center', fontsize=12, color='#888')
             _apply_style(self._fig)
@@ -290,7 +504,7 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
                     labels.append(dt.strftime('%b %y'))
                 except ValueError:
                     labels.append(m)
-            ax.bar(range(len(months)), counts, color='#4A90D9', width=0.6, edgecolor='#3A3A3A', linewidth=0.5)
+            ax.bar(range(len(months)), counts, color=C.ACCENT, width=0.6, edgecolor=C.BORDER, linewidth=0.5)
             ax.set_xticks(range(len(months)))
             ax.set_xticklabels(labels, rotation=45, fontsize=8)
             ax.set_ylabel('Uploads')
@@ -321,6 +535,7 @@ keeping the UI responsive even with 1000+ videos.
         self._thumb_pool = ThreadPoolExecutor(max_workers=4)
         self._rows: list[_ContentRow] = []
         self._all_media: list[dict[str, Any]] = []
+        self._display_media: list[dict[str, Any]] = []
         self._rendered_count = 0
         self._on_refresh = on_refresh
         nickname = creator.get('nickname', 'Unknown')
@@ -328,7 +543,7 @@ keeping the UI responsive even with 1000+ videos.
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(680, 480)
         self.resize(780, 560)
-        self.setStyleSheet(_DIALOG_QSS)
+        self.setStyleSheet(build_dialog_qss())
         self._build_ui()
         self._animated = False
         self._opacity_effect = QGraphicsOpacityEffect(self)
@@ -364,40 +579,55 @@ keeping the UI responsive even with 1000+ videos.
             return
         super().keyPressEvent(event)
 
-    def changeEvent(self, event) -> None:
-        """Prevent the parent window from being minimized when this dialog is minimized.
-
-        On Windows, minimizing a QDialog with WindowMinMaxButtonsHint propagates
-        the minimize to the parent window.  We detect this and restore only the
-        parent, while allowing the dialog to stay minimized normally.
-        """
-        if event.type() == QEvent.Type.WindowStateChange and self.windowState() & Qt.WindowState.WindowMinimized:
-            # The dialog is being minimized.  On Windows, this also minimizes
-            # the parent window.  Restore only the parent so the main dashboard
-            # stays visible behind the minimized dialog.
-            QTimer.singleShot(0, self._restore_parent_from_minimize)
-        super().changeEvent(event)
-
-    def _restore_parent_from_minimize(self) -> None:
-        """Restore the parent window that was minimized as a side-effect."""
-        parent = self.parent()
-        if parent and isinstance(parent, QWidget):
-            parent.setWindowState(Qt.WindowState.WindowNoState)
-            parent.show()
-            parent.raise_()
-            parent.activateWindow()
     def _build_ui(self) -> None:
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(16, 12, 16, 12)
         vbox.setSpacing(10)
         self._build_header(vbox)
         self._tabs = QTabWidget()
+        self._tabs.currentChanged.connect(self._on_tab_changed)
         vbox.addWidget(self._tabs, 1)
+        # --- Sort / Filter / Search control bar ---
+        control_bar = QHBoxLayout()
+        control_bar.setSpacing(8)
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(['Date (newest)', 'Date (oldest)', 'Title A-Z', 'Views (high-low)'])
+        self._sort_combo.setStyleSheet(
+            f'QComboBox {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
+            f'border-radius: 4px; padding: 4px 8px; min-width: 130px; }}'
+            f'QComboBox::drop-down {{ border: none; }}'
+            f'QComboBox QAbstractItemView {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
+            f'selection-background-color: {C.BG_HOVER}; }}')
+        self._sort_combo.currentIndexChanged.connect(self._apply_sort_filter)
+        control_bar.addWidget(self._sort_combo)
+
+        self._filter_combo = QComboBox()
+        self._filter_combo.addItems(['All', 'Verified only', 'Shorts only', 'Videos only', 'Streams only'])
+        self._filter_combo.setStyleSheet(
+            f'QComboBox {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
+            f'border-radius: 4px; padding: 4px 8px; min-width: 120px; }}'
+            f'QComboBox::drop-down {{ border: none; }}'
+            f'QComboBox QAbstractItemView {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
+            f'selection-background-color: {C.BG_HOVER}; }}')
+        self._filter_combo.currentIndexChanged.connect(self._apply_sort_filter)
+        control_bar.addWidget(self._filter_combo)
+
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText('Search content...')
+        self._search_edit.setStyleSheet(
+            f'QLineEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
+            f'border-radius: 4px; padding: 4px 8px; }}')
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._apply_sort_filter)
+        self._search_edit.textChanged.connect(self._search_timer.start)
+        control_bar.addWidget(self._search_edit, 1)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.viewport().setStyleSheet('background: #1E1E1E;')
+        self._scroll.viewport().setStyleSheet(f'background: {C.BG_LAYER};')
         self._list_container = QWidget()
-        self._list_container.setStyleSheet('background: #1E1E1E;')
+        self._list_container.setStyleSheet(f'background: {C.BG_LAYER};')
         self._list_layout = QVBoxLayout(self._list_container)
         self._list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._list_layout.setSpacing(6)
@@ -409,17 +639,18 @@ keeping the UI responsive even with 1000+ videos.
         media_layout = QVBoxLayout(media_page)
         media_layout.setContentsMargins(0, 0, 0, 0)
         media_layout.setSpacing(6)
+        media_layout.addLayout(control_bar)
         media_layout.addWidget(self._scroll, 1)
         self._count_label = QLabel()
-        self._count_label.setStyleSheet('color: rgba(224,224,224,0.5); font-size: 11px; background: transparent;')
+        self._count_label.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px; background: transparent;')
         media_layout.addWidget(self._count_label)
         self._load_more_btn = QPushButton('Load More')
         self._load_more_btn.setObjectName('loadMoreBtn')
         self._load_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._load_more_btn.setStyleSheet(
-            'QPushButton#loadMoreBtn { background: #2A2A2A; color: #E0E0E0; border: 1px solid #3A3A3A;'
-            ' border-radius: 4px; padding: 8px 20px; }'
-            'QPushButton#loadMoreBtn:hover { background: #3A3A3A; }'
+            f'QPushButton#loadMoreBtn {{ background: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER};'
+            f' border-radius: 4px; padding: 8px 20px; }}'
+            f'QPushButton#loadMoreBtn:hover {{ background: {C.BORDER}; }}'
         )
         self._load_more_btn.clicked.connect(self._load_more)
         media_layout.addWidget(self._load_more_btn)
@@ -429,31 +660,47 @@ keeping the UI responsive even with 1000+ videos.
         stats_layout.setContentsMargins(4, 8, 4, 4)
         stats_layout.setSpacing(8)
         filter_row = QHBoxLayout()
-        self._verified_check = QCheckBox('Show Non-Verified Content')
+        self._verified_check = QCheckBox('Verified only')
         self._verified_check.setChecked(False)
         self._verified_check.stateChanged.connect(self._on_verified_check_changed)
         filter_row.addWidget(self._verified_check)
+        filter_row.addWidget(QLabel('Type:'))
+        self._stats_type_combo = QComboBox()
+        self._stats_type_combo.addItem('All types', None)
+        self._stats_type_combo.addItem('Shorts', 'short')
+        self._stats_type_combo.addItem('Videos', 'video')
+        self._stats_type_combo.addItem('Streams', 'stream')
+        self._stats_type_combo.currentIndexChanged.connect(self._on_stats_type_changed)
+        filter_row.addWidget(self._stats_type_combo)
+        filter_row.addWidget(QLabel('Range:'))
+        self._stats_range_combo = QComboBox()
+        self._stats_range_combo.addItem('All time', None)
+        self._stats_range_combo.addItem('Last year', 'year')
+        self._stats_range_combo.addItem('Last month', 'month')
+        self._stats_range_combo.addItem('Last week', 'week')
+        self._stats_range_combo.currentIndexChanged.connect(self._on_stats_range_changed)
+        filter_row.addWidget(self._stats_range_combo)
         filter_row.addStretch(1)
         filter_row.addWidget(QLabel('Chart:'))
         self._btn_timeline = QPushButton('Timeline')
         self._btn_timeline.setCheckable(True)
         self._btn_timeline.setChecked(True)
         self._btn_timeline.setStyleSheet(
-            'QPushButton { background: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A; '
-            'border-radius: 4px; padding: 4px 12px; }'
-            'QPushButton:checked { background: #4A90D9; border-color: #4A90D9; color: #FFFFFF; }'
-            'QPushButton:hover { background: #3A3A3A; }'
-            'QPushButton:checked:hover { background: #5DA0E9; }')
+            f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
+            f'border-radius: 4px; padding: 4px 12px; }}'
+            f'QPushButton:checked {{ background: {C.ACCENT}; border-color: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; }}'
+            f'QPushButton:hover {{ background: {C.BORDER}; }}'
+            f'QPushButton:checked:hover {{ background: {C.ACCENT_HOVER}; }}')
         self._btn_timeline.clicked.connect(lambda: self._chart_stack.setCurrentIndex(0))
         filter_row.addWidget(self._btn_timeline)
         self._btn_bar = QPushButton('Upload Activity')
         self._btn_bar.setCheckable(True)
         self._btn_bar.setStyleSheet(
-            'QPushButton { background: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A; '
-            'border-radius: 4px; padding: 4px 12px; }'
-            'QPushButton:checked { background: #4A90D9; border-color: #4A90D9; color: #FFFFFF; }'
-            'QPushButton:hover { background: #3A3A3A; }'
-            'QPushButton:checked:hover { background: #5DA0E9; }')
+            f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
+            f'border-radius: 4px; padding: 4px 12px; }}'
+            f'QPushButton:checked {{ background: {C.ACCENT}; border-color: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; }}'
+            f'QPushButton:hover {{ background: {C.BORDER}; }}'
+            f'QPushButton:checked:hover {{ background: {C.ACCENT_HOVER}; }}')
         self._btn_bar.clicked.connect(lambda: self._chart_stack.setCurrentIndex(1))
         filter_row.addWidget(self._btn_bar)
         chart_group = QButtonGroup(self)
@@ -462,11 +709,39 @@ keeping the UI responsive even with 1000+ videos.
         chart_group.addButton(self._btn_bar)
         stats_layout.addLayout(filter_row)
         self._chart_stack = QStackedWidget()
-        self._creator_timeline = _CreatorTimelineChart(self._db, self._creator['id'])
-        self._chart_stack.addWidget(self._creator_timeline)
-        self._creator_bar = _CreatorBarChart(self._db, self._creator['id'])
-        self._chart_stack.addWidget(self._creator_bar)
+        self._creator_timeline = None
+        self._creator_bar = None
+        self._chart_stack.addWidget(QWidget())  # placeholder for timeline
+        self._chart_stack.addWidget(QWidget())  # placeholder for bar
         stats_layout.addWidget(self._chart_stack, 1)
+
+        # ── Report row (scoped to this creator) ──
+        report_row = QHBoxLayout()
+        report_row.addWidget(QLabel('Report:'))
+        self._report_period_combo = QComboBox()
+        self._report_period_combo.addItem('Monthly', 'monthly')
+        self._report_period_combo.addItem('Weekly', 'weekly')
+        self._report_period_combo.addItem('Yearly', 'yearly')
+        self._report_period_combo.addItem('All time', 'all')
+        report_row.addWidget(self._report_period_combo)
+        self._report_verified_check = QCheckBox('Verified only')
+        report_row.addWidget(self._report_verified_check)
+        report_row.addWidget(QLabel('Type:'))
+        self._report_type_combo = QComboBox()
+        self._report_type_combo.addItem('All types', None)
+        self._report_type_combo.addItem('Shorts', 'short')
+        self._report_type_combo.addItem('Videos', 'video')
+        self._report_type_combo.addItem('Streams', 'stream')
+        report_row.addWidget(self._report_type_combo)
+        self._report_btn = QPushButton('Copy Report')
+        self._report_btn.clicked.connect(self._on_copy_report)
+        report_row.addWidget(self._report_btn)
+        self._html_btn = QPushButton('Export HTML')
+        self._html_btn.clicked.connect(self._on_export_html)
+        report_row.addWidget(self._html_btn)
+        report_row.addStretch(1)
+        stats_layout.addLayout(report_row)
+
         self._tabs.addTab(stats_page, 'Stats')
         close = QPushButton('Close')
         close.setFixedWidth(100)
@@ -476,7 +751,7 @@ keeping the UI responsive even with 1000+ videos.
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         header = QFrame()
         header.setObjectName('historyHeader')
-        header.setStyleSheet('QFrame#historyHeader { background: #222222; border-radius: 8px; border: none; }QFrame#historyHeader QLabel { color: #E0E0E0; background: transparent; }')
+        header.setStyleSheet(_header_qss())
         h_layout = QVBoxLayout(header)
         h_layout.setSpacing(4)
         h_layout.setContentsMargins(12, 10, 12, 10)
@@ -487,48 +762,57 @@ keeping the UI responsive even with 1000+ videos.
         name_font.setBold(True)
         name_font.setPointSize(14)
         name_label.setFont(name_font)
-        name_label.setStyleSheet('color: #E0E0E0; background: transparent;')
+        name_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
         name_row.addWidget(name_label)
         sub_counts = self._db.bulk_subscriber_counts().get(self._creator['id'], {})
         sub_text = format_subscriber_count(sub_counts.get('youtube', 0), sub_counts.get('twitch', 0))
         if sub_text != 'N/A':
             sub_label = QLabel(sub_text)
-            sub_label.setStyleSheet('color: #999; font-size: 11px; background: transparent;')
+            sub_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
             name_row.addWidget(sub_label)
         name_row.addStretch(1)
         self._refresh_btn = QPushButton('Refresh Content')
         self._refresh_btn.setObjectName('refreshContentBtn')
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._refresh_btn.setStyleSheet('QPushButton#refreshContentBtn { background-color: #1A3A5C; color: #7EB8E0; border: 1px solid #2A5A8C; border-radius: 4px; padding: 6px 12px; }QPushButton#refreshContentBtn:hover { background-color: #2A5A8C; color: #AAD4F0; }')
+        self._refresh_btn.setStyleSheet(
+            f'QPushButton#refreshContentBtn {{ background-color: {C.ACCENT_BLUE_BG}; color: {C.ACCENT_HOVER}; border: 1px solid {C.ACCENT_BLUE_BORDER}; border-radius: 4px; padding: 6px 12px; }}'
+            f'QPushButton#refreshContentBtn:hover {{ background-color: {C.ACCENT_BLUE_BORDER}; color: {C.ACCENT_HOVER}; }}'
+        )
         self._refresh_btn.clicked.connect(self._on_refresh_content)
         name_row.addWidget(self._refresh_btn)
         self._delete_btn = QPushButton('Delete Member')
         self._delete_btn.setObjectName('deleteMemberBtn')
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._delete_btn.setStyleSheet('QPushButton#deleteMemberBtn { background-color: #2D1A1A; color: #FF8888; border: 1px solid #552222; border-radius: 4px; padding: 6px 12px; }QPushButton#deleteMemberBtn:hover { background-color: #4A1F1F; color: #FFAAAA; }')
+        self._delete_btn.setStyleSheet(
+            f'QPushButton#deleteMemberBtn {{ background-color: {C.DANGER_RED_BG}; color: {C.DANGER}; border: 1px solid {C.DANGER_RED_BORDER}; border-radius: 4px; padding: 6px 12px; }}'
+            f'QPushButton#deleteMemberBtn:hover {{ background-color: {C.DANGER_RED_BORDER}; color: {C.TEXT_PRIMARY}; }}'
+        )
         self._delete_btn.clicked.connect(self._on_delete_member)
         name_row.addWidget(self._delete_btn)
         self._export_btn = QPushButton('Export')
         self._export_btn.setObjectName('exportCreatorBtn')
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._export_btn.setStyleSheet('QPushButton#exportCreatorBtn { background-color: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 6px 12px; }QPushButton#exportCreatorBtn:hover { background-color: #4A4A4A; }')
+        self._export_btn.setStyleSheet(
+            f'QPushButton#exportCreatorBtn {{ background-color: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 12px; }}'
+            f'QPushButton#exportCreatorBtn:hover {{ background-color: {C.BG_HOVER}; }}'
+        )
         self._export_btn.clicked.connect(self._on_export_creator)
         name_row.addWidget(self._export_btn)
         h_layout.addLayout(name_row)
         self._last_verified_label = QLabel()
-        self._last_verified_label.setStyleSheet('color: #E0E0E0; font-size: 11px; background: transparent;')
+        self._last_verified_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
         self._update_last_verified()
         h_layout.addWidget(self._last_verified_label)
         # Notes section
         notes_label = QLabel('Notes:')
-        notes_label.setStyleSheet('color: #E0E0E0; font-size: 11px; background: transparent;')
+        notes_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
         h_layout.addWidget(notes_label)
         self._notes_edit = QTextEdit()
         self._notes_edit.setPlaceholderText('Add notes about this member…')
         self._notes_edit.setMaximumHeight(60)
         self._notes_edit.setStyleSheet(
-            'QTextEdit { background: #1C1C22; color: #E0E0E0; border: 1px solid #3A3A3A; '
-            'border-radius: 4px; padding: 4px; font-size: 12px; }')
+            f'QTextEdit {{ background: {C.BG_LAYER}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
+            f'border-radius: 4px; padding: 4px; font-size: 12px; }}')
         self._notes_edit.setPlainText(self._creator.get('notes', '') or '')
         self._notes_timer = QTimer(self)
         self._notes_timer.setSingleShot(True)
@@ -536,6 +820,13 @@ keeping the UI responsive even with 1000+ videos.
         self._notes_timer.timeout.connect(self._save_notes)
         self._notes_edit.textChanged.connect(self._notes_timer.start)
         h_layout.addWidget(self._notes_edit)
+        self._notes_save_label = QLabel('')
+        self._notes_save_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+        h_layout.addWidget(self._notes_save_label)
+        self._notes_save_clear_timer = QTimer(self)
+        self._notes_save_clear_timer.setSingleShot(True)
+        self._notes_save_clear_timer.setInterval(2000)
+        self._notes_save_clear_timer.timeout.connect(lambda: self._notes_save_label.setText(''))
         parent_layout.addWidget(header)
     def _update_last_verified(self) -> None:
         media = self._all_media or self._db.get_media(creator_id=self._creator['id'])
@@ -547,9 +838,8 @@ keeping the UI responsive even with 1000+ videos.
         else:
             self._last_verified_label.setText('No verified content yet')
     def _load_content(self) -> None:
-        """Clear existing rows and render the first page of media."""
+        """Clear existing rows, populate _all_media, then apply sort/filter."""
         # Remove only content rows from the list layout
-        # (count label and load-more button live in the parent media_page, not _list_layout)
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
             widget = item.widget()
@@ -557,36 +847,98 @@ keeping the UI responsive even with 1000+ videos.
                 widget.deleteLater()
         self._rows.clear()
         self._all_media = self._db.get_media(creator_id=self._creator['id'])
+        self._apply_sort_filter()
+
+    def _apply_sort_filter(self) -> None:
+        """Filter and sort _all_media into _display_media, then render."""
+        media = list(self._all_media)
+
+        # Filter
+        filter_idx = self._filter_combo.currentIndex()
+        if filter_idx == 1:  # Verified only
+            media = [m for m in media if m.get('is_verified', 0)]
+        elif filter_idx == 2:  # Shorts only
+            media = [m for m in media if m.get('is_short', 0)]
+        elif filter_idx == 3:  # Videos only (not short, not stream)
+            media = [m for m in media if not m.get('is_short', 0) and not m.get('is_stream', 0)]
+        elif filter_idx == 4:  # Streams only (Twitch or YouTube streams)
+            media = [m for m in media if m.get('is_stream', 0)]
+
+        # Search
+        search_text = self._search_edit.text().strip().lower()
+        if search_text:
+            media = [m for m in media if search_text in (m.get('title', '') or '').lower()]
+
+        # Sort
+        sort_idx = self._sort_combo.currentIndex()
+        if sort_idx == 0:  # Date (newest)
+            media.sort(key=lambda m: m.get('upload_date', '') or '', reverse=True)
+        elif sort_idx == 1:  # Date (oldest)
+            media.sort(key=lambda m: m.get('upload_date', '') or '')
+        elif sort_idx == 2:  # Title A-Z
+            media.sort(key=lambda m: (m.get('title', '') or '').lower())
+        elif sort_idx == 3:  # Views (high-low)
+            media.sort(key=lambda m: m.get('view_count', 0) or 0, reverse=True)
+
+        self._display_media = media
+        self._render_filtered_content()
+
+    def _render_filtered_content(self) -> None:
+        """Clear existing rows and render the first page of _display_media."""
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._rows.clear()
         self._rendered_count = 0
         self._list_container.blockSignals(True)
         self._scroll.blockSignals(True)
-        # Render first page
         self._render_next_page()
         self._list_container.blockSignals(False)
         self._scroll.blockSignals(False)
         self._list_container.updateGeometry()
         self._scroll.updateGeometry()
 
+    def _on_tab_changed(self, index: int) -> None:
+        """Lazily create charts when the Stats tab is first shown."""
+        if self._tabs.tabText(index) != 'Stats' or self._creator_timeline is not None:
+            return
+        verified_only = self._verified_check.isChecked()
+        content_type = self._stats_type_combo.currentData()
+        self._creator_timeline = _CreatorTimelineChart(self._db, self._creator['id'])
+        self._creator_timeline.set_verified_only(verified_only)
+        self._creator_timeline.set_content_type(content_type)
+        self._chart_stack.removeWidget(self._chart_stack.widget(0))
+        self._chart_stack.insertWidget(0, self._creator_timeline)
+        self._creator_bar = _CreatorBarChart(self._db, self._creator['id'])
+        self._creator_bar.set_verified_only(verified_only)
+        self._creator_bar.set_content_type(content_type)
+        self._chart_stack.removeWidget(self._chart_stack.widget(1))
+        self._chart_stack.insertWidget(1, self._creator_bar)
+        self._chart_stack.setCurrentIndex(0 if self._btn_timeline.isChecked() else 1)
+
     def _render_next_page(self) -> None:
         """Append the next batch of rows (up to _PAGE_SIZE) into the list."""
         start = self._rendered_count
-        end = min(start + self._PAGE_SIZE, len(self._all_media))
+        end = min(start + self._PAGE_SIZE, len(self._display_media))
         channel_name = self._creator.get('nickname', '')
         for i in range(start, end):
-            row = _ContentRow(self._all_media[i], self._db, self._on_verified_toggled, self, channel_name=channel_name, thumb_pool=self._thumb_pool)
+            row = _ContentRow(self._display_media[i], self._db, self._on_verified_toggled, self, channel_name=channel_name, thumb_pool=self._thumb_pool)
+            row.content_type_changed.connect(self._on_content_type_changed)
             self._rows.append(row)
             self._list_layout.addWidget(row)
         self._rendered_count = end
-        total = len(self._all_media)
+        total = len(self._display_media)
         self._count_label.setText(f'Showing {self._rendered_count} of {total}')
         if self._rendered_count >= total:
             self._load_more_btn.hide()
-            self._count_label.setStyleSheet('color: rgba(224,224,224,0.4); font-size: 11px; background: transparent;')
+            self._count_label.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px; background: transparent;')
         else:
             self._load_more_btn.show()
             remaining = total - self._rendered_count
             self._load_more_btn.setText(f'Load More ({remaining} remaining)')
-            self._count_label.setStyleSheet('color: rgba(224,224,224,0.5); font-size: 11px; background: transparent;')
+            self._count_label.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px; background: transparent;')
 
     def _load_more(self) -> None:
         """Handle the Load More button click — render the next page."""
@@ -608,9 +960,87 @@ keeping the UI responsive even with 1000+ videos.
         self.verified_changed.emit()
     def _on_verified_check_changed(self, state: int) -> None:
         """Re-render both Stats charts when the verification toggle changes."""
-        verified_only = not self._verified_check.isChecked()
-        self._creator_timeline.set_verified_only(verified_only)
-        self._creator_bar.set_verified_only(verified_only)
+        verified_only = self._verified_check.isChecked()
+        if self._creator_timeline is not None:
+            self._creator_timeline.set_verified_only(verified_only)
+        if self._creator_bar is not None:
+            self._creator_bar.set_verified_only(verified_only)
+
+    def _on_stats_type_changed(self, index: int) -> None:
+        """Re-render both Stats charts when the content-type combo changes."""
+        content_type = self._stats_type_combo.currentData()
+        if self._creator_timeline is not None:
+            self._creator_timeline.set_content_type(content_type)
+        if self._creator_bar is not None:
+            self._creator_bar.set_content_type(content_type)
+
+    def _on_stats_range_changed(self, index: int) -> None:
+        """Re-render both Stats charts when the time-range combo changes."""
+        time_range = self._stats_range_combo.currentData()
+        if self._creator_timeline is not None:
+            self._creator_timeline.set_time_range(time_range)
+        if self._creator_bar is not None:
+            self._creator_bar.set_time_range(time_range)
+
+    def _on_copy_report(self) -> None:
+        """Generate a per-creator report and copy it to the clipboard."""
+        from core.report_generator import generate_report
+        from PyQt6.QtWidgets import QApplication
+        from ui.dialog_utils import dark_info
+        period = self._report_period_combo.currentData() or 'monthly'
+        verified_only = self._report_verified_check.isChecked()
+        content_type = self._report_type_combo.currentData()
+        creator_id = self._creator.get('id')
+        report = generate_report(self._db, period=period, verified_only=verified_only,
+                                 content_type=content_type, creator_id=creator_id)
+        QApplication.clipboard().setText(report)
+        dark_info(self, 'Report Copied', 'Creator report has been copied to your clipboard.')
+
+    def _on_export_html(self) -> None:
+        """Export a per-creator HTML dashboard page."""
+        from core.html_export import generate_html_report
+        from PyQt6.QtWidgets import QFileDialog
+        from ui.dialog_utils import dark_info, dark_warning
+        period = self._report_period_combo.currentData() or 'monthly'
+        verified_only = self._report_verified_check.isChecked()
+        content_type = self._report_type_combo.currentData()
+        time_range = self._stats_range_combo.currentData()
+        creator_id = self._creator.get('id')
+        try:
+            html = generate_html_report(self._db, period=period, verified_only=verified_only,
+                                        content_type=content_type, time_range=time_range,
+                                        creator_id=creator_id)
+            nick = self._creator.get('nickname', 'creator')
+            default_name = f'{nick}_dashboard.html'
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Export HTML', default_name, 'HTML Files (*.html)')
+            if path:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(html)
+                dark_info(self, 'Exported', f'HTML dashboard exported to {path}')
+        except Exception as exc:
+            dark_warning(self, 'Export Failed', str(exc))
+
+    def _on_content_type_changed(self) -> None:
+        """Re-render Stats charts and refresh the media list when a content row's type is overridden."""
+        # Update _all_media entries from the changed row data
+        for row in self._rows:
+            content_id = row._media.get('content_id', '')
+            for i, m in enumerate(self._all_media):
+                if m.get('content_id') == content_id:
+                    self._all_media[i] = dict(row._media)
+                    break
+        # Re-apply filter so the media tab reflects the change immediately
+        self._apply_sort_filter()
+        # Re-render stats charts
+        verified_only = self._verified_check.isChecked()
+        content_type = self._stats_type_combo.currentData() if hasattr(self, '_stats_type_combo') else None
+        if self._creator_timeline is not None:
+            self._creator_timeline.set_verified_only(verified_only)
+            self._creator_timeline.set_content_type(content_type)
+        if self._creator_bar is not None:
+            self._creator_bar.set_verified_only(verified_only)
+            self._creator_bar.set_content_type(content_type)
     def _on_refresh_content(self) -> None:
         """Trigger a background API refresh for this creator and reload content when done."""
         if self._on_refresh is not None:
@@ -623,14 +1053,22 @@ keeping the UI responsive even with 1000+ videos.
         self._refresh_btn.setText('Refresh Content')
         self._load_content()
         self._update_last_verified()
-        verified_only = not self._verified_check.isChecked()
-        self._creator_timeline.set_verified_only(verified_only)
-        self._creator_bar.set_verified_only(verified_only)
+        verified_only = self._verified_check.isChecked()
+        content_type = self._stats_type_combo.currentData() if hasattr(self, '_stats_type_combo') else None
+        if self._creator_timeline is not None:
+            self._creator_timeline.set_verified_only(verified_only)
+            self._creator_timeline.set_content_type(content_type)
+        if self._creator_bar is not None:
+            self._creator_bar.set_verified_only(verified_only)
+            self._creator_bar.set_content_type(content_type)
     def _save_notes(self) -> None:
         """Save notes to the database (called by debounce timer)."""
+        self._notes_save_label.setText('Saving...')
         text = self._notes_edit.toPlainText()
         self._db.update_creator(self._creator['id'], notes=text)
         self._creator['notes'] = text
+        self._notes_save_label.setText('Saved ✓')
+        self._notes_save_clear_timer.start()
 
     def _on_delete_member(self) -> None:
         nick = self._creator.get('nickname', 'Unknown')

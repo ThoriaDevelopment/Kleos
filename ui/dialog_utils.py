@@ -33,13 +33,15 @@ def handle_fullscreen_keypress(window: QWidget, event: QKeyEvent) -> bool:
 
 
 def enable_window_maximize(window: QWidget) -> None:
-    """Add the minimize and maximize buttons to a dialog's title bar.
+    """Add the maximize button to a dialog's title bar.
 
     Only needed for ``QDialog`` subclasses — ``QMainWindow`` already has
-    them by default.
+    them by default.  On Windows, ``WindowMinMaxButtonsHint`` also adds a
+    minimize button which causes the parent window to minimize as a side-effect,
+    so we use only ``WindowMaximizeButtonHint`` instead.
     """
     window.setWindowFlags(
-        window.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint
+        window.windowFlags() | Qt.WindowType.WindowMaximizeButtonHint
     )
 
 

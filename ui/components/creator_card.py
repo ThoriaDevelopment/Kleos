@@ -7,11 +7,42 @@ from ui.theme import C, M
 from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt, QTimer, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QGridLayout, QLabel, QMenu, QWidget
+from PyQt6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QMenu, QWidget
 if TYPE_CHECKING:
     from core.db_manager import DatabaseManager
 _ACCENT_R, _ACCENT_G, _ACCENT_B = (QColor(C.ACCENT).red(), QColor(C.ACCENT).green(), QColor(C.ACCENT).blue())
 _SHADOW_INIT = QColor(0, 0, 0, 0)
+
+
+class _SparklineWidget(QWidget):
+    """Tiny row of dots showing upload frequency over the last N weeks."""
+
+    def __init__(self, data: list[int], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._data = data or [0] * 7
+        self.setFixedSize(max(len(self._data) * 8 + 4, 10), 14)
+        self.setStyleSheet('background: transparent;')
+
+    def update_data(self, data: list[int]) -> None:
+        self._data = data or [0] * 7
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        max_val = max(self._data) if self._data else 1
+        max_val = max(max_val, 1)
+        for i, val in enumerate(self._data):
+            alpha = max(40, min(220, int(40 + 180 * (val / max_val))))
+            radius = max(2, min(4, int(2 + 2 * (val / max_val))))
+            painter.setBrush(QColor(_ACCENT_R, _ACCENT_G, _ACCENT_B, alpha))
+            painter.setPen(Qt.PenStyle.NoPen)
+            center_x = 4 + i * 8
+            center_y = 7
+            painter.drawEllipse(QPoint(center_x, center_y), radius, radius)
+        painter.end()
+
+
 def relative_time(iso_str: str) -> str:
     if not iso_str:
         return 'N/A'
@@ -190,14 +221,19 @@ class _RippleOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         alpha = max(0, int(60 * (1.0 - self._radius / max(self._anim.endValue(), 1))))
-        painter.setBrush(QColor(255, 255, 255, alpha))
+        # Use accent colour for ripple so it's visible on both light and dark themes
+        ripple_color = QColor(C.ACCENT)
+        ripple_color.setAlpha(alpha)
+        painter.setBrush(ripple_color)
         painter.setPen(Qt.PenStyle.NoPen)
         r = int(self._radius)
         painter.drawEllipse(self._origin, r, r)
-def card_stylesheet(role_color: str | None=None) -> str:
+def card_stylesheet(role_color: str | None=None, focused: bool=False) -> str:
     """Build a per-card stylesheet from design-system tokens."""
-    base = 'border-radius: 6px; padding: 4px; background: #222222;'
-    child = 'CreatorCard QLabel { background: transparent; color: #E0E0E0; }CreatorCard QWidget { background: transparent; }'
+    base = f'border-radius: 6px; padding: 4px; background: {C.CARD_BG};'
+    if focused:
+        base += f' border: 2px solid {C.ACCENT};'
+    child = f'CreatorCard QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}CreatorCard QWidget {{ background: transparent; }}'
     if not role_color:
         return f'CreatorCard {{ {base} }}' + child
     else:
@@ -244,13 +280,18 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
     export_creator_requested = pyqtSignal(int)
     delete_requested = pyqtSignal(int)
     edit_notes_requested = pyqtSignal(int)
-    def __init__(self, creator: dict[str, Any], role: dict[str, Any] | None, last_activity: str, has_new_activity: bool, subscriber_text: str='N/A', parent: QWidget | None=None) -> None:
+    role_change_requested = pyqtSignal(int, int)
+    tags_changed = pyqtSignal(int)
+
+    def __init__(self, creator: dict[str, Any], role: dict[str, Any] | None, last_activity: str, has_new_activity: bool, subscriber_text: str='N/A', roles: list[dict[str, Any]] | None=None, activity_data: list[int] | None=None, parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self._creator = creator
         self._role = role
         self._last_activity_iso = last_activity
         self._has_new_activity = has_new_activity
         self._subscriber_text = subscriber_text
+        self._roles = roles or []
+        self._activity_data = activity_data or []
         self._hover_anim = None
         self._shadow_timer = QTimer(self)
         self._shadow_timer.setSingleShot(False)
@@ -265,6 +306,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._ripple = _RippleOverlay(self)
         self._base_pos = None
         self._suppress_click = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setMinimumHeight(72)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -275,7 +317,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self.setStyleSheet(card_stylesheet(role_color))
         self._build_ui()
     def _build_ui(self) -> None:
-        """\nGrid columns (fixed widths keep all rows in perfect alignment):\n\n  col 0  nickname        stretch\n  col 1  avatar          32 px\n  col 2  platform tag   120 px\n  col 3  subscriber      130 px\n  col 4  alert icon      24 px  ← always present, hidden when unused\n  col 5  last activity  140 px\n  col 6  duration        90 px\n"""
+        """\nGrid columns (fixed widths keep all rows in perfect alignment):\n\n  col 0  nickname        stretch\n  col 1  avatar          32 px\n  col 2  platform tag   120 px\n  col 3  subscriber      130 px\n  col 4  alert icon      24 px  ← always present, hidden when unused\n  col 5  sparkline       64 px  ← activity dots\n  col 6  last activity  140 px\n  col 7  duration        90 px\n"""
         grid = QGridLayout(self)
         grid.setContentsMargins(12, 8, 12, 8)
         grid.setSpacing(8)
@@ -284,7 +326,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         name_font.setPointSize(11)
         self._name_label = QLabel(self._creator.get('nickname', 'Unknown'))
         self._name_label.setFont(name_font)
-        self._name_label.setStyleSheet(f'color: #E0E0E0; background: transparent;')
+        self._name_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
         grid.addWidget(self._name_label, 0, 0)
         grid.setColumnStretch(0, 1)
         self._avatar_label = QLabel()
@@ -301,7 +343,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         tag_text = _platform_label(platforms)
         self._platform_label = QLabel(tag_text)
         self._platform_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._platform_label.setStyleSheet(f'background: rgba(255,255,255,0.08); border-radius: 4px; padding: 2px 10px; font-size: 11px; color: #E0E0E0;')
+        self._platform_label.setStyleSheet(f'background: {C.BG_HOVER}; border-radius: 4px; padding: 2px 10px; font-size: 11px; color: {C.TEXT_SECONDARY};')
         grid.addWidget(self._platform_label, 0, 2)
         grid.setColumnMinimumWidth(2, 120)
         self._sub_label = QLabel(self._subscriber_text)
@@ -313,21 +355,45 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._review_dot.setFixedWidth(24)
         self._review_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._review_dot.setToolTip('New activity — click to inspect')
-        self._review_dot.setStyleSheet(f'color: #FF6B35; font-size: 16px; background: transparent;')
+        self._review_dot.setStyleSheet(f'color: {C.DANGER}; font-size: 16px; background: transparent;')
         self._review_dot.setVisible(self._has_new_activity)
         grid.addWidget(self._review_dot, 0, 4)
         grid.setColumnMinimumWidth(4, 24)
+        # Sparkline (activity dots)
+        self._sparkline = _SparklineWidget(self._activity_data, self)
+        grid.addWidget(self._sparkline, 0, 5)
+        grid.setColumnMinimumWidth(5, 64)
         self._activity_label = QLabel(relative_time(self._last_activity_iso))
         self._activity_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._activity_label.setStyleSheet(f'color: #E0E0E0; font-size: 11px; background: transparent;')
-        grid.addWidget(self._activity_label, 0, 5)
-        grid.setColumnMinimumWidth(5, 140)
+        self._activity_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        grid.addWidget(self._activity_label, 0, 6)
+        grid.setColumnMinimumWidth(6, 140)
         date_added = self._creator.get('date_added', '')
         self._duration_label = QLabel(membership_duration(date_added))
         self._duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._duration_label.setStyleSheet(f'color: #E0E0E0; font-size: 11px; background: transparent;')
-        grid.addWidget(self._duration_label, 0, 6)
-        grid.setColumnMinimumWidth(6, 90)
+        self._duration_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        grid.addWidget(self._duration_label, 0, 7)
+        grid.setColumnMinimumWidth(7, 90)
+        # Tags row
+        self._tags_row = QWidget(self)
+        self._tags_row.setStyleSheet('background: transparent;')
+        tags_layout = QHBoxLayout(self._tags_row)
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        tags_layout.setSpacing(4)
+        tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        try:
+            tags = json.loads(self._creator.get('tags', '[]'))
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+        for tag in tags:
+            chip = QLabel(tag)
+            chip.setStyleSheet(
+                f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; '
+                f'border-radius: 8px; padding: 1px 6px; font-size: 10px;'
+            )
+            tags_layout.addWidget(chip)
+        if tags:
+            grid.addWidget(self._tags_row, 1, 0, 1, 8)
     def _load_avatar(self) -> None:
         pfp = self._creator.get('pfp_url')
         if pfp:
@@ -444,7 +510,11 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._review_dot.setVisible(visible)
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self)
-        menu.setStyleSheet('QMenu { background-color: #1C1C22; border: 1px solid #3A3A3A; }QMenu::item { color: #E0E0E0; padding: 6px 20px; }QMenu::item:selected { background-color: #2A2A33; color: #FFFFFF; }')
+        menu.setStyleSheet(
+            f'QMenu {{ background-color: {C.BG_RAISED}; border: 1px solid {C.BORDER}; }}'
+            f'QMenu::item {{ color: {C.TEXT_PRIMARY}; padding: 6px 20px; }}'
+            f'QMenu::item:selected {{ background-color: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; }}'
+        )
         edit_nick = QAction('Edit Nickname', self)
         edit_nick.triggered.connect(lambda: self.edit_requested.emit(self._creator['id'], 'nickname', self._creator.get('nickname', '')))
         menu.addAction(edit_nick)
@@ -454,6 +524,22 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         edit_date = QAction('Edit Date Added', self)
         edit_date.triggered.connect(lambda: self.edit_requested.emit(self._creator['id'], 'date_added', self._creator.get('date_added', '')))
         menu.addAction(edit_date)
+        # Change Role submenu
+        if self._roles:
+            role_menu = QMenu('Change Role', self)
+            role_menu.setStyleSheet(menu.styleSheet())
+            current_role_id = self._creator.get('role_id')
+            for r in self._roles:
+                action = role_menu.addAction(r['role_name'])
+                action.setCheckable(True)
+                action.setChecked(r['id'] == current_role_id)
+                rid = r['id']
+                action.triggered.connect(lambda checked, rid=rid: self.role_change_requested.emit(self._creator['id'], rid))
+            menu.addMenu(role_menu)
+        # Manage Tags
+        manage_tags = QAction('Manage Tags', self)
+        manage_tags.triggered.connect(lambda: self._manage_tags())
+        menu.addAction(manage_tags)
         menu.addSeparator()
         refresh_action = QAction('Refresh Data', self)
         refresh_action.triggered.connect(lambda: self.refresh_requested.emit(self._creator['id']))
@@ -470,6 +556,165 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         export_action.triggered.connect(lambda: self.export_creator_requested.emit(self._creator['id']))
         menu.addAction(export_action)
         menu.exec(self.mapToGlobal(pos))
+
+    def _manage_tags(self) -> None:
+        """Open a dialog to manage tags for this creator."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QListWidget, QListWidgetItem, QDialogButtonBox
+        from ui.theme.stylesheet import build_dialog_qss
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'Manage Tags — {self._creator.get("nickname", "Unknown")}')
+        dlg.setMinimumWidth(300)
+        dlg.setStyleSheet(build_dialog_qss())
+        layout = QVBoxLayout(dlg)
+        try:
+            current_tags = json.loads(self._creator.get('tags', '[]'))
+        except (json.JSONDecodeError, TypeError):
+            current_tags = []
+        tag_list = QListWidget()
+        for tag in current_tags:
+            item = QListWidgetItem(tag)
+            item.setData(Qt.ItemDataRole.UserRole, tag)
+            tag_list.addItem(item)
+        layout.addWidget(tag_list)
+        remove_btn = QPushButton('Remove Selected')
+        remove_btn.clicked.connect(lambda: [tag_list.takeItem(tag_list.row(item)) for item in tag_list.selectedItems()])
+        layout.addWidget(remove_btn)
+        add_row = QHBoxLayout()
+        add_input = QLineEdit()
+        add_input.setPlaceholderText('Add tag…')
+        add_row.addWidget(add_input, 1)
+        add_btn = QPushButton('Add')
+        add_btn.clicked.connect(lambda: add_input.text().strip() and (
+            tag_list.addItem(QListWidgetItem(add_input.text().strip())),
+            add_input.clear()
+        ))
+        add_row.addWidget(add_btn)
+        layout.addLayout(add_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_tags = [tag_list.item(i).data(Qt.ItemDataRole.UserRole) or tag_list.item(i).text() for i in range(tag_list.count())]
+            # Find the DatabaseManager via the parent chain
+            from core.db_manager import DatabaseManager
+            db = None
+            parent_widget = self.parent()
+            while parent_widget:
+                if hasattr(parent_widget, '_db') and isinstance(parent_widget._db, DatabaseManager):
+                    db = parent_widget._db
+                    break
+                parent_widget = parent_widget.parent()
+            if db:
+                db.set_creator_tags(self._creator['id'], new_tags)
+                self._creator['tags'] = json.dumps(new_tags)
+                self.tags_changed.emit(self._creator['id'])
+
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        super().focusInEvent(event)
+        # Add focus ring
+        self.setStyleSheet(card_stylesheet(
+            self._role.get('role_color') if self._role else None,
+            focused=True,
+        ))
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        self.setStyleSheet(card_stylesheet(
+            self._role.get('role_color') if self._role else None,
+            focused=False,
+        ))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            self.clicked.emit(self._creator['id'])
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self._navigate_card(event.key())
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _navigate_card(self, key: int) -> None:
+        """Move focus to the previous/next visible CreatorCard in the layout."""
+        parent_layout = self.parent()
+        if parent_layout is None:
+            return
+        layout = parent_layout.layout() if hasattr(parent_layout, 'layout') else None
+        if layout is None:
+            # Walk up to find a layout
+            widget = parent_layout
+            while widget is not None:
+                if widget.layout() is not None:
+                    layout = widget.layout()
+                    break
+                widget = widget.parent()
+        if layout is None:
+            return
+        # Collect visible CreatorCard siblings in layout order
+        siblings = []
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            w = item.widget() if item is not None else None
+            if isinstance(w, CreatorCard) and w.isVisible() and not w.isHidden():
+                siblings.append(w)
+        if not siblings:
+            return
+        try:
+            idx = siblings.index(self)
+        except ValueError:
+            return
+        direction = -1 if key == Qt.Key.Key_Up else 1
+        new_idx = (idx + direction) % len(siblings)
+        target = siblings[new_idx]
+        target.setFocus()
+        # Scroll the scroll area to make the target visible
+        scroll = target
+        while scroll is not None:
+            from PyQt6.QtWidgets import QScrollArea
+            if isinstance(scroll, QScrollArea):
+                scroll.ensureWidgetVisible(target)
+                break
+            scroll = scroll.parent()
+
+    def update_data(self, creator: dict, role: dict | None, last_activity: str, has_new_activity: bool, subscriber_text: str, roles: list | None = None, activity_data: list[int] | None = None) -> None:
+        """Update this card's data in-place without destroying/recreating the widget."""
+        self._creator = creator
+        self._role = role
+        self._last_activity_iso = last_activity
+        self._has_new_activity = has_new_activity
+        self._subscriber_text = subscriber_text
+        if roles is not None:
+            self._roles = roles
+        # Update visible widgets
+        self._name_label.setText(creator.get('nickname', 'Unknown'))
+        self._activity_label.setText(relative_time(last_activity))
+        self._sub_label.setText(subscriber_text)
+        self._review_dot.setVisible(has_new_activity)
+        self._load_avatar()
+        if activity_data is not None:
+            self._sparkline.update_data(activity_data)
+        # Update role color stylesheet
+        role_color = role.get('role_color') if role else None
+        self.setStyleSheet(card_stylesheet(role_color))
+        # Update tags row
+        try:
+            tags = json.loads(creator.get('tags', '[]'))
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+        # Clear existing tag chips
+        while self._tags_row.layout().count():
+            item = self._tags_row.layout().takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for tag in tags:
+            chip = QLabel(tag)
+            chip.setStyleSheet(
+                f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; '
+                f'border-radius: 8px; padding: 1px 6px; font-size: 10px;'
+            )
+            self._tags_row.layout().addWidget(chip)
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button()!= Qt.MouseButton.LeftButton:
             event.accept()

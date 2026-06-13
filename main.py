@@ -11,7 +11,7 @@ from core.paths import APP_DIR, BACKUPS_DIR, STORAGE_DIR, THUMBNAILS_DIR
 from ui.app_icon import create_app_icon
 from ui.main_window import MainWindow
 from ui.theme import build_global_qss
-from ui.theme.tokens import C
+from ui.theme.tokens import C, theme_manager
 
 
 class _KleosStyle(QProxyStyle):
@@ -81,9 +81,9 @@ class FirstRunWizard(QDialog):
         f'QPushButton:disabled {{ color: {C.TEXT_MUTED}; background: {C.BG_LAYER}; }}'
     )
     _ACCENT_BTN = (
-        f'QPushButton {{ background-color: {C.CHECK_ACCENT}; color: #7EB8E0; '
-        f'border: 1px solid #2A5A8C; border-radius: 4px; padding: 8px 20px; }}'
-        f'QPushButton:hover {{ background-color: #2A5A8C; color: #AAD4F0; }}'
+        f'QPushButton {{ background-color: {C.CHECK_ACCENT}; color: {C.TEXT_ON_ACCENT}; '
+        f'border: 1px solid {C.ACCENT_BLUE_BORDER}; border-radius: 4px; padding: 8px 20px; }}'
+        f'QPushButton:hover {{ background-color: {C.ACCENT_BLUE_BORDER}; color: {C.ACCENT_HOVER}; }}'
     )
 
     # ── Mockup helpers ──────────────────────────────────────────────────
@@ -214,8 +214,8 @@ class FirstRunWizard(QDialog):
         h.addWidget(title_lbl, 1)
 
         badge_text = '✓ In Community' if verified else 'Verify'
-        badge_color = '#2E7D32' if verified else C.TEXT_MUTED
-        badge_bg = '#1B3A1B' if verified else C.BG_LAYER
+        badge_color = C.VERIFY_GREEN if verified else C.TEXT_MUTED
+        badge_bg = C.BG_RAISED if verified else C.BG_LAYER
         badge = QLabel(badge_text)
         badge.setStyleSheet(
             f'background: {badge_bg}; color: {badge_color}; '
@@ -483,7 +483,7 @@ class FirstRunWizard(QDialog):
         tb = QHBoxLayout()
         add_btn = QLabel('  ＋ Add Member  ')
         add_btn.setStyleSheet(
-            f'background: {C.CHECK_ACCENT}; color: #7EB8E0; '
+            f'background: {C.CHECK_ACCENT}; color: {C.ACCENT_HOVER}; '
             f'border-radius: 3px; padding: 4px 10px; font-size: 11px;'
         )
         tb.addWidget(add_btn)
@@ -935,9 +935,13 @@ def main() -> None:
         sys.exit(1)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle(_KleosStyle(app.style()))
-    app.setStyleSheet(build_global_qss())
     app.setWindowIcon(create_app_icon())
     db = DatabaseManager(determine_startup_profile())
+
+    # Apply saved theme (must happen before global stylesheet and window)
+    saved_theme = db.get_setting('theme') or 'default'
+    theme_manager.apply(saved_theme)
+    app.setStyleSheet(build_global_qss())
 
     # First-run wizard: show only once, only mark complete if user accepted
     first_run = db.get_global_setting('first_run_complete')

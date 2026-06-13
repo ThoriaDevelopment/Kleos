@@ -4,10 +4,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 from ui.theme import C, M
+from ui.theme.stylesheet import build_dialog_qss, refresh_all_styles
+from ui.theme.tokens import theme_manager
 from PyQt6 import sip
 from PyQt6.QtCore import QAbstractAnimation, QDate, QEasingCurve, QPoint, QPropertyAnimation, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPalette, QShortcut
-from PyQt6.QtWidgets import QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
 from core.api_client import FetchWorker, load_api_keys
 from core.db_manager import DatabaseManager
 from core.verify_worker import ANTHROPIC_AVAILABLE, VerifyWorker
@@ -15,9 +17,10 @@ logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import CreatorCard, format_subscriber_count
 from ui.components.history_dialog import HistoryDialog
-from ui.dialog_utils import dark_question, dark_warning, handle_fullscreen_keypress
+from ui.dialog_utils import dark_question, dark_warning, dark_info, handle_fullscreen_keypress
 from ui.settings_dialog import SettingsDialog
 from ui.analytics_window import AnalyticsWindow
+from ui.notification import NotificationToast
 class GradientCanvasV2(QWidget):
     """Full-window underlay widget that paints a slow-breathing gradient\nusing design-system colour tokens.\n\nThe gradient alternates between C.BG_BASE and C.BG_DEEP at ±4% opacity\nover a 10-second sinusoidal loop driven by QVariantAnimation.\nNo layout geometry is recalculated — only a paint event fires.\n"""
     def __init__(self, parent: QWidget) -> None:
@@ -78,13 +81,41 @@ class GradientCanvasV2(QWidget):
         grad.setColorAt(0.0, top_color)
         grad.setColorAt(1.0, QColor(C.BG_DEEP))
         painter.fillRect(self.rect(), grad)
+
+    def refresh_colors(self) -> None:
+        """Update gradient colours after a theme change and repaint."""
+        self._col_a = QColor(C.BG_BASE)
+        self._col_b = QColor(C.BG_DEEP)
+        self.update()
 class _InlineEditDialog(QDialog):
-    _CALENDAR_QSS = 'QCalendarWidget { background: #222222; color: #E0E0E0; }QCalendarWidget QToolButton { color: #E0E0E0; background: #222222; border: 1px solid #3A3A3A; }QCalendarWidget QMenu { background: #3A3A3A; color: #E0E0E0; }QCalendarWidget QAbstractItemView { background: #222222; selection-background-color: #E0E0E0; border: none; padding: 4px; }#qt_calendar_yearbutton:hover { background: #222222; color: #E0E0E0; }#qt_calendar_yearedit { color: #E0E0E0; }#qt_calendar_prevmonth { background: #222222; border: none; }#qt_calendar_nextmonth { background: #222222; border: none; }QCalendarWidget QTableView { background: #3A3A3A; gridline-color: #4A90D9; selection-color: #FFFFFF; alternate-background-color: #0F0F14; }'
+    _CALENDAR_QSS = None  # Built dynamically in __init__ for theme support
+
     def __init__(self, field: str, current_value: str, parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f'Edit {field.replace('_', ' ').title()}')
         self.setMinimumWidth(320)
-        self.setStyleSheet('QDialog { background: #09090C; }QLabel { color: #E0E0E0; background: transparent; }QLineEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 4px 8px; }QListWidget { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; }QListWidget::item:selected { background: #2A2A33; }QCheckBox { color: #E0E0E0; border: 1px solid #3A5A8C; }QPushButton { background: #1C1C22; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #2A2A33; }QDialogButtonBox { background: transparent; }')
+        self._CALENDAR_QSS = (
+            f'QCalendarWidget {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; }}'
+            f'QCalendarWidget QToolButton {{ color: {C.TEXT_PRIMARY}; background: {C.INPUT_BG}; border: 1px solid {C.INPUT_BORDER}; }}'
+            f'QCalendarWidget QMenu {{ background: {C.BORDER}; color: {C.TEXT_PRIMARY}; }}'
+            f'QCalendarWidget QAbstractItemView {{ background: {C.INPUT_BG}; selection-background-color: {C.TEXT_PRIMARY}; border: none; padding: 4px; }}'
+            f'#qt_calendar_yearbutton:hover {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; }}'
+            f'#qt_calendar_yearedit {{ color: {C.TEXT_PRIMARY}; }}'
+            f'#qt_calendar_prevmonth {{ background: {C.INPUT_BG}; border: none; }}'
+            f'#qt_calendar_nextmonth {{ background: {C.INPUT_BG}; border: none; }}'
+            f'QCalendarWidget QTableView {{ background: {C.BORDER}; gridline-color: {C.ACCENT}; selection-color: {C.TEXT_ON_ACCENT}; alternate-background-color: {C.BG_BASE}; }}'
+        )
+        self.setStyleSheet(
+            f'QDialog {{ background: {C.BG_DEEP}; }}'
+            f'QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
+            f'QLineEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; border-radius: 4px; padding: 4px 8px; }}'
+            f'QListWidget {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; border-radius: 4px; }}'
+            f'QListWidget::item:selected {{ background: {C.BG_HOVER}; }}'
+            f'QCheckBox {{ color: {C.TEXT_PRIMARY}; border: 1px solid {C.CHECK_ACCENT}; }}'
+            f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 14px; }}'
+            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+            f'QDialogButtonBox {{ background: transparent; }}'
+        )
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self._field = field
@@ -141,7 +172,7 @@ class _MissingKeysBanner(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         label = QLabel('API keys missing. Please configure them in Settings to pull media data.')
-        label.setStyleSheet(f'font-size: 14px; color: #FF6B35; background: transparent;')
+        label.setStyleSheet(f'font-size: 14px; color: {C.DANGER}; background: transparent;')
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label)
         btn = QPushButton('Open Settings')
@@ -155,7 +186,18 @@ class _AddCreatorDialog(QDialog):
         self._db = db
         self.setWindowTitle('Add Media Member')
         self.setMinimumWidth(380)
-        self.setStyleSheet('QDialog { background: #09090C; }QLabel { color: #E0E0E0; background: transparent; }QLineEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 4px 8px; }QLineEdit::placeholder { color: rgba(224,224,224,0.4); }QComboBox { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 4px 8px; }QComboBox QAbstractItemView { background: #1C1C22; color: #E0E0E0; border: 1px solid #3A3A3A; selection-background-color: #2A2A33; }QListWidget { background: #222222; color: #E0E0E0; border: 1px solid #3A5A8C; }QPushButton { background: #1C1C22; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #2A2A33; }QDialogButtonBox { background: transparent; }')
+        self.setStyleSheet(
+            f'QDialog {{ background: {C.BG_DEEP}; }}'
+            f'QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
+            f'QLineEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; border-radius: 4px; padding: 4px 8px; }}'
+            f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}'
+            f'QComboBox {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; border-radius: 4px; padding: 4px 8px; }}'
+            f'QComboBox QAbstractItemView {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; selection-background-color: {C.BG_HOVER}; }}'
+            f'QListWidget {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.CHECK_ACCENT}; }}'
+            f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 14px; }}'
+            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+            f'QDialogButtonBox {{ background: transparent; }}'
+        )
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self._nick = QLineEdit()
@@ -168,7 +210,7 @@ class _AddCreatorDialog(QDialog):
         plat_layout.setSpacing(2)
         plat_layout.addWidget(self._youtube_check)
         plat_layout.addWidget(self._twitch_check)
-        plat_container.setStyleSheet('QWidget { background: #222222; border: 1px solid #3A3A3A; border-radius: 4px; }QCheckBox { outline: none; }QCheckBox::focus { outline: none; }')
+        plat_container.setStyleSheet(f'QWidget {{ background: {C.INPUT_BG}; border: 1px solid {C.INPUT_BORDER}; border-radius: 4px; }}QCheckBox {{ outline: none; }}QCheckBox::focus {{ outline: none; }}')
         form.addRow('Platforms:', plat_container)
         self._youtube_link = QLineEdit()
         self._youtube_link.setPlaceholderText('https://www.youtube.com/channel/...')
@@ -266,6 +308,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._refresh_relative_times)
         self._timer.start(60000)
         self._refresh_cards()
+        theme_manager.theme_changed.connect(self._on_theme_changed)
     def _build_ui(self) -> None:
         central = QWidget()
         central.setObjectName('centralWidget')
@@ -344,14 +387,13 @@ class MainWindow(QMainWindow):
         self._refresh_profile_combo()
         self._profile_combo.currentIndexChanged.connect(self._on_profile_switch)
         top_row2.addWidget(self._profile_combo)
-        top_vbox = QVBoxLayout()
+        top_container = QWidget()
+        self._top_container = top_container
+        top_vbox = QVBoxLayout(top_container)
         top_vbox.setContentsMargins(0, 0, 0, 0)
         top_vbox.setSpacing(0)
         top_vbox.addLayout(top_row1)
         top_vbox.addLayout(top_row2)
-        top_container = QWidget()
-        top_container.setStyleSheet('background: rgba(0,0,0,0.35);')
-        top_container.setLayout(top_vbox)
         vbox.addWidget(top_container)
         # Progress bar area for auto-verify (hidden by default)
         self._verify_progress_area = QWidget()
@@ -374,7 +416,8 @@ class MainWindow(QMainWindow):
         vbox.addWidget(self._verify_progress_area)
         sep = QWidget()
         sep.setFixedHeight(1)
-        sep.setStyleSheet(f'background: #3A3A3A;')
+        sep.setStyleSheet(f'background: {C.BORDER};')
+        self._separator = sep
         vbox.addWidget(sep)
         self._stack = QVBoxLayout()
         self._stack.setContentsMargins(16, 12, 16, 12)
@@ -394,7 +437,40 @@ class MainWindow(QMainWindow):
         self._card_layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
         self._scroll.setWidget(self._card_container)
         self._stack.addWidget(self._scroll, 1)
+        # Empty state widget (shown when no creators exist)
+        self._empty_state = QWidget()
+        empty_layout = QVBoxLayout(self._empty_state)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.setSpacing(12)
+        empty_icon = QLabel('🎬')
+        empty_icon.setStyleSheet(f'font-size: 48px; background: transparent;')
+        empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(empty_icon)
+        self._empty_title = QLabel('No media members yet')
+        self._empty_title.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self._empty_title)
+        self._empty_desc = QLabel('Add your first media member to get started.')
+        self._empty_desc.setStyleSheet(f'font-size: 13px; color: {C.TEXT_SECONDARY}; background: transparent;')
+        self._empty_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self._empty_desc)
+        self._empty_btn = QPushButton('+ Add Media Member')
+        self._empty_btn.setFixedWidth(200)
+        self._empty_btn.setStyleSheet(f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 6px; padding: 10px 20px; font-size: 14px; font-weight: bold;')
+        self._empty_btn.clicked.connect(self._on_add_creator)
+        empty_btn_layout = QHBoxLayout()
+        empty_btn_layout.addStretch(1)
+        empty_btn_layout.addWidget(self._empty_btn)
+        empty_btn_layout.addStretch(1)
+        empty_layout.addLayout(empty_btn_layout)
+        empty_layout.addStretch(1)
+        self._empty_state.setStyleSheet('background: transparent;')
+        self._empty_state.setVisible(False)
+        self._stack.addWidget(self._empty_state)
         vbox.addLayout(self._stack, 1)
+        # Apply initial inline styles (also called on theme change)
+        self._apply_inline_styles()
+
     def _on_central_resize(self, event) -> None:
         """Keep the gradient canvas covering the entire central widget."""
         self._bg_canvas.resize(self.centralWidget().size())
@@ -402,9 +478,33 @@ class MainWindow(QMainWindow):
     def apply_main_window_qss(self) -> None:
         """Apply MainWindow-specific QSS overrides using design-system tokens.\n\nSupplements the global stylesheet (build_global_qss) applied in\nmain.py.  Only MainWindow-specific selectors are set here; common\nwidget styles are inherited from the application stylesheet.\n"""
         self.setStyleSheet(
-            f'QMainWindow {{ background: #0F0F14; }}\n'
+            f'QMainWindow {{ background: {C.BG_BASE}; }}\n'
             f'QCheckBox::indicator:checked {{ image: none; }}\n'
         )
+
+    def _on_theme_changed(self) -> None:
+        """React to a theme switch: refresh gradient, stylesheets, and cards."""
+        self._bg_canvas.refresh_colors()
+        self.apply_main_window_qss()
+        self._apply_inline_styles()
+        self._refresh_cards()
+        refresh_all_styles()
+
+    def _apply_inline_styles(self) -> None:
+        """Re-apply inline QSS that uses C.* tokens (called on theme change)."""
+        # Top container: semi-transparent BG_BASE overlay so gradient breathes through
+        _hex = C.BG_BASE.lstrip('#')
+        _r, _g, _b = int(_hex[0:2], 16), int(_hex[2:4], 16), int(_hex[4:6], 16)
+        self._top_container.setStyleSheet(f'background: rgba({_r},{_g},{_b},0.88);')
+        # Separator
+        self._separator.setStyleSheet(f'background: {C.BORDER};')
+        # Status labels
+        self._fetch_status.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+        self._verify_progress_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; background: transparent;')
+        # Empty state
+        self._empty_title.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._empty_desc.setStyleSheet(f'font-size: 13px; color: {C.TEXT_SECONDARY}; background: transparent;')
+        self._empty_btn.setStyleSheet(f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 6px; padding: 10px 20px; font-size: 14px; font-weight: bold;')
     _CARD_BATCH_SIZE = 20
 
     def _refresh_cards(self) -> None:
@@ -431,19 +531,32 @@ class MainWindow(QMainWindow):
         sub_counts = self._sub_counts
         creators = self._db.get_creators()
         roles = {r['id']: r for r in self._db.get_roles()}
+        roles_list = list(roles.values())
+        # Activity sparkline data
+        activity = self._db.bulk_activity_sparkline()
+
+        # Show/hide empty state
+        if not creators:
+            self._scroll.setVisible(False)
+            self._empty_state.setVisible(True)
+            return
+        self._scroll.setVisible(True)
+        self._empty_state.setVisible(False)
+
         for c in creators:
             role = roles.get(c.get('role_id'))
             last_act = last_activity.get(c['id'], '')
             has_new_activity = c['id'] in new_activity_ids
             counts = sub_counts.get(c['id'], {})
             sub_text = format_subscriber_count(counts.get('youtube', 0), counts.get('twitch', 0))
-            self._pending_card_data.append((c, role, last_act, has_new_activity, sub_text))
+            spark = activity.get(c['id'], [])
+            self._pending_card_data.append((c, role, last_act, has_new_activity, sub_text, roles_list, spark))
         # Create first batch immediately
         first_batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
         self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
         first_cards = []
-        for c, role, last_act, has_new, sub_text in first_batch:
-            card = CreatorCard(c, role, last_act, has_new, sub_text)
+        for c, role, last_act, has_new, sub_text, rlist, spark in first_batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark)
             self._connect_card_signals(card)
             self._cards[c['id']] = card
             self._card_layout.addWidget(card)
@@ -466,6 +579,8 @@ class MainWindow(QMainWindow):
         card.export_creator_requested.connect(self._on_export_creator)
         card.delete_requested.connect(self._on_delete_creator)
         card.edit_notes_requested.connect(self._on_edit_notes)
+        card.role_change_requested.connect(self._on_role_change)
+        card.tags_changed.connect(lambda _: self._refresh_cards())
 
     def _create_next_batch(self) -> None:
         """Create the next batch of creator cards (lazy loading)."""
@@ -474,8 +589,8 @@ class MainWindow(QMainWindow):
         batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
         self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
         new_cards = []
-        for c, role, last_act, has_new, sub_text in batch:
-            card = CreatorCard(c, role, last_act, has_new, sub_text)
+        for c, role, last_act, has_new, sub_text, rlist, spark in batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark)
             self._connect_card_signals(card)
             self._cards[c['id']] = card
             self._card_layout.addWidget(card)
@@ -543,9 +658,17 @@ class MainWindow(QMainWindow):
         for cid, card in self._cards.items():
             role_match = (self._active_filter_role_id is None
                           or card.role_id == self._active_filter_role_id)
-            search_match = (not self._search_text
-                            or self._search_text in card.creator.get('nickname', '').lower())
-            card.setVisible(role_match and search_match)
+            # Search matches nickname or tags
+            nickname_match = (not self._search_text
+                              or self._search_text in card.creator.get('nickname', '').lower())
+            tags_str = ' '.join(
+                json.loads(card.creator.get('tags', '[]'))
+                if isinstance(card.creator.get('tags', '[]'), str)
+                else card.creator.get('tags', [])
+            ).lower()
+            tag_match = (not self._search_text
+                         or self._search_text in tags_str)
+            card.setVisible(role_match and (nickname_match or tag_match))
     def _refresh_profile_combo(self) -> None:
         """Repopulate the profile dropdown without triggering a switch."""
         self._profile_combo.blockSignals(True)
@@ -591,6 +714,10 @@ class MainWindow(QMainWindow):
         self._fetch_status.setVisible(False)
         if profile and profile != self._db.profile:
             self._db.switch_profile(profile)
+            # Re-apply theme for the new profile (each profile may have its own theme)
+            saved_theme = self._db.get_setting('theme') or 'default'
+            if saved_theme != theme_manager.current:
+                theme_manager.apply(saved_theme)
             self._refresh_cards()
             self._refresh_profile_combo()
 
@@ -708,13 +835,13 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle(f'Edit Notes — {creator.get("nickname", "Unknown")}')
         dlg.setMinimumWidth(400)
         dlg.setMinimumHeight(250)
-        dlg.setStyleSheet('QDialog { background: #09090C; }')
+        dlg.setStyleSheet(f'QDialog {{ background: {C.BG_DEEP}; }}')
         layout = QVBoxLayout(dlg)
         notes_edit = QTextEdit()
         notes_edit.setPlainText(creator.get('notes', '') or '')
         notes_edit.setStyleSheet(
-            'QTextEdit { background: #222222; color: #E0E0E0; border: 1px solid #3A3A3A; '
-            'border-radius: 4px; padding: 4px; }')
+            f'QTextEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
+            f'border-radius: 4px; padding: 4px; }}')
         layout.addWidget(notes_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
@@ -733,6 +860,11 @@ class MainWindow(QMainWindow):
         """Focus the search bar and select all text (Ctrl+F shortcut)."""
         self._search_edit.setFocus()
         self._search_edit.selectAll()
+
+    def _on_role_change(self, creator_id: int, role_id: int) -> None:
+        """Handle role change from creator card context menu."""
+        self._db.update_creator(creator_id, role_id=role_id)
+        self._refresh_cards()
 
     def _on_sort_changed(self, index: int) -> None:
         """Reorder cards by the selected sort key."""
@@ -937,7 +1069,7 @@ class MainWindow(QMainWindow):
 
         Always refreshes cards (partial data may have been fetched even if
         some per-creator errors occurred).  Also refreshes the media history
-        dialog if one is open.
+        dialog if one is open, and check for notification milestones.
         """
         # Clean up any deferred profile switch connection.
         if self._fetch_worker is not None:
@@ -950,6 +1082,7 @@ class MainWindow(QMainWindow):
         self._restore_refresh_button()
         if self._data_fetched:
             self._refresh_cards()
+            self._check_milestones()
         if self._active_history is not None:
             try:
                 self._active_history.refresh_completed()
@@ -957,6 +1090,52 @@ class MainWindow(QMainWindow):
                 pass
         self._data_fetched = False
         self._cleanup_fetch_worker()
+
+    def _check_milestones(self) -> None:
+        """Check for subscriber and view milestones after a fetch."""
+        sub_counts = self._db.bulk_subscriber_counts()
+        creators = self._db.get_creators()
+        pending_alerts = []
+        for c in creators:
+            cid = c['id']
+            counts = sub_counts.get(cid, {})
+            yt_subs = counts.get('youtube', 0)
+            tw_follows = counts.get('twitch', 0)
+            max_subs = max(yt_subs, tw_follows)
+            if max_subs > 0:
+                pending_alerts.extend(self._db.check_subscriber_milestones(cid, max_subs))
+            # Check per-creator total views
+            media = self._db.get_media(creator_id=cid)
+            total_views = sum(m.get('view_count', 0) for m in media)
+            if total_views > 0:
+                pending_alerts.extend(self._db.check_view_thresholds(cid, total_views))
+        for alert in pending_alerts:
+            creator = self._db.get_creator(alert['creator_id'])
+            name = creator.get('nickname', 'Unknown') if creator else 'Unknown'
+            if alert['type'] == 'subscriber_milestone':
+                threshold = alert['threshold']
+                if threshold >= 1_000_000:
+                    label = f'{threshold // 1_000_000}M'
+                elif threshold >= 1_000:
+                    label = f'{threshold // 1_000}K'
+                else:
+                    label = str(threshold)
+                msg = f'{name} reached {label} subscribers!'
+            else:
+                threshold = alert['threshold']
+                if threshold >= 1_000_000:
+                    label = f'{threshold // 1_000_000}M'
+                elif threshold >= 1_000:
+                    label = f'{threshold // 1_000}K'
+                else:
+                    label = str(threshold)
+                msg = f'{name} passed {label} total views!'
+            self._show_notification('🎉 Milestone!', msg)
+
+    def _show_notification(self, title: str, message: str) -> None:
+        """Show a toast notification in the top-right corner."""
+        toast = NotificationToast(title, message, self)
+        toast.show()
     def _on_fetch_error(self, msg: str) -> None:
         """Handle a per-creator fetch error.
 
@@ -1041,12 +1220,45 @@ class MainWindow(QMainWindow):
                     with open(path, 'r', encoding='utf-8') as f:
                         data = _json.load(f)
                     if data.get('type') == 'creator':
-                        new_id = self._db.import_creator(data)
-                        self._refresh_cards()
-                        from ui.dialog_utils import dark_info
-                        creator = self._db.get_creator(new_id)
-                        name = creator.get('nickname', 'Creator') if creator else 'Creator'
-                        dark_info(self, 'Imported', f'"{name}" imported successfully.')
+                        # Check for duplicate by link before importing
+                        c_data = data.get('creator', {})
+                        existing_id = self._db.find_creator_by_link(
+                            youtube_link=c_data.get('youtube_link'),
+                            twitch_link=c_data.get('twitch_link'),
+                        )
+                        if existing_id is not None:
+                            existing = self._db.get_creator(existing_id)
+                            existing_name = existing.get('nickname', 'Unknown') if existing else 'Unknown'
+                            from ui.dialog_utils import dark_question
+                            result = dark_question(
+                                self, 'Duplicate Creator',
+                                f'A creator named "{existing_name}" already has the same '
+                                f'YouTube/Twitch link.\n\nMerge media into the existing creator?',
+                            )
+                            if result == QMessageBox.StandardButton.Yes:
+                                # Merge: add media to existing creator
+                                for m in data.get('media_content', []):
+                                    self._db.upsert_media(
+                                        existing_id, m['platform'], m['content_id'],
+                                        title=m.get('title', ''),
+                                        thumbnail_path=m.get('thumbnail_path', ''),
+                                        thumbnail_url=m.get('thumbnail_url', ''),
+                                        upload_date=m.get('upload_date', ''),
+                                        view_count=m.get('view_count', 0),
+                                        is_short=bool(m.get('is_short', 0)),
+                                        description=m.get('description', ''),
+                                    )
+                                self._refresh_cards()
+                                dark_info(self, 'Merged', f'Media merged into "{existing_name}".')
+                            else:
+                                dark_info(self, 'Skipped', 'Import cancelled.')
+                        else:
+                            new_id = self._db.import_creator(data)
+                            self._refresh_cards()
+                            from ui.dialog_utils import dark_info
+                            creator = self._db.get_creator(new_id)
+                            name = creator.get('nickname', 'Creator') if creator else 'Creator'
+                            dark_info(self, 'Imported', f'"{name}" imported successfully.')
                         event.acceptProposedAction()
                         return
                     elif data.get('version') == 1 and 'creators' in data:
