@@ -1,12 +1,18 @@
 """Interactive chart utilities for Kleos.
 
 Provides ``_ZoomableFigureCanvas``, a mixin that adds scroll-to-zoom,
-click-drag-pan, and double-click-reset to any ``FigureCanvas`` subclass.
+click-drag-pan, double-click-reset, and a hover tooltip + crosshair to any
+``FigureCanvas`` subclass.
 """
 from __future__ import annotations
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.dates import date2num, num2date
+from PyQt6 import sip
 from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtWidgets import QLabel
+
+from ui.theme.tokens import C
 
 
 # Scale factor applied per scroll-step: 1.15 means each tick zooms ~15 %.
@@ -39,7 +45,9 @@ class _ZoomableFigureCanvas:
         """Snapshot the current axis limits as the "home" view.
 
         Call this at the end of ``_render()`` **after** ``draw()`` so the
-        mixin always has the correct baseline to reset to.
+        mixin always has the correct baseline to reset to.  Also drops any
+        crosshair/tooltip overlay state — ``_render()`` clears the figure, so
+        the crosshair artists are gone and must be recreated on the next hover.
         """
         ax = self._primary_axes()
         if ax is not None:
@@ -48,6 +56,113 @@ class _ZoomableFigureCanvas:
         else:
             self._home_xlim = None
             self._home_ylim = None
+        # ``_render()`` did fig.clear(); the crosshair artists are destroyed.
+        self._cross_v = None
+        self._cross_h = None
+        self._hide_overlay()
+
+    # -- hover overlay (tooltip + crosshair) ----------------------------------
+
+    def _ensure_tooltip(self) -> QLabel | None:
+        """Lazily create the hover-tooltip label (a transparent-for-mouse child)."""
+        tip = getattr(self, '_tooltip', None)
+        if tip is not None and not sip.isdeleted(tip):
+            return tip
+        lbl = QLabel('', self)
+        lbl.setObjectName('chartTooltip')
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        lbl.hide()
+        self._tooltip = lbl
+        return lbl
+
+    def _hide_overlay(self) -> None:
+        """Hide the tooltip label and the crosshair artists (if any)."""
+        tip = getattr(self, '_tooltip', None)
+        if tip is not None and not sip.isdeleted(tip):
+            tip.hide()
+        for art in (getattr(self, '_cross_v', None), getattr(self, '_cross_h', None)):
+            if art is not None and getattr(art, 'axes', None) is not None:
+                art.set_visible(False)
+
+    def _ensure_crosshair(self, ax) -> None:
+        """Create the two crosshair artists on *ax* if they are missing."""
+        if self._cross_v is None or getattr(self._cross_v, 'axes', None) is None:
+            self._cross_v = ax.axvline(ax.get_xlim()[0], visible=False,
+                                       color=C.TEXT_MUTED, linewidth=0.6,
+                                       linestyle=(0, (3, 3)), zorder=5)
+        if self._cross_h is None or getattr(self._cross_h, 'axes', None) is None:
+            self._cross_h = ax.axhline(ax.get_ylim()[0], visible=False,
+                                       color=C.TEXT_MUTED, linewidth=0.6,
+                                       linestyle=(0, (3, 3)), zorder=5)
+
+    def _nearest_point(self, xnum: float, ynum: float):
+        """Return ``(date, views, label)`` for the plotted point nearest the
+        cursor, or ``None`` when no series data is registered."""
+        series = getattr(self, '_series_data', None) or []
+        best = None
+        best_dx = None
+        for s in series:
+            xs = s.get('xnum')
+            if xs is None or len(xs) == 0:
+                continue
+            # Linear scan; series are small (one creator's uploads / a handful
+            # of creators).  Track the nearest by x-distance only so the tooltip
+            # snaps along the time axis regardless of y zoom.
+            for i, px in enumerate(xs):
+                dx = abs(px - xnum)
+                if best_dx is None or dx < best_dx:
+                    best_dx = dx
+                    best = (s['dates'][i], s['views'][i], s.get('label', ''))
+        return best
+
+    def _show_overlay_at(self, qt_pos: QPoint) -> None:
+        """Show the crosshair + tooltip for the cursor at *qt_pos* (widget coords)."""
+        ax = self._axes_at(qt_pos)
+        if ax is None:
+            self._hide_overlay()
+            return
+        dpi_ratio = self.devicePixelRatioF()
+        mx = qt_pos.x() * dpi_ratio
+        my = (self.height() - qt_pos.y()) * dpi_ratio
+        data = ax.transData.inverted().transform((mx, my))
+        xnum, ynum = float(data[0]), float(data[1])
+
+        self._ensure_crosshair(ax)
+        self._cross_v.set_xdata([xnum, xnum])
+        self._cross_h.set_ydata([ynum, ynum])
+        self._cross_v.set_visible(True)
+        self._cross_h.set_visible(True)
+
+        tip = self._ensure_tooltip()
+        nearest = self._nearest_point(xnum, ynum)
+        if nearest is not None:
+            date, views, label = nearest
+            lines = []
+            if label:
+                lines.append(label)
+            try:
+                lines.append(num2date(xnum).strftime('%Y-%m-%d'))
+            except Exception:
+                lines.append(str(date))
+            lines.append(f'{views:,} views')
+            tip.setText('\n'.join(lines))
+        else:
+            # No registered series (e.g. a bar chart): show raw coordinates.
+            try:
+                tip.setText(num2date(xnum).strftime('%Y-%m-%d'))
+            except Exception:
+                tip.setText('')
+        tip.adjustSize()
+        # Position the tooltip near the cursor, clamped to the canvas.
+        tx = qt_pos.x() + 14
+        ty = qt_pos.y() + 14
+        tx = min(tx, max(0, self.width() - tip.width()))
+        ty = min(ty, max(0, self.height() - tip.height()))
+        tip.move(tx, ty)
+        tip.show()
+        tip.raise_()
+        self.draw_idle()
+
 
     def _reset_to_home(self) -> None:
         """Restore the saved home limits and redraw."""
@@ -56,6 +171,7 @@ class _ZoomableFigureCanvas:
             return
         ax.set_xlim(self._home_xlim)
         ax.set_ylim(self._home_ylim)
+        self._hide_overlay()
         self.draw()
 
     # -- helpers --------------------------------------------------------------
@@ -135,12 +251,13 @@ class _ZoomableFigureCanvas:
                 self._pan_start = event.position().toPoint() if hasattr(event, 'position') else event.pos()
                 self._pan_xlim = ax.get_xlim()
                 self._pan_ylim = ax.get_ylim()
+                self._hide_overlay()
                 event.accept()
                 return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        """Pan the chart as the user drags."""
+        """Pan the chart as the user drags, or show the hover overlay when idle."""
         if getattr(self, '_pan_active', False):
             ax = self._primary_axes()
             if ax is None:
@@ -168,7 +285,15 @@ class _ZoomableFigureCanvas:
             self.draw()
             event.accept()
             return
+        # Not panning → update the hover tooltip + crosshair.
+        qt = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+        self._show_overlay_at(qt)
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        """Hide the overlay when the cursor leaves the canvas."""
+        self._hide_overlay()
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         """End the pan."""

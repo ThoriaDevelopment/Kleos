@@ -99,21 +99,16 @@ def generate_report(db: DatabaseManager, period: str = 'monthly', role_id: int |
         lines.append(f'Period: All Time')
     lines.append(f'Filter: {content_label}')
 
-    # Per-creator stats within the period
+    # Per-creator stats within the period (one grouped query instead of N+1)
+    date_clause = f"AND upload_date >= '{since_str}'" if since_str else ''
+    media_stats = db.bulk_media_stats(content_clause, date_clause)
     total_views = 0
     total_uploads = 0
     creator_stats: list[dict[str, Any]] = []
 
     for c in creators:
         cid = c['id']
-        date_clause = f"AND upload_date >= '{since_str}'" if since_str else ''
-        rows = db._read(
-            f"SELECT COALESCE(SUM(view_count), 0) AS views, COUNT(*) AS count "
-            f"FROM media_content WHERE creator_id = ? {content_clause} {date_clause}",
-            (cid,),
-        )
-        views = rows[0]['views'] if rows else 0
-        count = rows[0]['count'] if rows else 0
+        views, count = media_stats.get(cid, (0, 0))
         total_views += views
         total_uploads += count
 

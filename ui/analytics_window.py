@@ -1,67 +1,21 @@
 from __future__ import annotations
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.dates import date2num
 from matplotlib.figure import Figure
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager
 from ui.app_icon import create_app_icon
+from ui.chart_common import apply_style, build_conditions, chart_title, series_colors, smooth_mpl_patch
 from ui.chart_utils import _ZoomableFigureCanvas
 from ui.dialog_utils import enable_window_maximize, handle_fullscreen_keypress
+from ui.geometry import restore_geometry, save_geometry
 from ui.theme.stylesheet import build_dialog_qss
 from ui.theme.tokens import C
-
-
-def _mpl_style() -> dict:
-    """Return matplotlib style dict using current theme tokens."""
-    return {
-        'figure.facecolor': C.DIALOG_BG, 'axes.facecolor': C.INPUT_BG,
-        'axes.edgecolor': C.BORDER, 'axes.labelcolor': C.TEXT_PRIMARY,
-        'xtick.color': C.TEXT_SECONDARY, 'ytick.color': C.TEXT_SECONDARY,
-        'text.color': C.TEXT_PRIMARY, 'grid.color': C.BORDER,
-        'grid.alpha': 0.5, 'lines.color': C.ACCENT,
-    }
-
-
-def _apply_style(fig: Figure) -> None:
-    s = _mpl_style()
-    fig.patch.set_facecolor(s['figure.facecolor'])
-    fig.patch.set_edgecolor(s['figure.facecolor'])
-    fig.patch.set_linewidth(0)
-    for ax in fig.axes:
-        ax.set_facecolor(s['axes.facecolor'])
-        ax.tick_params(colors=s['xtick.color'])
-        ax.xaxis.label.set_color(s['axes.labelcolor'])
-        ax.yaxis.label.set_color(s['axes.labelcolor'])
-        ax.title.set_color(s['text.color'])
-        for spine in ax.spines.values():
-            spine.set_color(s['axes.edgecolor'])
-        ax.grid(True, color=s['grid.color'], alpha=s['grid.alpha'])
-
-
-def _chart_title(verified_only: bool, content_type: str | None, base: str) -> str:
-    """Build a chart title from filter state.
-
-    Examples:
-        verified_only=False, content_type=None → "All Content — View Trajectory"
-        verified_only=True,  content_type=None → "Verified Content — View Trajectory"
-        verified_only=False, content_type='short'  → "All Shorts — View Trajectory"
-        verified_only=True,  content_type='short'  → "Verified Shorts — View Trajectory"
-    """
-    type_labels: dict[str | None, str] = {
-        None:      'Content',
-        'short':   'Shorts',
-        'video':   'Videos',
-        'stream':  'Streams',
-    }
-    type_part = type_labels.get(content_type, 'Content')
-    if content_type is None:
-        prefix = 'Verified' if verified_only else 'All'
-    else:
-        prefix = 'Verified' if verified_only else 'All'
-    return f'{prefix} {type_part} — {base}'
 
 
 class _TimelineChart(_ZoomableFigureCanvas, FigureCanvas):
@@ -111,39 +65,15 @@ class _TimelineChart(_ZoomableFigureCanvas, FigureCanvas):
 
         table_prefix: 'm.' for timeline (joins), '' for bar chart (single table).
         """
-        p = table_prefix
-        conditions: list[str] = [f'{p}upload_date != \'\'']
-        params: list[Any] = []
-        if self._verified_only:
-            conditions.append(f'{p}is_verified = 1')
-        ct = self._content_type
-        if ct == 'short':
-            conditions.append(f'{p}is_short = 1')
-        elif ct == 'video':
-            conditions.append(f'{p}is_short = 0')
-            conditions.append(f'{p}is_stream = 0')
-        elif ct == 'stream':
-            conditions.append(f'{p}is_stream = 1')
-        if self._time_range:
-            now = datetime.now(timezone.utc)
-            if self._time_range == 'week':
-                since = now - timedelta(weeks=1)
-            elif self._time_range == 'month':
-                since = now - timedelta(days=30)
-            elif self._time_range == 'year':
-                since = now - timedelta(days=365)
-            else:
-                since = None
-            if since:
-                conditions.append(f'{p}upload_date >= ?')
-                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
-        if self._platform:
-            conditions.append(f'{p}platform = ?')
-            params.append(self._platform)
-        return conditions, params
+        return build_conditions(
+            verified_only=self._verified_only, content_type=self._content_type,
+            time_range=self._time_range, platform=self._platform,
+            table_prefix=table_prefix,
+        )
 
     def _render(self) -> None:
         self._fig.clear()
+        self._series_data = []
         ax = self._fig.add_subplot(111)
         conditions, params = self._build_conditions(table_prefix='m.')
         conditions.append('m.creator_id = c.id')
@@ -155,16 +85,16 @@ class _TimelineChart(_ZoomableFigureCanvas, FigureCanvas):
             tuple(params),
         )
         if not rows:
-            label = _chart_title(self._verified_only, self._content_type, 'View Trajectory')
+            label = chart_title(self._verified_only, self._content_type, 'View Trajectory')
             ax.text(0.5, 0.5, f'No data for: {label}', ha='center', va='center', fontsize=11, color='#888')
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self.draw()
             self._save_home_limits()
         else:
             by_creator = defaultdict(list)
             for r in rows:
                 by_creator[r['nickname']].append((r['upload_date'], r['view_count']))
-            colors = [C.ACCENT, '#9B59B6', '#2ECC71', '#E74C3C', '#F39C12', '#1ABC9C', '#E67E22', '#3498DB']
+            colors = series_colors()
             for i, (nick, points) in enumerate(by_creator.items()):
                 dates = []
                 views = []
@@ -176,12 +106,21 @@ class _TimelineChart(_ZoomableFigureCanvas, FigureCanvas):
                     except (ValueError, TypeError):
                         pass
                 if dates:
-                    ax.plot(dates, views, marker='o', markersize=4, label=nick, color=colors[i % len(colors)], linewidth=1.5)
+                    color = colors[i % len(colors)]
+                    patch = smooth_mpl_patch(date2num(dates), views, color,
+                                            floor=0.0, linewidth=1.5, label=nick, zorder=3)
+                    if patch is not None:
+                        ax.add_patch(patch)
+                    ax.scatter(dates, views, marker='o', s=16, color=color, zorder=4)
+                    self._series_data.append({
+                        'xnum': date2num(dates), 'dates': dates,
+                        'views': views, 'label': nick,
+                    })
             ax.set_xlabel('Date')
             ax.set_ylabel('Views')
-            ax.set_title(_chart_title(self._verified_only, self._content_type, 'View Trajectory'))
+            ax.set_title(chart_title(self._verified_only, self._content_type, 'View Trajectory'))
             ax.legend(fontsize=8, facecolor=C.INPUT_BG, edgecolor=C.BORDER, labelcolor=C.TEXT_PRIMARY)
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self._fig.autofmt_xdate()
             self.draw()
             self._save_home_limits()
@@ -231,35 +170,10 @@ class _MonthlyBarChart(_ZoomableFigureCanvas, FigureCanvas):
 
     def _build_conditions(self) -> tuple[list[str], list[Any]]:
         """Return (conditions_list, params) for the current filters."""
-        conditions: list[str] = ["upload_date != ''"]
-        params: list[Any] = []
-        if self._verified_only:
-            conditions.append('is_verified = 1')
-        ct = self._content_type
-        if ct == 'short':
-            conditions.append('is_short = 1')
-        elif ct == 'video':
-            conditions.append('is_short = 0')
-            conditions.append('is_stream = 0')
-        elif ct == 'stream':
-            conditions.append('is_stream = 1')
-        if self._time_range:
-            now = datetime.now(timezone.utc)
-            if self._time_range == 'week':
-                since = now - timedelta(weeks=1)
-            elif self._time_range == 'month':
-                since = now - timedelta(days=30)
-            elif self._time_range == 'year':
-                since = now - timedelta(days=365)
-            else:
-                since = None
-            if since:
-                conditions.append('upload_date >= ?')
-                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
-        if self._platform:
-            conditions.append('platform = ?')
-            params.append(self._platform)
-        return conditions, params
+        return build_conditions(
+            verified_only=self._verified_only, content_type=self._content_type,
+            time_range=self._time_range, platform=self._platform, table_prefix='',
+        )
 
     def _render(self) -> None:
         self._fig.clear()
@@ -271,9 +185,9 @@ class _MonthlyBarChart(_ZoomableFigureCanvas, FigureCanvas):
             tuple(params),
         )
         if not rows:
-            label = _chart_title(self._verified_only, self._content_type, 'Upload Activity')
+            label = chart_title(self._verified_only, self._content_type, 'Upload Activity')
             ax.text(0.5, 0.5, f'No data for: {label}', ha='center', va='center', fontsize=11, color='#888')
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self.draw()
             self._save_home_limits()
         else:
@@ -299,8 +213,8 @@ class _MonthlyBarChart(_ZoomableFigureCanvas, FigureCanvas):
             ax.set_xticks(range(len(months)))
             ax.set_xticklabels(labels, rotation=45, fontsize=8)
             ax.set_ylabel('Uploads')
-            ax.set_title(_chart_title(self._verified_only, self._content_type, 'Upload Activity'))
-            _apply_style(self._fig)
+            ax.set_title(chart_title(self._verified_only, self._content_type, 'Upload Activity'))
+            apply_style(self._fig)
             self._fig.tight_layout()
             self.draw()
             self._save_home_limits()
@@ -320,8 +234,19 @@ class AnalyticsWindow(QDialog):
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(860, 580)
         self.resize(960, 680)
-        self.setStyleSheet(build_dialog_qss())
+        self.reapply_theme()
+        restore_geometry(self, 'AnalyticsWindow', self._db)
+        self.finished.connect(lambda _r: save_geometry(self, 'AnalyticsWindow', self._db))
         self._build_ui()
+
+    def reapply_theme(self) -> None:
+        """Rebuild the dialog stylesheet and recolor charts from live tokens."""
+        self.setStyleSheet(build_dialog_qss())
+        # Charts read C.* inside _render(); re-render so axis/face/series colors
+        # follow a theme switch without reopening the dialog.
+        for chart in (getattr(self, '_timeline', None), getattr(self, '_bar_chart', None)):
+            if chart is not None and not sip.isdeleted(chart):
+                chart._render()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if handle_fullscreen_keypress(self, event):

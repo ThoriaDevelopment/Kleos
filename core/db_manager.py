@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from .paths import BACKUPS_DIR, GLOBAL_SETTINGS_PATH, STORAGE_DIR
@@ -59,7 +59,7 @@ def _write_global_settings(settings: dict[str, str]) -> None:
             pass
         raise
 _SCHEMA = '\nCREATE TABLE IF NOT EXISTS settings (\n    key     TEXT PRIMARY KEY,\n    value   TEXT NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS roles (\n    id          INTEGER PRIMARY KEY AUTOINCREMENT,\n    role_name   TEXT    NOT NULL UNIQUE,\n    role_color  TEXT    NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS creators (\n    id            INTEGER PRIMARY KEY AUTOINCREMENT,\n    nickname      TEXT    NOT NULL,\n    platforms     TEXT    NOT NULL DEFAULT \'[]\',\n    role_id       INTEGER NOT NULL,\n    youtube_type  TEXT,\n    youtube_channel_id TEXT,\n    youtube_link  TEXT,\n    twitch_link   TEXT,\n    pfp_url       TEXT,\n    date_added       TEXT    NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')),\n    is_new_activity  INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE RESTRICT\n);\n\nCREATE TABLE IF NOT EXISTS media_content (\n    id              INTEGER PRIMARY KEY AUTOINCREMENT,\n    creator_id      INTEGER NOT NULL,\n    platform        TEXT    NOT NULL CHECK(platform IN (\'youtube\', \'twitch\')),\n    content_id      TEXT    NOT NULL UNIQUE,\n    title           TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_path  TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_url   TEXT    NOT NULL DEFAULT \'\',\n    upload_date     TEXT    NOT NULL DEFAULT \'\',\n    view_count      INTEGER NOT NULL DEFAULT 0,\n    is_verified     INTEGER NOT NULL DEFAULT 0,\n    is_short        INTEGER NOT NULL DEFAULT 0,\n    is_stream       INTEGER NOT NULL DEFAULT 0,\n    type_override   TEXT    DEFAULT NULL,\n    description     TEXT    NOT NULL DEFAULT \'\',\n    FOREIGN KEY (creator_id) REFERENCES creators(id) ON DELETE CASCADE\n);\n\nCREATE INDEX IF NOT EXISTS idx_media_creator  ON media_content(creator_id);\nCREATE INDEX IF NOT EXISTS idx_media_platform  ON media_content(platform);\nCREATE INDEX IF NOT EXISTS idx_content_id      ON media_content(content_id);\n'
-_SCHEMA_VERSION = 6  # Increment when adding new migrations
+_SCHEMA_VERSION = 7  # Increment when adding new migrations
 
 # Migrate old invalid Anthropic model IDs to valid API identifiers.
 _MODEL_ID_MIGRATION = {
@@ -207,6 +207,47 @@ class DatabaseManager:
             media_cols = [row['name'] for row in conn.execute('PRAGMA table_info(media_content)')]
             if 'type_override' not in media_cols:
                 conn.execute('ALTER TABLE media_content ADD COLUMN type_override TEXT DEFAULT NULL')
+        if version == 7:
+            # v6→v7: add creator_snapshots for trend arrows / smart alerts, and
+            # widen the alerts CHECK to admit 'velocity_spike' and 'inactivity'.
+            # SQLite cannot ALTER a CHECK constraint, so rename→recreate→copy→drop.
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS creator_snapshots ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'creator_id INTEGER NOT NULL, '
+                'captured_at TEXT NOT NULL, '
+                'view_total INTEGER NOT NULL DEFAULT 0, '
+                'subscriber_total INTEGER NOT NULL DEFAULT 0, '
+                'FOREIGN KEY (creator_id) REFERENCES creators(id) ON DELETE CASCADE, '
+                'UNIQUE (creator_id, captured_at))'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_snapshots_creator_date '
+                'ON creator_snapshots(creator_id, captured_at DESC)'
+            )
+            # Widen the alerts CHECK (only if the old narrow one is in place).
+            cols = [row['name'] for row in conn.execute('PRAGMA table_info(alerts)')]
+            if cols:
+                conn.execute('ALTER TABLE alerts RENAME TO alerts_old_v6')
+                conn.execute(
+                    'CREATE TABLE alerts ('
+                    'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                    'creator_id INTEGER NOT NULL, '
+                    "alert_type TEXT NOT NULL CHECK(alert_type IN ("
+                    "'view_milestone', 'subscriber_milestone', 'velocity_spike', 'inactivity')), "
+                    'threshold INTEGER NOT NULL, '
+                    "triggered_at TEXT NOT NULL DEFAULT '', "
+                    'FOREIGN KEY (creator_id) REFERENCES creators(id) ON DELETE CASCADE)'
+                )
+                conn.execute(
+                    'INSERT INTO alerts (creator_id, alert_type, threshold, triggered_at) '
+                    'SELECT creator_id, alert_type, threshold, triggered_at FROM alerts_old_v6'
+                )
+                conn.execute(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_unique '
+                    'ON alerts(creator_id, alert_type, threshold)'
+                )
+                conn.execute('DROP TABLE alerts_old_v6')
     @property
     def profile(self) -> str:
         return self._profile
@@ -303,28 +344,35 @@ class DatabaseManager:
     def _backup(self) -> None:
         """Create a timestamped backup and prune to MAX_BACKUPS.
 
-        Checkpoints the WAL inside the write lock first so the .db file
-        contains all committed data, then offloads the file copy to a
-        background thread so reads aren't blocked.
-
-        Note: the file copy happens outside the lock, so new writes between
-        the checkpoint and the copy are not captured.  This is acceptable
-        for a best-effort point-in-time backup — the backup reflects all
-        data committed before the checkpoint.
+        Acquires ``_write_lock`` and delegates to ``_backup_locked``.  Use
+        this from callers that are not already holding the write lock.
         """
         with self._write_lock:
-            now = time.monotonic()
-            if now - self._last_backup_time < _BACKUP_DEBOUNCE_S:
-                return
-            else:
-                self._last_backup_time = now
-                if self._conn is not None:
-                    try:
-                        self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                        self._conn.commit()
-                    except sqlite3.Error:
-                        pass
-                profile_snapshot = self._profile
+            self._backup_locked()
+
+    def _backup_locked(self) -> None:
+        """Create a timestamped backup and prune to MAX_BACKUPS.
+
+        Assumes the caller already holds ``_write_lock``.  Checkpoints the
+        WAL so the .db file contains all committed data, then offloads the
+        file copy to a background thread so reads aren't blocked.
+
+        Note: the file copy happens outside the lock (in the spawned thread),
+        so new writes between the checkpoint and the copy are not captured.
+        This is acceptable for a best-effort point-in-time backup — the
+        backup reflects all data committed before the checkpoint.
+        """
+        now = time.monotonic()
+        if now - self._last_backup_time < _BACKUP_DEBOUNCE_S:
+            return
+        self._last_backup_time = now
+        if self._conn is not None:
+            try:
+                self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+        profile_snapshot = self._profile
         ts = f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")}_{int(time.monotonic() * 1000000) % 1000000:06d}Z'
         src = STORAGE_DIR / f'{profile_snapshot}.db'
         dst = BACKUPS_DIR / f'{profile_snapshot}_{ts}.db.bak'
@@ -362,7 +410,12 @@ class DatabaseManager:
                 except Exception:
                     pass
                 raise ValueError(f'Database error: {exc}') from exc
-        self._backup()
+            # Run the debounced checkpoint/backup while still holding the
+            # lock, instead of releasing and immediately re-acquiring it on
+            # every write (the old _write → _backup() path).  This removes a
+            # lock cycle per write and a window where another writer could
+            # interleave between the commit and the checkpoint.
+            self._backup_locked()
         return cursor
 
     def _read(self, sql: str, params: tuple=()) -> list[dict[str, Any]]:
@@ -379,10 +432,31 @@ class DatabaseManager:
         """Return {creator_id: last_upload_date} for all creators."""
         rows = self._read('SELECT creator_id, MAX(upload_date) AS last_activity FROM media_content GROUP BY creator_id')
         return {r['creator_id']: r['last_activity'] for r in rows}
-    def bulk_unverified_creators(self) -> set[int]:
-        """Return set of creator IDs that have at least one unverified item."""
-        rows = self._read('SELECT DISTINCT creator_id FROM media_content WHERE is_verified = 0')
-        return {r['creator_id'] for r in rows}
+    def bulk_view_totals(self) -> dict[int, int]:
+        """Return {creator_id: SUM(view_count)} for all creators in one query.
+
+        Use instead of per-creator ``get_media`` + ``sum()`` when only the
+        total view count is needed (e.g. milestone checks).
+        """
+        rows = self._read(
+            'SELECT creator_id, COALESCE(SUM(view_count), 0) AS total '
+            'FROM media_content GROUP BY creator_id'
+        )
+        return {r['creator_id']: r['total'] for r in rows}
+    def bulk_media_stats(self, content_clause: str = '', date_clause: str = '') -> dict[int, tuple[int, int]]:
+        """Return {creator_id: (total_views, count)} for media matching the clauses.
+
+        Replaces per-creator ``SUM``/``COUNT`` queries (an N+1 pattern in the
+        report generators) with a single ``GROUP BY`` pass.  *content_clause*
+        and *date_clause* are pre-built ``AND ...`` fragments produced by
+        ``report_generator._build_filter_clause`` and the date-range builders;
+        both may be empty strings.
+        """
+        rows = self._read(
+            f"SELECT creator_id, COALESCE(SUM(view_count), 0) AS views, COUNT(*) AS count "
+            f"FROM media_content WHERE 1=1 {content_clause} {date_clause} GROUP BY creator_id"
+        )
+        return {r['creator_id']: (r['views'], r['count']) for r in rows}
     def bulk_new_activity_creators(self) -> set[int]:
         """Return set of creator IDs flagged with new-activity alert."""
         rows = self._read('SELECT id FROM creators WHERE is_new_activity = 1')
@@ -435,30 +509,6 @@ class DatabaseManager:
     def clear_new_activity(self, creator_id: int) -> None:
         """Clear the new-activity alert flag for a creator (on inspection)."""
         self._write('UPDATE creators SET is_new_activity = 0 WHERE id = ?', (creator_id,))
-    def ingest_channel_payloads(self, creator_id: int, payloads: dict[str, dict[str, Any]]) -> None:
-        """Write multi-platform metadata into the creator record.\n\nExpected *payloads* shape:\n    {\n        \"youtube\": {\"display_name\": str, \"views\": int, \"pfp_url\": str},\n        \"twitch\":  {\"display_name\": str, \"followers\": int, \"pfp_url\": str},\n    }\n"""
-        kwargs = {}
-        yt = payloads.get('youtube')
-        if yt:
-            if yt.get('display_name'):
-                kwargs['nickname'] = yt['display_name']
-            if yt.get('pfp_url'):
-                kwargs['pfp_url'] = yt['pfp_url']
-            if yt.get('views') is not None:
-                self.set_setting(f"yt_channel_views_{creator_id}", str(yt['views']))
-        tw = payloads.get('twitch')
-        if tw:
-            if tw.get('display_name') and 'nickname' not in kwargs:
-                kwargs['nickname'] = tw['display_name']
-            if tw.get('pfp_url') and 'pfp_url' not in kwargs:
-                kwargs['pfp_url'] = tw['pfp_url']
-            if tw.get('followers') is not None:
-                self.set_setting(f"twitch_followers_{creator_id}", str(tw['followers']))
-        if kwargs:
-            self.update_creator(creator_id, **kwargs)
-    def ingest_youtube_channel_payload(self, creator_id: int, payload: dict[str, Any]) -> None:
-        """Legacy wrapper that routes a single YouTube payload through the\nunified multi-platform ingestor.\n"""
-        self.ingest_channel_payloads(creator_id, {'youtube': payload})
     def set_new_activity(self, creator_id: int) -> None:
         """Set the new-activity alert flag for a creator (on new content)."""
         self._write('UPDATE creators SET is_new_activity = 1 WHERE id = ?', (creator_id,))
@@ -637,19 +687,39 @@ class DatabaseManager:
         """
         if not records:
             return
-        new_creator_ids = set()
+        content_ids = [rec['content_id'] for rec in records]
         with self._write_lock:
             try:
-                for rec in records:
-                    existing = self._conn.execute(
-                        'SELECT 1 FROM media_content WHERE content_id = ?', (rec['content_id'],)
-                    ).fetchone()
-                    self._conn.execute(
-                        'INSERT INTO media_content (creator_id, platform, content_id, title, thumbnail_path, thumbnail_url, upload_date, view_count, is_verified, is_short, is_stream, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT(content_id) DO UPDATE SET title = excluded.title, thumbnail_path = excluded.thumbnail_path, thumbnail_url = excluded.thumbnail_url, upload_date = excluded.upload_date, view_count = excluded.view_count, is_short = CASE WHEN media_content.type_override IS NOT NULL THEN media_content.is_short ELSE excluded.is_short END, is_stream = CASE WHEN media_content.type_override IS NOT NULL THEN media_content.is_stream ELSE excluded.is_stream END, description = excluded.description',
-                        (rec['creator_id'], rec['platform'], rec['content_id'], rec.get('title', ''), rec.get('thumbnail_path', ''), rec.get('thumbnail_url', ''), rec.get('upload_date', ''), rec.get('view_count', 0), int(rec.get('is_short', False)), int(rec.get('is_stream', False)), rec.get('description', ''))
+                # Pre-fetch existing content_ids in one chunked IN(...) query
+                # so we can decide which records are genuinely new without a
+                # per-record SELECT (halves the statements inside the lock).
+                existing_ids: set[str] = set()
+                for i in range(0, len(content_ids), 500):
+                    chunk = content_ids[i:i + 500]
+                    placeholders = ','.join('?' * len(chunk))
+                    existing_ids.update(
+                        row[0] for row in self._conn.execute(
+                            f'SELECT content_id FROM media_content WHERE content_id IN ({placeholders})',
+                            tuple(chunk),
+                        )
                     )
-                    if not existing:
-                        new_creator_ids.add(rec['creator_id'])
+                upsert_sql = (
+                    'INSERT INTO media_content (creator_id, platform, content_id, title, thumbnail_path, thumbnail_url, upload_date, view_count, is_verified, is_short, is_stream, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) '
+                    'ON CONFLICT(content_id) DO UPDATE SET '
+                    'title = excluded.title, thumbnail_path = excluded.thumbnail_path, thumbnail_url = excluded.thumbnail_url, upload_date = excluded.upload_date, view_count = excluded.view_count, '
+                    'is_short = CASE WHEN media_content.type_override IS NOT NULL THEN media_content.is_short ELSE excluded.is_short END, '
+                    'is_stream = CASE WHEN media_content.type_override IS NOT NULL THEN media_content.is_stream ELSE excluded.is_stream END, '
+                    'description = excluded.description'
+                )
+                upsert_params = [
+                    (rec['creator_id'], rec['platform'], rec['content_id'], rec.get('title', ''),
+                     rec.get('thumbnail_path', ''), rec.get('thumbnail_url', ''), rec.get('upload_date', ''),
+                     rec.get('view_count', 0), int(rec.get('is_short', False)), int(rec.get('is_stream', False)),
+                     rec.get('description', ''))
+                    for rec in records
+                ]
+                self._conn.executemany(upsert_sql, upsert_params)
+                new_creator_ids = {rec['creator_id'] for rec in records if rec['content_id'] not in existing_ids}
                 for cid in new_creator_ids:
                     self._conn.execute('UPDATE creators SET is_new_activity = 1 WHERE id = ?', (cid,))
                 self._conn.commit()
@@ -699,12 +769,6 @@ class DatabaseManager:
     def get_unverified_media(self) -> list[dict[str, Any]]:
         """Return all media rows where is_verified = 0."""
         return self._read('SELECT content_id, title, description FROM media_content WHERE is_verified = 0')
-    def delete_media(self, media_id: int) -> None:
-        self._write('DELETE FROM media_content WHERE id = ?', (media_id,))
-    def purge_creator_media(self, creator_id: int, platform: str) -> int:
-        """Delete all media_content rows for *creator_id* and *platform*.\n\nReturns the number of rows deleted.\n"""
-        cur = self._write('DELETE FROM media_content WHERE creator_id = ? AND platform = ?', (creator_id, platform))
-        return cur.rowcount
     _SQL_VARIABLE_LIMIT = 500
 
     def prune_stale_media(self, creator_id: int, platform: str, current_ids: set[str]) -> int:
@@ -807,6 +871,153 @@ class DatabaseManager:
                 alerts.append({'type': 'subscriber_milestone', 'threshold': m, 'creator_id': creator_id})
         return alerts
 
+    # ── Creator snapshots (trend arrows + smart alerts) ────────────────
+
+    _SNAPSHOT_RETENTION_DAYS = 90
+
+    def _record_snapshots(self) -> None:
+        """Persist one per-creator-per-day snapshot of view/subscriber totals.
+
+        Called after a successful fetch (alongside the milestone checks). For
+        each creator, today's row is upserted (so re-fetching the same day just
+        refreshes the numbers). Rows older than the retention window are pruned.
+        ``subscriber_total`` is the max per-platform count (matching the
+        milestone logic in :meth:`MainWindow._check_milestones`).
+        """
+        creators = self.get_creators()
+        if not creators:
+            return
+        view_totals = self.bulk_view_totals()
+        sub_counts = self.bulk_subscriber_counts()
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        rows = []
+        for c in creators:
+            cid = c['id']
+            counts = sub_counts.get(cid, {})
+            yt = counts.get('youtube', 0)
+            tw = counts.get('twitch', 0)
+            sub_total = max(yt, tw)
+            view_total = view_totals.get(cid, 0)
+            rows.append((cid, today, view_total, sub_total))
+        upsert_sql = (
+            'INSERT INTO creator_snapshots (creator_id, captured_at, view_total, subscriber_total) '
+            'VALUES (?, ?, ?, ?) '
+            'ON CONFLICT(creator_id, captured_at) DO UPDATE SET '
+            'view_total = excluded.view_total, subscriber_total = excluded.subscriber_total'
+        )
+        for row in rows:
+            self._write(upsert_sql, row)
+        # Prune old snapshots.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=self._SNAPSHOT_RETENTION_DAYS)).strftime('%Y-%m-%d')
+        self._write('DELETE FROM creator_snapshots WHERE captured_at < ?', (cutoff,))
+
+    def bulk_trend_arrows(self, window_days: int = 7) -> dict[int, str]:
+        """Return {creator_id: 'up'|'down'|'flat'|'none'} over a snapshot window.
+
+        Compares the most recent subscriber snapshot to the one roughly
+        ``window_days`` ago. A change under 1 % is reported as 'flat' so tiny
+        fluctuations on large channels don't flip the arrow constantly.
+        """
+        creators = self.get_creators()
+        if not creators:
+            return {}
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime('%Y-%m-%d')
+        # Most recent and the earliest-after-cutoff snapshot per creator.
+        latest = {r['creator_id']: r['subscriber_total'] for r in self._read(
+            'SELECT creator_id, subscriber_total FROM creator_snapshots s '
+            'WHERE captured_at = (SELECT MAX(captured_at) FROM creator_snapshots WHERE creator_id = s.creator_id)'
+        )}
+        baseline = {r['creator_id']: r['subscriber_total'] for r in self._read(
+            'SELECT creator_id, subscriber_total FROM creator_snapshots s '
+            'WHERE captured_at = (SELECT MIN(captured_at) FROM creator_snapshots '
+            'WHERE creator_id = s.creator_id AND captured_at >= ?)',
+            (cutoff,),
+        )}
+        result: dict[int, str] = {}
+        for c in creators:
+            cid = c['id']
+            cur = latest.get(cid)
+            prev = baseline.get(cid)
+            if cur is None or prev is None:
+                result[cid] = 'none'
+                continue
+            if prev == 0:
+                result[cid] = 'up' if cur > 0 else 'flat'
+                continue
+            pct = (cur - prev) / prev * 100.0
+            if abs(pct) < 1.0:
+                result[cid] = 'flat'
+            elif pct > 0:
+                result[cid] = 'up'
+            else:
+                result[cid] = 'down'
+        return result
+
+    def check_velocity_alerts(self, window_days: int = 3, growth_pct: float = 20.0) -> list[dict[str, Any]]:
+        """Detect creators whose subscribers grew ≥ ``growth_pct`` in the window.
+
+        Returns one dict per newly-detected spike: ``{'type': 'velocity_spike',
+        'creator_id', 'threshold': window_days, 'pct': actual_pct}``. Dedup is
+        on ``(creator_id, 'velocity_spike', window_days)`` so each creator
+        notifies at most once per window length (the trend arrow shows ongoing
+        state on the card).
+        """
+        creators = self.get_creators()
+        if not creators:
+            return []
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime('%Y-%m-%d')
+        latest = {r['creator_id']: r['subscriber_total'] for r in self._read(
+            'SELECT creator_id, subscriber_total FROM creator_snapshots s '
+            'WHERE captured_at = (SELECT MAX(captured_at) FROM creator_snapshots WHERE creator_id = s.creator_id)'
+        )}
+        baseline = {r['creator_id']: r['subscriber_total'] for r in self._read(
+            'SELECT creator_id, subscriber_total FROM creator_snapshots s '
+            'WHERE captured_at = (SELECT MIN(captured_at) FROM creator_snapshots '
+            'WHERE creator_id = s.creator_id AND captured_at >= ?)',
+            (cutoff,),
+        )}
+        alerts: list[dict[str, Any]] = []
+        for c in creators:
+            cid = c['id']
+            cur = latest.get(cid)
+            prev = baseline.get(cid)
+            if cur is None or prev is None or prev == 0:
+                continue
+            pct = (cur - prev) / prev * 100.0
+            if pct >= growth_pct and not self.has_alert(cid, 'velocity_spike', window_days):
+                self.add_alert(cid, 'velocity_spike', window_days)
+                alerts.append({'type': 'velocity_spike', 'creator_id': cid, 'threshold': window_days, 'pct': round(pct, 1)})
+        return alerts
+
+    def check_inactivity_alerts(self, idle_days: int = 30) -> list[dict[str, Any]]:
+        """Detect creators with no upload in the last ``idle_days`` days.
+
+        Returns one dict per newly-idle creator: ``{'type': 'inactivity',
+        'creator_id', 'threshold': idle_days, 'idle_days': actual}``. Dedup is
+        on ``(creator_id, 'inactivity', idle_days)``.
+        """
+        creators = self.get_creators()
+        last_activity = self.bulk_last_activity()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=idle_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        alerts: list[dict[str, Any]] = []
+        for c in creators:
+            cid = c['id']
+            last = last_activity.get(cid, '')
+            if not last:
+                # Never uploaded — only count as inactive if they've been a
+                # member long enough to have produced something.
+                continue
+            if last < cutoff and not self.has_alert(cid, 'inactivity', idle_days):
+                self.add_alert(cid, 'inactivity', idle_days)
+                # Days since last upload (best-effort from the ISO date).
+                try:
+                    last_dt = datetime.fromisoformat(last.replace('Z', '+00:00'))
+                    delta = (datetime.now(timezone.utc) - last_dt).days
+                except (ValueError, TypeError):
+                    delta = idle_days
+                alerts.append({'type': 'inactivity', 'creator_id': cid, 'threshold': idle_days, 'idle_days': delta})
+        return alerts
+
     # ── Tags ──────────────────────────────────────────────────────────────
 
     def set_creator_tags(self, creator_id: int, tags: list[str]) -> None:
@@ -861,13 +1072,6 @@ class DatabaseManager:
             if rows:
                 return rows[0]['id']
         return None
-
-    # ── Settings helpers ──────────────────────────────────────────────────
-
-    def get_setting_with_default(self, key: str, default: str) -> str:
-        """Return a setting value, falling back to *default* if not found."""
-        val = self.get_setting(key)
-        return val if val is not None else default
 
     # ── Profile import / export ──────────────────────────────────────────
 
@@ -1098,76 +1302,3 @@ def determine_startup_profile() -> str:
     if (STORAGE_DIR / f'{last}.db').exists():
         return last
     return 'default'
-
-def _run_self_test() -> None:
-    """Verify schema creation, CRUD, profile switching, and backup."""
-    import tempfile
-    import os
-    from . import paths as _paths_mod
-    import core.db_manager as _self_mod
-    tmp = Path(tempfile.mkdtemp())
-    _paths_mod.STORAGE_DIR = tmp / 'storage'
-    _paths_mod.BACKUPS_DIR = tmp / 'storage' / 'backups'
-    _paths_mod.GLOBAL_SETTINGS_PATH = _paths_mod.STORAGE_DIR / 'global_settings.json'
-    _self_mod.STORAGE_DIR = _paths_mod.STORAGE_DIR
-    _self_mod.BACKUPS_DIR = _paths_mod.BACKUPS_DIR
-    _self_mod.GLOBAL_SETTINGS_PATH = _paths_mod.GLOBAL_SETTINGS_PATH
-    print(f'Test dir: {tmp}')
-    db = DatabaseManager('default')
-    print(f'Active profile: {db.profile}')
-    assert db.profile == 'default'
-    assert (STORAGE_DIR / 'default.db').exists()
-    db.set_global_setting('api_keys_json', '{\"yt\": \"key123\"}')
-    assert db.get_global_setting('api_keys_json') == '{\"yt\": \"key123\"}'
-    rid = db.add_role('Streamer', '#FF5733')
-    role = db.get_role(rid)
-    assert role['role_name'] == 'Streamer'
-    db.update_role(rid, role_color='#00FF00')
-    assert db.get_role(rid)['role_color'] == '#00FF00'
-    cid = db.add_creator('TestNick', rid, ['youtube', 'twitch'], youtube_link='https://www.youtube.com/channel/UC_test')
-    creator = db.get_creator(cid)
-    assert creator['nickname'] == 'TestNick'
-    assert json.loads(creator['platforms']) == ['youtube', 'twitch']
-    assert creator['youtube_link'] == 'https://www.youtube.com/channel/UC_test'
-    mid = db.add_media(cid, 'youtube', 'vid001', 'First Video', is_verified=True)
-    assert db.get_media_by_content_id('vid001')['is_verified'] == 1
-    db.upsert_media(cid, 'youtube', 'vid001', 'Updated Title', view_count=42)
-    rec = db.get_media_by_content_id('vid001')
-    assert rec['title'] == 'Updated Title'
-    assert rec['is_verified'] == 1, 'upsert must preserve is_verified'
-    assert rec['view_count'] == 42
-    db.switch_profile('gaming_team')
-    assert db.profile == 'gaming_team'
-    assert (STORAGE_DIR / 'gaming_team.db').exists()
-    assert db.list_profiles() == ['default', 'gaming_team']
-    assert db.get_creators() == []
-    db.add_role('ToDelete', '#111111')
-    del_rid = db.add_role('ToDelete2', '#222222')
-    db.add_creator('Ghost', del_rid, ['youtube'])
-    try:
-        db.delete_role(del_rid)
-        assert False, 'Should have raised ValueError'
-    except ValueError:
-        pass
-    db.delete_creator(db.get_creators()[0]['id'])
-    db.delete_role(del_rid)
-    try:
-        db.add_media(999, 'youtube', 'bad_fk', 'No creator')
-        assert False, 'Should have raised ValueError for FK violation'
-    except ValueError:
-        pass
-    db.close()
-    # Test determine_startup_profile
-    assert determine_startup_profile() == 'gaming_team', f'Expected gaming_team, got {determine_startup_profile()}'
-    # Test that switching profiles persists to global settings
-    db2 = DatabaseManager('default')
-    assert determine_startup_profile() == 'default', f'Expected default after switch, got {determine_startup_profile()}'
-    # Test global API keys survive a profile switch
-    db2.set_global_setting('api_keys_json', '{"yt": "test_key_12345"}')
-    db2.switch_profile('gaming_team')
-    assert db2.get_global_setting('api_keys_json') == '{"yt": "test_key_12345"}', 'Global keys should survive profile switch'
-    db2.close()
-    shutil.rmtree(tmp)
-    print('All self-tests passed.')
-if __name__ == '__main__':
-    _run_self_test()

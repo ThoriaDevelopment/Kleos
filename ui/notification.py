@@ -72,15 +72,6 @@ class NotificationToast(QFrame):
 
         card = QFrame(self)
         card.setObjectName('toastCard')
-        card.setStyleSheet(
-            f"""
-            QFrame#toastCard {{
-                background: {C.BG_RAISED};
-                border: 1px solid {C.BORDER};
-                border-radius: 8px;
-            }}
-            """
-        )
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(14, 10, 14, 12)
         card_layout.setSpacing(4)
@@ -91,9 +82,6 @@ class NotificationToast(QFrame):
 
         title_lbl = QLabel(title)
         title_lbl.setObjectName('toastTitle')
-        title_lbl.setStyleSheet(
-            f"font-weight: bold; font-size: 13px; color: {C.TEXT_PRIMARY};"
-        )
         title_row.addWidget(title_lbl)
 
         title_row.addStretch()
@@ -101,22 +89,6 @@ class NotificationToast(QFrame):
         close_btn = QPushButton('×')  # ×
         close_btn.setObjectName('toastCloseBtn')
         close_btn.setFixedSize(22, 22)
-        close_btn.setStyleSheet(
-            f"""
-            QPushButton#toastCloseBtn {{
-                background: transparent;
-                color: {C.TEXT_MUTED};
-                border: none;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 4px;
-            }}
-            QPushButton#toastCloseBtn:hover {{
-                background: {C.BG_HOVER};
-                color: {C.TEXT_PRIMARY};
-            }}
-            """
-        )
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.dismiss)
         title_row.addWidget(close_btn)
@@ -127,9 +99,6 @@ class NotificationToast(QFrame):
         msg_lbl = QLabel(message)
         msg_lbl.setObjectName('toastMessage')
         msg_lbl.setWordWrap(True)
-        msg_lbl.setStyleSheet(
-            f"font-size: 12px; color: {C.TEXT_SECONDARY};"
-        )
         card_layout.addWidget(msg_lbl)
 
         outer.addWidget(card)

@@ -269,31 +269,3 @@ def prune_cache(db: Any | None = None, max_orphan_files: int = 200) -> int:
         for f in to_remove:
             f.unlink(missing_ok=True)
         return len(to_remove)
-
-
-def refresh_thumbnails_high_quality(db: Any) -> int:
-    """Re-fetch all thumbnails from their original URLs, overwriting cached versions.
-
-    Iterates all media_content rows and re-downloads each thumbnail from the
-    source URL using ``force=True`` to bypass the cache.  Updates
-    ``thumbnail_path`` in the database for every successfully refreshed thumbnail.
-
-    The old cached file is only replaced after the new download succeeds,
-    avoiding data loss if a download fails.
-
-    Returns the number of thumbnails successfully refreshed.
-    """
-    refreshed = 0
-    media = db.get_media()
-    for m in media:
-        url = m.get('thumbnail_url', '') or ''
-        if not url:
-            continue
-        new_path = ensure_thumbnail(url, force=True)
-        if new_path:
-            db._write(
-                'UPDATE media_content SET thumbnail_path = ? WHERE id = ?',
-                (new_path, m['id']),
-            )
-            refreshed += 1
-    return refreshed

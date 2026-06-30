@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from typing import Any
+
 from PyQt6.QtCore import QObject, pyqtSignal
 
 # ---------------------------------------------------------------------------
 # Theme definitions
 # ---------------------------------------------------------------------------
-# Each theme maps token names to hex colour strings or rgba() values.
-# The keys must match exactly the attributes set on class C below.
+# Each theme maps token names to colour values (hex strings, rgba() strings,
+# or the SERIES_COLORS list). The keys must match exactly the attributes
+# set on class C below.
 
-THEMES: dict[str, dict[str, str]] = {
+THEMES: dict[str, dict[str, Any]] = {
     'default': {
         'BG_DEEP':           '#09090C',
         'BG_BASE':           '#0F0F14',
@@ -42,6 +45,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#4A90D9',
         'ACCENT_BLUE_BG':    '#1A3A5C',
         'ACCENT_BLUE_BORDER':'#2A5A8C',
+        'TOPBAR_BG':         'rgba(15,15,20,0.88)',
+        'SERIES_COLORS':     ['#4A90D9', '#9B59B6', '#2ECC71', '#E74C3C',
+                              '#F39C12', '#1ABC9C', '#E67E22', '#3498DB'],
     },
 
     # ── Biophilic ── natural, earthy greens / sand / stone ──────────────
@@ -78,6 +84,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#6ABF69',
         'ACCENT_BLUE_BG':    '#1A3A2A',
         'ACCENT_BLUE_BORDER':'#2A5A3A',
+        'TOPBAR_BG':         'rgba(20,32,22,0.88)',
+        'SERIES_COLORS':     ['#6ABF69', '#D4B481', '#C2772E', '#7A9D54',
+                              '#B5651D', '#4A7C59', '#E0A458', '#8FA372'],
     },
 
     # ── Frutiger Aero ── 2000s utopian tech, sky blue / white / green ──
@@ -114,6 +123,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#0088CC',
         'ACCENT_BLUE_BG':    '#D0E8F8',
         'ACCENT_BLUE_BORDER':'#80B8D8',
+        'TOPBAR_BG':         'rgba(224,238,248,0.88)',
+        'SERIES_COLORS':     ['#0088CC', '#2E8B57', '#FF6B35', '#9B59B6',
+                              '#F39C12', '#E74C3C', '#1ABC9C', '#3498DB'],
     },
 
     # ── DORFic ── industrial minimalist, stark white/black + orange ────
@@ -150,6 +162,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#FF6600',
         'ACCENT_BLUE_BG':    '#2A1500',
         'ACCENT_BLUE_BORDER':'#4A2800',
+        'TOPBAR_BG':         'rgba(10,10,10,0.88)',
+        'SERIES_COLORS':     ['#FF6600', '#00CC66', '#FFFFFF', '#FF3333',
+                              '#FFB266', '#66CCFF', '#FFCC00', '#FF99FF'],
     },
 
     # ── Indigo Citrus ── deep midnight indigo + electric orange ────────
@@ -186,6 +201,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#FF7A2E',
         'ACCENT_BLUE_BG':    '#3A1A08',
         'ACCENT_BLUE_BORDER':'#5A3020',
+        'TOPBAR_BG':         'rgba(16,16,58,0.88)',
+        'SERIES_COLORS':     ['#FF7A2E', '#9B59B6', '#40C870', '#FF4444',
+                              '#F39C12', '#1ABC9C', '#E06820', '#6A4AAA'],
     },
 
     # ── Y2K Futurism ── maximalist, hot pink / lime / cyber blue ──────
@@ -222,6 +240,9 @@ THEMES: dict[str, dict[str, str]] = {
         'ACCENT_BLUE':       '#00D4FF',
         'ACCENT_BLUE_BG':    '#001830',
         'ACCENT_BLUE_BORDER':'#002850',
+        'TOPBAR_BG':         'rgba(20,0,48,0.88)',
+        'SERIES_COLORS':     ['#FF2D95', '#80FF00', '#00D4FF', '#FFCC00',
+                              '#9B59B6', '#FF6B35', '#00FF99', '#FF44FF'],
     },
 }
 
@@ -264,11 +285,33 @@ class C:
 
 
 class M:
-    """Motion / animation timing — constant across all themes."""
+    """Motion, spacing, and elevation tokens — constant across all themes."""
+    # Animation / interaction timing
     CARD_STAGGER_MS = 22
     CARD_HOVER_MS = 150
     PRESS_SCALE = 0.97
     HOVER_LIFT = 3
+
+    # Spacing scale (px). Values match the pre-token paddings so the
+    # migration to M.* is visually identical.
+    SPACE_XS = 4
+    SPACE_SM = 6
+    SPACE_MD = 8
+    SPACE_LG = 14
+    SPACE_XL = 20
+
+    # Corner radii (px)
+    RADIUS_SM = 3
+    RADIUS_MD = 4
+    RADIUS_LG = 6
+
+    # Elevation as drop-shadow parameters for QGraphicsDropShadowEffect:
+    # (blur_radius, y_offset, alpha 0-255). Qt QSS has no box-shadow, so
+    # elevation is applied via shadow effects (see stylesheet.elevation_effect).
+    SHADOW_RGB = (0, 0, 0)
+    ELEVATION_1 = (8, 2, 50)
+    ELEVATION_2 = (16, 4, 80)
+    ELEVATION_3 = (28, 8, 110)
 
 
 # Singleton theme manager — initialise C with default values

@@ -49,8 +49,6 @@ class YouTubeVideo:
         self.is_short = is_short
         self.is_stream = is_stream
         self.description = description
-    def as_dict(self) -> dict[str, Any]:
-        return {s: getattr(self, s) for s in self.__slots__}
 class TwitchStream:
     __slots__ = ('content_id', 'title', 'thumbnail_url', 'started_at', 'viewer_count', 'user_login', 'description')
     def __init__(self, content_id: str, title: str, thumbnail_url: str, started_at: str, viewer_count: int, user_login: str, description: str='') -> None:
@@ -61,8 +59,6 @@ class TwitchStream:
         self.viewer_count = viewer_count
         self.user_login = user_login
         self.description = description
-    def as_dict(self) -> dict[str, Any]:
-        return {s: getattr(self, s) for s in self.__slots__}
 class YouTubeClient:
     """Fetches the latest uploads for a given channel ID via YouTube v3."""
     def __init__(self, api_key: str) -> None:
@@ -215,21 +211,6 @@ class YouTubeClient:
             return False
         total_seconds = hours * 3600 + minutes * 60 + seconds
         return total_seconds <= 90
-    def get_channel_id(self, handle: str) -> str | None:
-        """Resolve a ``@handle`` to a channel ID."""
-        try:
-            params = {'key': self._key, 'part': 'id', 'forHandle': handle.lstrip('@')}
-            resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
-            _diag_response(resp, f'YouTube channel resolve handle={handle}')
-        except requests.RequestException as exc:
-            logger.warning('YouTube channel resolve failed for %s: %s', handle, exc)
-            return None
-        try:
-            items = resp.json().get('items', [])
-        except (ValueError, json.JSONDecodeError):
-            logger.warning('YouTube channel resolve returned invalid JSON for handle=%s', handle)
-            return None
-        return items[0]['id'] if items else None
     def fetch_channel_profile(self, identifier: str, *, is_handle: bool=False) -> dict[str, Any] | None:
         """Fetch channel metadata including display name, PFP URL, and stats.\n\nWhen *is_handle* is True, *identifier* is treated as a ``@handle``\nand routed through the ``forHandle`` parameter.  Otherwise it is\ntreated as a channel ID and routed through ``id``.\n\nReturns a dict with keys ``channel_id``, ``display_name``,\n``pfp_url``, ``subscriber_count``, ``view_count``, or ``None``\non failure.\n"""
         params = {'key': self._key, 'part': 'id,snippet,statistics,contentDetails'}
@@ -733,7 +714,13 @@ data contamination.
             # Track whether each sub-fetch completed without errors so we
             # never prune based on incomplete data.
             streams_ok = False
-            videos_ok = True   # Default True: considered completed when skipped
+            # Default False: never prune based on incomplete data.  If the
+            # profile fetch fails or the creator has no user_id, the videos
+            # block below is skipped and videos_ok stays False, so the prune
+            # guard fails and existing past broadcasts are preserved rather
+            # than silently deleted.  Only a fully completed fetch_videos
+            # call sets this True.
+            videos_ok = False
             try:
                 profile = client.get_user_profile(twitch_login)
             except requests.RequestException as exc:

@@ -4,12 +4,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 from ui.theme import C, M
-from ui.theme.stylesheet import build_dialog_qss, refresh_all_styles
-from ui.theme.tokens import theme_manager
+from ui.theme.stylesheet import build_dialog_qss, build_main_window_qss, refresh_all_styles
+from ui.theme.tokens import theme_manager, THEME_NAMES
+from ui.geometry import save_geometry, restore_geometry
+from ui.command_palette import CommandPalette, Action
 from PyQt6 import sip
 from PyQt6.QtCore import QAbstractAnimation, QDate, QEasingCurve, QPoint, QPropertyAnimation, Qt, QTimer, QVariantAnimation, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QLinearGradient, QPainter, QPalette, QShortcut
-from PyQt6.QtWidgets import QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtGui import QColor, QKeySequence, QLinearGradient, QPainter, QShortcut
+from PyQt6.QtWidgets import QCalendarWidget, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QProgressBar, QScrollArea, QStackedWidget, QTextEdit, QVBoxLayout, QWidget
 from core.api_client import FetchWorker, load_api_keys
 from core.db_manager import DatabaseManager
 from core.keyword_verify import KeywordVerifyWorker
@@ -306,6 +308,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence('Ctrl+R'), self, activated=self._on_refresh_all)
         QShortcut(QKeySequence('Ctrl+N'), self, activated=self._on_add_creator)
         QShortcut(QKeySequence('Ctrl+F'), self, activated=self._focus_search)
+        QShortcut(QKeySequence('Ctrl+K'), self, activated=self._open_command_palette)
+        # Restore the main-window geometry from the global settings file so the
+        # size/position survives a profile switch (per-profile dialogs are
+        # restored by each dialog individually).
+        restore_geometry(self, 'MainWindow', self._db, global_store=True)
         self.apply_main_window_qss()
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_relative_times)
@@ -364,7 +371,7 @@ class MainWindow(QMainWindow):
         top_row2.addWidget(self._search_edit)
         top_row2.addSpacing(8)
         self._fetch_status = QLabel('')
-        self._fetch_status.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+        self._fetch_status.setObjectName('fetchStatus')
         self._fetch_status.setVisible(False)
         top_row2.addWidget(self._fetch_status)
         top_row2.addStretch(1)
@@ -391,6 +398,7 @@ class MainWindow(QMainWindow):
         self._profile_combo.currentIndexChanged.connect(self._on_profile_switch)
         top_row2.addWidget(self._profile_combo)
         top_container = QWidget()
+        top_container.setObjectName('topBar')
         self._top_container = top_container
         top_vbox = QVBoxLayout(top_container)
         top_vbox.setContentsMargins(0, 0, 0, 0)
@@ -404,7 +412,7 @@ class MainWindow(QMainWindow):
         progress_layout = QHBoxLayout(self._verify_progress_area)
         progress_layout.setContentsMargins(16, 6, 16, 6)
         self._verify_progress_label = QLabel('')
-        self._verify_progress_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; background: transparent;')
+        self._verify_progress_label.setObjectName('verifyProgress')
         progress_layout.addWidget(self._verify_progress_label)
         self._verify_progress_bar = QProgressBar()
         self._verify_progress_bar.setMinimum(0)
@@ -419,7 +427,7 @@ class MainWindow(QMainWindow):
         vbox.addWidget(self._verify_progress_area)
         sep = QWidget()
         sep.setFixedHeight(1)
-        sep.setStyleSheet(f'background: {C.BORDER};')
+        sep.setObjectName('separator')
         self._separator = sep
         vbox.addWidget(sep)
         self._stack = QVBoxLayout()
@@ -446,20 +454,20 @@ class MainWindow(QMainWindow):
         empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.setSpacing(12)
         empty_icon = QLabel('🎬')
-        empty_icon.setStyleSheet(f'font-size: 48px; background: transparent;')
+        empty_icon.setObjectName('emptyStateIcon')
         empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(empty_icon)
         self._empty_title = QLabel('No media members yet')
-        self._empty_title.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._empty_title.setObjectName('emptyTitle')
         self._empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(self._empty_title)
         self._empty_desc = QLabel('Add your first media member to get started.')
-        self._empty_desc.setStyleSheet(f'font-size: 13px; color: {C.TEXT_SECONDARY}; background: transparent;')
+        self._empty_desc.setObjectName('emptyDesc')
         self._empty_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(self._empty_desc)
         self._empty_btn = QPushButton('+ Add Media Member')
         self._empty_btn.setFixedWidth(200)
-        self._empty_btn.setStyleSheet(f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 6px; padding: 10px 20px; font-size: 14px; font-weight: bold;')
+        self._empty_btn.setObjectName('emptyBtn')
         self._empty_btn.clicked.connect(self._on_add_creator)
         empty_btn_layout = QHBoxLayout()
         empty_btn_layout.addStretch(1)
@@ -471,43 +479,25 @@ class MainWindow(QMainWindow):
         self._empty_state.setVisible(False)
         self._stack.addWidget(self._empty_state)
         vbox.addLayout(self._stack, 1)
-        # Apply initial inline styles (also called on theme change)
-        self._apply_inline_styles()
 
     def _on_central_resize(self, event) -> None:
         """Keep the gradient canvas covering the entire central widget."""
         self._bg_canvas.resize(self.centralWidget().size())
         QWidget.resizeEvent(self.centralWidget(), event)
     def apply_main_window_qss(self) -> None:
-        """Apply MainWindow-specific QSS overrides using design-system tokens.\n\nSupplements the global stylesheet (build_global_qss) applied in\nmain.py.  Only MainWindow-specific selectors are set here; common\nwidget styles are inherited from the application stylesheet.\n"""
-        self.setStyleSheet(
-            f'QMainWindow {{ background: {C.BG_BASE}; }}\n'
-            f'QCheckBox::indicator:checked {{ image: none; }}\n'
-        )
+        """Apply MainWindow-specific QSS from the shared stylesheet builder."""
+        self.setStyleSheet(build_main_window_qss())
 
     def _on_theme_changed(self) -> None:
         """React to a theme switch: refresh gradient, stylesheets, and cards."""
         self._bg_canvas.refresh_colors()
-        self.apply_main_window_qss()
-        self._apply_inline_styles()
-        self._refresh_cards()
         refresh_all_styles()
-
-    def _apply_inline_styles(self) -> None:
-        """Re-apply inline QSS that uses C.* tokens (called on theme change)."""
-        # Top container: semi-transparent BG_BASE overlay so gradient breathes through
-        _hex = C.BG_BASE.lstrip('#')
-        _r, _g, _b = int(_hex[0:2], 16), int(_hex[2:4], 16), int(_hex[4:6], 16)
-        self._top_container.setStyleSheet(f'background: rgba({_r},{_g},{_b},0.88);')
-        # Separator
-        self._separator.setStyleSheet(f'background: {C.BORDER};')
-        # Status labels
-        self._fetch_status.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
-        self._verify_progress_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; background: transparent;')
-        # Empty state
-        self._empty_title.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {C.TEXT_PRIMARY}; background: transparent;')
-        self._empty_desc.setStyleSheet(f'font-size: 13px; color: {C.TEXT_SECONDARY}; background: transparent;')
-        self._empty_btn.setStyleSheet(f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 6px; padding: 10px 20px; font-size: 14px; font-weight: bold;')
+        # Re-skin cards in place rather than rebuilding them (no DB reload,
+        # no cascade animation). Child labels follow the global stylesheet
+        # via object-name rules; the card frame is rebuilt per-card.
+        for card in self._cards.values():
+            if not sip.isdeleted(card):
+                card.reapply_theme()
     _CARD_BATCH_SIZE = 20
 
     def _refresh_cards(self) -> None:
@@ -520,7 +510,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_scroll'):
             scroll_pos = self._scroll.verticalScrollBar().value()
         for t in self._cascade_timers:
-            t.stop()
+            if not sip.isdeleted(t):
+                t.stop()
         self._cascade_timers.clear()
         self._batch_timer.stop()
         for card in self._cards.values():
@@ -537,6 +528,11 @@ class MainWindow(QMainWindow):
         roles_list = list(roles.values())
         # Activity sparkline data
         activity = self._db.bulk_activity_sparkline()
+        # Subscriber trend arrows (up/down/flat/none) over the snapshot window
+        try:
+            trends = self._db.bulk_trend_arrows()
+        except Exception:
+            trends = {}
 
         # Show/hide empty state
         if not creators:
@@ -553,13 +549,14 @@ class MainWindow(QMainWindow):
             counts = sub_counts.get(c['id'], {})
             sub_text = format_subscriber_count(counts.get('youtube', 0), counts.get('twitch', 0))
             spark = activity.get(c['id'], [])
-            self._pending_card_data.append((c, role, last_act, has_new_activity, sub_text, roles_list, spark))
+            trend = trends.get(c['id'], 'none')
+            self._pending_card_data.append((c, role, last_act, has_new_activity, sub_text, roles_list, spark, trend))
         # Create first batch immediately
         first_batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
         self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
         first_cards = []
-        for c, role, last_act, has_new, sub_text, rlist, spark in first_batch:
-            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark)
+        for c, role, last_act, has_new, sub_text, rlist, spark, trend in first_batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark, trend=trend)
             self._connect_card_signals(card)
             self._cards[c['id']] = card
             self._card_layout.addWidget(card)
@@ -583,7 +580,19 @@ class MainWindow(QMainWindow):
         card.delete_requested.connect(self._on_delete_creator)
         card.edit_notes_requested.connect(self._on_edit_notes)
         card.role_change_requested.connect(self._on_role_change)
-        card.tags_changed.connect(lambda _: self._refresh_cards())
+        card.tags_changed.connect(self._on_tags_changed)
+
+    def _on_tags_changed(self, creator_id: int) -> None:
+        """Update a single card's tags in-place and re-apply the filter.
+
+        Tag edits don't affect sort order, so this avoids a full grid rebuild
+        (and its cascade re-animation) — only the affected card's chips are
+        refreshed and the search/role filter is re-evaluated.
+        """
+        card = self._cards.get(creator_id)
+        if card is not None:
+            card.refresh_tags()
+        self._apply_filter()
 
     def _create_next_batch(self) -> None:
         """Create the next batch of creator cards (lazy loading)."""
@@ -592,8 +601,8 @@ class MainWindow(QMainWindow):
         batch = self._pending_card_data[:self._CARD_BATCH_SIZE]
         self._pending_card_data = self._pending_card_data[self._CARD_BATCH_SIZE:]
         new_cards = []
-        for c, role, last_act, has_new, sub_text, rlist, spark in batch:
-            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark)
+        for c, role, last_act, has_new, sub_text, rlist, spark, trend in batch:
+            card = CreatorCard(c, role, last_act, has_new, sub_text, roles=rlist, activity_data=spark, trend=trend)
             self._connect_card_signals(card)
             self._cards[c['id']] = card
             self._card_layout.addWidget(card)
@@ -612,7 +621,15 @@ class MainWindow(QMainWindow):
             effect = QGraphicsOpacityEffect(card)
             effect.setOpacity(0.0)
             card.setGraphicsEffect(effect)
-            def _launch(c=card, eff=effect, d=ANIM_DURATION):
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            def _launch(c=card, eff=effect, d=ANIM_DURATION, t=timer):
+                # This one-shot timer has fired: release it immediately so
+                # repeated refreshes don't accumulate stale QTimers on the
+                # MainWindow object tree.
+                if t in self._cascade_timers:
+                    self._cascade_timers.remove(t)
+                t.deleteLater()
                 if sip.isdeleted(c):
                     return None
                 else:
@@ -631,8 +648,6 @@ class MainWindow(QMainWindow):
                     op_anim.finished.connect(lambda cc=c: cc.mark_cascade_complete())
                     op_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
                     pos_anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-            timer = QTimer(self)
-            timer.setSingleShot(True)
             timer.timeout.connect(_launch)
             timer.start(delay)
             self._cascade_timers.append(timer)
@@ -797,7 +812,6 @@ class MainWindow(QMainWindow):
 
     def _on_export_creator(self, creator_id: int) -> None:
         """Export a single creator's data to a JSON file."""
-        import json as _json
         from PyQt6.QtWidgets import QFileDialog
         creator = self._db.get_creator(creator_id)
         if not creator:
@@ -810,7 +824,7 @@ class MainWindow(QMainWindow):
         try:
             data = self._db.export_creator(creator_id)
             with open(path, 'w', encoding='utf-8') as f:
-                _json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(data, f, indent=2, ensure_ascii=False)
             from ui.dialog_utils import dark_info
             dark_info(self, 'Exported', f'Creator exported to {path}')
         except Exception as exc:
@@ -838,13 +852,10 @@ class MainWindow(QMainWindow):
         dlg.setWindowTitle(f'Edit Notes — {creator.get("nickname", "Unknown")}')
         dlg.setMinimumWidth(400)
         dlg.setMinimumHeight(250)
-        dlg.setStyleSheet(f'QDialog {{ background: {C.BG_DEEP}; }}')
+        dlg.setStyleSheet(build_dialog_qss())
         layout = QVBoxLayout(dlg)
         notes_edit = QTextEdit()
         notes_edit.setPlainText(creator.get('notes', '') or '')
-        notes_edit.setStyleSheet(
-            f'QTextEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
-            f'border-radius: 4px; padding: 4px; }}')
         layout.addWidget(notes_edit)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
@@ -863,6 +874,53 @@ class MainWindow(QMainWindow):
         """Focus the search bar and select all text (Ctrl+F shortcut)."""
         self._search_edit.setFocus()
         self._search_edit.selectAll()
+
+    def _cycle_theme(self) -> None:
+        """Apply the next theme in the registry and persist the choice."""
+        names = list(THEME_NAMES)
+        try:
+            idx = names.index(theme_manager.current)
+        except ValueError:
+            idx = -1
+        nxt = names[(idx + 1) % len(names)]
+        theme_manager.apply(nxt)
+        self._db.set_setting('theme', nxt)
+
+    def _build_action_registry(self) -> list[Action]:
+        """Build the palette action list from existing entry points.
+
+        Per-creator "Open history" jump actions are rebuilt every time the
+        palette opens so they reflect the current ``self._cards`` membership.
+        """
+        actions: list[Action] = [
+            Action('add', 'Add Media Member', self._on_add_creator,
+                   hint='Ctrl+N', keywords='add new creator member'),
+            Action('refresh', 'Refresh All', self._on_refresh_all,
+                   hint='Ctrl+R', keywords='refresh fetch update all'),
+            Action('verify', 'Verify Media', self._on_verify,
+                   hint='', keywords='verify keyword ai gemini claude'),
+            Action('settings', 'Settings', self._on_settings,
+                   hint='', keywords='settings api keys profiles roles theme'),
+            Action('analytics', 'Analytics & Leaderboard', self._on_leaderboard,
+                   hint='', keywords='analytics leaderboard charts stats'),
+            Action('search', 'Focus Search', self._focus_search,
+                   hint='Ctrl+F', keywords='search focus filter find'),
+            Action('theme', 'Cycle Theme', self._cycle_theme,
+                   hint='', keywords='theme color cycle switch dark light'),
+        ]
+        for cid, card in self._cards.items():
+            nick = card.creator.get('nickname', f'creator {cid}')
+            actions.append(Action(
+                f'open:{cid}', f'Open History: {nick}',
+                lambda c=cid: self._on_card_clicked(c),
+                hint='', keywords='open history creator member media',
+            ))
+        return actions
+
+    def _open_command_palette(self) -> None:
+        """Open the Ctrl+K command palette (modal)."""
+        palette = CommandPalette(self._build_action_registry(), self)
+        palette.exec()
 
     def _on_role_change(self, creator_id: int, role_id: int) -> None:
         """Handle role change from creator card context menu."""
@@ -1163,6 +1221,12 @@ class MainWindow(QMainWindow):
         self._restore_refresh_button()
         if self._data_fetched:
             self._refresh_cards()
+            # Record a per-creator daily snapshot BEFORE running smart-alert
+            # detectors so velocity/inactivity checks see today's numbers.
+            try:
+                self._db._record_snapshots()
+            except Exception as exc:
+                logger.warning('Snapshot recording failed: %s', exc)
             self._check_milestones()
         if self._active_history is not None:
             try:
@@ -1176,6 +1240,8 @@ class MainWindow(QMainWindow):
         """Check for subscriber and view milestones after a fetch."""
         sub_counts = self._db.bulk_subscriber_counts()
         creators = self._db.get_creators()
+        view_totals = self._db.bulk_view_totals()
+        names = {c['id']: c.get('nickname', 'Unknown') for c in creators}
         pending_alerts = []
         for c in creators:
             cid = c['id']
@@ -1185,14 +1251,12 @@ class MainWindow(QMainWindow):
             max_subs = max(yt_subs, tw_follows)
             if max_subs > 0:
                 pending_alerts.extend(self._db.check_subscriber_milestones(cid, max_subs))
-            # Check per-creator total views
-            media = self._db.get_media(creator_id=cid)
-            total_views = sum(m.get('view_count', 0) for m in media)
+            # Check per-creator total views (one bulk query instead of N get_media calls)
+            total_views = view_totals.get(cid, 0)
             if total_views > 0:
                 pending_alerts.extend(self._db.check_view_thresholds(cid, total_views))
         for alert in pending_alerts:
-            creator = self._db.get_creator(alert['creator_id'])
-            name = creator.get('nickname', 'Unknown') if creator else 'Unknown'
+            name = names.get(alert['creator_id'], 'Unknown')
             if alert['type'] == 'subscriber_milestone':
                 threshold = alert['threshold']
                 if threshold >= 1_000_000:
@@ -1212,6 +1276,21 @@ class MainWindow(QMainWindow):
                     label = str(threshold)
                 msg = f'{name} passed {label} total views!'
             self._show_notification('🎉 Milestone!', msg)
+
+        # ── Smart alerts: velocity spikes + inactivity ──
+        try:
+            velocity = self._db.check_velocity_alerts()
+            for alert in velocity:
+                name = names.get(alert['creator_id'], 'Unknown')
+                pct = int(alert.get('pct', 0))
+                self._show_notification('🚀 Rapid growth!', f'{name} gained {pct}% subscribers recently.')
+            inactive = self._db.check_inactivity_alerts()
+            for alert in inactive:
+                name = names.get(alert['creator_id'], 'Unknown')
+                days = alert.get('idle_days', 30)
+                self._show_notification('💤 Inactivity', f'{name} has no uploads in {days} days.')
+        except Exception as exc:
+            logger.warning('Smart-alert check failed: %s', exc)
 
     def _show_notification(self, title: str, message: str) -> None:
         """Show a toast notification in the top-right corner."""
@@ -1297,9 +1376,8 @@ class MainWindow(QMainWindow):
             path = url.toLocalFile()
             if path.endswith('.json'):
                 try:
-                    import json as _json
                     with open(path, 'r', encoding='utf-8') as f:
-                        data = _json.load(f)
+                        data = json.load(f)
                     if data.get('type') == 'creator':
                         # Check for duplicate by link before importing
                         c_data = data.get('creator', {})
@@ -1395,6 +1473,7 @@ class MainWindow(QMainWindow):
                     self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
                 except RuntimeError:
                     pass
+            save_geometry(self, 'MainWindow', self._db, global_store=True)
             self._db.close()
             super().closeEvent(event)
             return

@@ -4,10 +4,10 @@ from typing import Any
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from core.db_manager import DatabaseManager
 from ui.dialog_utils import dark_info, dark_question, dark_warning
-from ui.theme.stylesheet import build_dialog_qss
+from ui.geometry import restore_geometry, save_geometry
+from ui.theme.stylesheet import build_dialog_qss, qss_refresh
 from ui.theme.tokens import C, theme_manager, THEMES, THEME_NAMES
 class _ApiKeysTab(QWidget):
     """Input fields for YouTube Data API v3 and Twitch Helix credentials."""
@@ -40,10 +40,10 @@ class _ApiKeysTab(QWidget):
         layout.addLayout(form)
         layout.addSpacing(12)
         limit_label = QLabel('Videos per creator:')
-        limit_label.setStyleSheet('font-weight: bold;')
+        limit_label.setObjectName('formLabel')
         layout.addWidget(limit_label)
         limit_hint = QLabel('Maximum videos to fetch per creator. Set to 0 for all.')
-        limit_hint.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px;')
+        limit_hint.setObjectName('noteLabel')
         limit_hint.setWordWrap(True)
         layout.addWidget(limit_hint)
         self._limit_spin = QSpinBox()
@@ -57,7 +57,7 @@ class _ApiKeysTab(QWidget):
         layout.addWidget(self._limit_spin)
         layout.addStretch(1)
         note = QLabel('API keys are shared across all profiles.')
-        note.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 10px;')
+        note.setObjectName('noteLabel')
         note.setWordWrap(True)
         layout.addWidget(note)
     def save(self) -> None:
@@ -101,13 +101,13 @@ class _VerifyTab(QWidget):
         self._db = db
         layout = QVBoxLayout(self)
         desc_label = QLabel('Community Description:')
-        desc_label.setStyleSheet('font-weight: bold;')
+        desc_label.setObjectName('formLabel')
         layout.addWidget(desc_label)
         desc_hint = QLabel(
             f'Describe your community in {_VerifyTab._MAX_WORDS} words or fewer. '
             'The AI will use this to decide which videos to verify.'
         )
-        desc_hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px;')
+        desc_hint.setObjectName('hintLabel')
         desc_hint.setWordWrap(True)
         layout.addWidget(desc_hint)
         self._desc_edit = QTextEdit()
@@ -122,11 +122,12 @@ class _VerifyTab(QWidget):
         self._desc_edit.textChanged.connect(self._update_word_count)
         layout.addWidget(self._desc_edit)
         self._word_label = QLabel()
+        self._word_label.setObjectName('wordCount')
         self._update_word_count()
         layout.addWidget(self._word_label)
         layout.addSpacing(12)
         model_label = QLabel('AI Model:')
-        model_label.setStyleSheet('font-weight: bold;')
+        model_label.setObjectName('formLabel')
         layout.addWidget(model_label)
         self._model_combo = QComboBox()
         saved_model = db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
@@ -137,14 +138,14 @@ class _VerifyTab(QWidget):
         layout.addWidget(self._model_combo)
         layout.addSpacing(12)
         kw_label = QLabel('Verification Keywords:')
-        kw_label.setStyleSheet('font-weight: bold;')
+        kw_label.setObjectName('formLabel')
         layout.addWidget(kw_label)
         kw_hint = QLabel(
             'Enter keywords separated by commas. Videos whose title or description '
             'contain any keyword as a whole word will be auto-verified. '
             'Matching is case-insensitive. This does not use AI.'
         )
-        kw_hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px;')
+        kw_hint.setObjectName('hintLabel')
         kw_hint.setWordWrap(True)
         layout.addWidget(kw_hint)
         self._keywords_edit = QLineEdit()
@@ -156,9 +157,10 @@ class _VerifyTab(QWidget):
     def _update_word_count(self) -> None:
         text = self._desc_edit.toPlainText()
         word_count = len(text.split()) if text.strip() else 0
-        color = C.DANGER if word_count > _VerifyTab._MAX_WORDS else C.TEXT_MUTED
+        over = word_count > _VerifyTab._MAX_WORDS
         self._word_label.setText(f'{word_count} / {_VerifyTab._MAX_WORDS} words')
-        self._word_label.setStyleSheet(f'color: {color}; font-size: 11px;')
+        self._word_label.setProperty('over', 'true' if over else 'false')
+        qss_refresh(self._word_label)
     def save(self) -> bool:
         text = self._desc_edit.toPlainText().strip()
         word_count = len(text.split()) if text else 0
@@ -179,11 +181,17 @@ class _ProfilesTab(QWidget):
         self._db = db
         self._profile_changed = False
         self._cancel_fetch = cancel_fetch
+        # A profile switch/create requested inside the dialog but not yet
+        # committed.  The actual switch_profile() call is deferred to save()
+        # so that the other tabs (which still hold the *previous* profile's
+        # values) write to the previous profile first, instead of overwriting
+        # the new profile with stale data.
+        self._pending_profile: str | None = None
         layout = QVBoxLayout(self)
         h_current = QHBoxLayout()
         h_current.addWidget(QLabel('Active Profile:'))
         self._current_label = QLabel(db.profile)
-        self._current_label.setStyleSheet(f'font-weight: bold; color: {C.ACCENT}; background: transparent;')
+        self._current_label.setObjectName('accentLabel')
         h_current.addWidget(self._current_label)
         h_current.addStretch(1)
         layout.addLayout(h_current)
@@ -201,11 +209,7 @@ class _ProfilesTab(QWidget):
         switch_btn.clicked.connect(self._on_switch)
         btn_row.addWidget(switch_btn)
         delete_btn = QPushButton('Delete')
-        delete_btn.setStyleSheet(
-            f'QPushButton {{ color: {C.DANGER}; background: {C.BG_RAISED}; border: 1px solid {C.BORDER};'
-            f'   border-radius: 4px; padding: 6px 14px; }}'
-            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
-        )
+        delete_btn.setObjectName('danger')
         delete_btn.clicked.connect(self._on_delete)
         btn_row.addWidget(delete_btn)
         layout.addLayout(btn_row)
@@ -225,8 +229,13 @@ class _ProfilesTab(QWidget):
         layout.addStretch(1)
     def _refresh_list(self) -> None:
         self._list.clear()
-        current = self._db.profile
-        for name in self._db.list_profiles():
+        current = self._pending_profile or self._db.profile
+        names = self._db.list_profiles()
+        # A pending create has no database yet, so show it in the list
+        # (bolded) so the user sees their choice before it is committed.
+        if self._pending_profile and self._pending_profile not in names:
+            names = names + [self._pending_profile]
+        for name in names:
             item = QListWidgetItem(name)
             if name == current:
                 font = item.font()
@@ -249,7 +258,7 @@ class _ProfilesTab(QWidget):
                 else:
                     if self._cancel_fetch:
                         self._cancel_fetch()
-                    self._db.switch_profile(name)
+                    self._pending_profile = name
                     self._profile_changed = True
                     self._current_label.setText(name)
                     self._name_input.clear()
@@ -260,12 +269,12 @@ class _ProfilesTab(QWidget):
             return None
         else:
             name = item.text()
-            if name == self._db.profile:
+            if name == (self._pending_profile or self._db.profile):
                 return None
             else:
                 if self._cancel_fetch:
                     self._cancel_fetch()
-                self._db.switch_profile(name)
+                self._pending_profile = name
                 self._profile_changed = True
                 self._current_label.setText(name)
                 self._refresh_list()
@@ -356,6 +365,25 @@ class _ProfilesTab(QWidget):
             return
         dark_info(self, 'Imported', f'Creator imported successfully (ID: {new_id}).')
 
+    def save(self) -> bool:
+        """Commit a deferred profile switch/create.
+
+        Called from ``SettingsDialog._on_save`` *after* the other tabs have
+        persisted their values, so those tabs write to the previous profile
+        rather than overwriting the new one with stale data.  Returns False
+        if the switch could not be completed (e.g. the profile name is no
+        longer valid), leaving the active profile unchanged.
+        """
+        if self._pending_profile is None:
+            return True
+        try:
+            self._db.switch_profile(self._pending_profile)
+        except ValueError as exc:
+            dark_warning(self, 'Cannot Switch Profile', str(exc))
+            return False
+        self._pending_profile = None
+        return True
+
     @property
     def profile_changed(self) -> bool:
         return self._profile_changed
@@ -387,11 +415,7 @@ class _RoleManagerTab(QWidget):
         form.addWidget(add_btn)
         layout.addLayout(form)
         del_btn = QPushButton('Delete Selected Role')
-        del_btn.setStyleSheet(
-            f'QPushButton {{ color: {C.DANGER}; background: {C.BG_RAISED}; border: 1px solid {C.BORDER};'
-            f'   border-radius: 4px; padding: 6px 14px; }}'
-            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
-        )
+        del_btn.setObjectName('danger')
         del_btn.clicked.connect(self._on_delete)
         layout.addWidget(del_btn)
         edit_btn = QPushButton('Edit Selected Role')
@@ -510,7 +534,7 @@ class _AppearanceTab(QWidget):
 
         # ── Theme selector ────────────────────────────────────────────
         theme_label = QLabel('Theme:')
-        theme_label.setStyleSheet('font-weight: bold;')
+        theme_label.setObjectName('formLabel')
         layout.addWidget(theme_label)
 
         self._theme_combo = QComboBox()
@@ -532,7 +556,7 @@ class _AppearanceTab(QWidget):
 
         # ── Thumbnail quality ─────────────────────────────────────────
         thumb_label = QLabel('Thumbnail Quality:')
-        thumb_label.setStyleSheet('font-weight: bold;')
+        thumb_label.setObjectName('formLabel')
         layout.addWidget(thumb_label)
         self._thumb_combo = QComboBox()
         self._thumb_combo.addItem('Low (cached)', 'low')
@@ -546,7 +570,7 @@ class _AppearanceTab(QWidget):
             'Low quality uses cached thumbnails (fast).\n'
             'High quality re-downloads thumbnails from original URLs (slower, better resolution).'
         )
-        thumb_hint.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px;')
+        thumb_hint.setObjectName('noteLabel')
         thumb_hint.setWordWrap(True)
         layout.addWidget(thumb_hint)
         layout.addStretch(1)
@@ -580,14 +604,14 @@ class _NotificationsTab(QWidget):
 
         # View count thresholds
         view_label = QLabel('View Count Alert Thresholds:')
-        view_label.setStyleSheet('font-weight: bold;')
+        view_label.setObjectName('formLabel')
         layout.addWidget(view_label)
 
         view_desc = QLabel(
             'Comma-separated view count thresholds.\n'
             'You\'ll be notified when a creator\'s total views cross each threshold.'
         )
-        view_desc.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px;')
+        view_desc.setObjectName('countLabel')
         view_desc.setWordWrap(True)
         layout.addWidget(view_desc)
 
@@ -600,14 +624,14 @@ class _NotificationsTab(QWidget):
 
         # Subscriber milestones (informational)
         sub_label = QLabel('Subscriber Milestones:')
-        sub_label.setStyleSheet('font-weight: bold;')
+        sub_label.setObjectName('formLabel')
         layout.addWidget(sub_label)
 
         milestones = QLabel(
             'You\'ll automatically be notified when a creator reaches:\n'
             '1K · 5K · 10K · 25K · 50K · 75K · 100K · 250K · 500K · 750K · 1M subscribers'
         )
-        milestones.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px;')
+        milestones.setObjectName('countLabel')
         milestones.setWordWrap(True)
         layout.addWidget(milestones)
 
@@ -625,7 +649,7 @@ class _NotificationsTab(QWidget):
         self._db.clear_alerts()
         dark_info(self, 'Alerts Reset', 'All triggered alerts have been cleared.')
 
-    def save(self) -> None:
+    def save(self) -> bool:
         text = self._thresholds_edit.text().strip()
         # Validate: must be comma-separated positive integers
         if text:
@@ -635,8 +659,9 @@ class _NotificationsTab(QWidget):
             except (ValueError, AssertionError):
                 dark_warning(self, 'Invalid Thresholds',
                              'Enter comma-separated positive numbers (e.g. 10000,100000,1000000)')
-                return
+                return False
         self._db.set_setting('notification_view_thresholds', text)
+        return True
 
 
 class SettingsDialog(QDialog):
@@ -647,11 +672,9 @@ class SettingsDialog(QDialog):
         self._cancel_fetch = cancel_fetch
         self.setWindowTitle('Settings')
         self.setMinimumSize(520, 420)
-        self.setStyleSheet(
-            build_dialog_qss()
-            + f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}\n'
-            f'QDialogButtonBox {{ background: transparent; }}\n'
-        )
+        self.reapply_theme()
+        restore_geometry(self, 'SettingsDialog', self._db)
+        self.finished.connect(lambda _r: save_geometry(self, 'SettingsDialog', self._db))
         layout = QVBoxLayout(self)
         self._tabs = QTabWidget()
         self._api_tab = _ApiKeysTab(db)
@@ -671,12 +694,29 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._on_save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def reapply_theme(self) -> None:
+        """Rebuild the dialog stylesheet from current theme tokens."""
+        self.setStyleSheet(
+            build_dialog_qss()
+            + f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}\n'
+            f'QDialogButtonBox {{ background: transparent; }}\n'
+        )
+
     def _on_save(self) -> None:
         self._api_tab.save()
         if not self._verify_tab.save():
             return
         self._appearance_tab.save()
-        self._notifications_tab.save()
+        if not self._notifications_tab.save():
+            self._tabs.setCurrentWidget(self._notifications_tab)
+            return
+        # Commit a deferred profile switch *after* the other tabs have saved
+        # their values to the previous profile, so the new profile is not
+        # overwritten with stale data.
+        if not self._profiles_tab.save():
+            self._tabs.setCurrentWidget(self._profiles_tab)
+            return
         # Apply theme change immediately if it changed
         new_theme = self._appearance_tab._theme_combo.currentData()
         if new_theme != theme_manager.current:

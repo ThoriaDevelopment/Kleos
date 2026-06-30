@@ -1,8 +1,5 @@
-import os
 import sys
 import logging
-# Set tooltip display duration to 3 seconds (must be set before QApplication init)
-os.environ['QT_TOOLTIP_TIMEOUT'] = '3000'
 from PyQt6.QtCore import QEvent, QObject, Qt
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton, QProxyStyle, QStackedWidget, QStyle, QStyleOption, QToolTip, QVBoxLayout, QWidget
@@ -72,19 +69,28 @@ class FirstRunWizard(QDialog):
     _NUM_PAGES = 10
 
     # ── Shared stylesheet ──────────────────────────────────────────────
-    _STYLE = (
-        f'QDialog {{ background: {C.BG_BASE}; }}'
-        f'QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
-        f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
-        f'border: 1px solid {C.BORDER}; border-radius: 4px; padding: 8px 16px; }}'
-        f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
-        f'QPushButton:disabled {{ color: {C.TEXT_MUTED}; background: {C.BG_LAYER}; }}'
-    )
-    _ACCENT_BTN = (
-        f'QPushButton {{ background-color: {C.CHECK_ACCENT}; color: {C.TEXT_ON_ACCENT}; '
-        f'border: 1px solid {C.ACCENT_BLUE_BORDER}; border-radius: 4px; padding: 8px 20px; }}'
-        f'QPushButton:hover {{ background-color: {C.ACCENT_BLUE_BORDER}; color: {C.ACCENT_HOVER}; }}'
-    )
+    # Exposed as functions (not frozen class-attribute f-strings) so they
+    # re-evaluate the live theme tokens on every call — see reapply_theme().
+    @staticmethod
+    def _style() -> str:
+        return (
+            f'QDialog {{ background: {C.BG_BASE}; }}'
+            f'QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
+            f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
+            f'border: 1px solid {C.BORDER}; border-radius: 4px; padding: 8px 16px; }}'
+            f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+            f'QPushButton:disabled {{ color: {C.TEXT_MUTED}; background: {C.BG_LAYER}; }}'
+            f'QLabel#cardMeta {{ color: {C.TEXT_SECONDARY}; background: transparent; }}'
+            f'QLabel#countLabel {{ color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent; }}'
+        )
+
+    @staticmethod
+    def _accent_btn() -> str:
+        return (
+            f'QPushButton {{ background-color: {C.CHECK_ACCENT}; color: {C.TEXT_ON_ACCENT}; '
+            f'border: 1px solid {C.ACCENT_BLUE_BORDER}; border-radius: 4px; padding: 8px 20px; }}'
+            f'QPushButton:hover {{ background-color: {C.ACCENT_BLUE_BORDER}; color: {C.ACCENT_HOVER}; }}'
+        )
 
     # ── Mockup helpers ──────────────────────────────────────────────────
 
@@ -346,7 +352,7 @@ class FirstRunWizard(QDialog):
         self.setWindowIcon(create_app_icon())
         self.setMinimumWidth(540)
         self.setMinimumHeight(480)
-        self.setStyleSheet(self._STYLE)
+        self.setStyleSheet(self._style())
 
         # ── Page stack ─────────────────────────────────────────────────
         self._stack = QStackedWidget()
@@ -430,7 +436,7 @@ class FirstRunWizard(QDialog):
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         settings_btn = QPushButton('Set up API Keys')
-        settings_btn.setStyleSheet(self._ACCENT_BTN)
+        settings_btn.setStyleSheet(self._accent_btn())
         settings_btn.clicked.connect(self._open_settings)
         btn_row.addWidget(settings_btn)
         btn_row.addStretch(1)
@@ -468,7 +474,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -524,7 +530,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -588,7 +594,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -639,7 +645,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -685,7 +691,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -729,7 +735,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -792,7 +798,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(8)
@@ -837,7 +843,7 @@ class FirstRunWizard(QDialog):
         )
         desc.setWordWrap(True)
         desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setStyleSheet(f'color: {C.TEXT_SECONDARY};')
+        desc.setObjectName('cardMeta')
         lay.addWidget(desc)
 
         lay.addSpacing(12)
@@ -868,17 +874,23 @@ class FirstRunWizard(QDialog):
         # Step counter label (cleaner than 10 dots)
         self._step_label = QLabel()
         self._step_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._step_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px;')
+        self._step_label.setObjectName('countLabel')
         nav.addWidget(self._step_label)
 
         nav.addStretch(1)
 
         self._next_btn = QPushButton('Next →')
-        self._next_btn.setStyleSheet(self._ACCENT_BTN)
+        self._next_btn.setStyleSheet(self._accent_btn())
         self._next_btn.clicked.connect(self._go_next)
         nav.addWidget(self._next_btn)
 
         return nav
+
+    def reapply_theme(self) -> None:
+        """Rebuild the wizard stylesheet + accent button from live tokens."""
+        self.setStyleSheet(self._style())
+        if hasattr(self, '_next_btn'):
+            self._next_btn.setStyleSheet(self._accent_btn())
 
     def _update_nav(self):
         idx = self._stack.currentIndex()

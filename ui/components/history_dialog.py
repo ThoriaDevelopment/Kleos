@@ -3,10 +3,11 @@ import threading
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.dates import date2num
 from matplotlib.figure import Figure
 from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
@@ -17,48 +18,12 @@ from core.db_manager import DatabaseManager
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import relative_time, format_subscriber_count
 from ui.dialog_utils import dark_question, enable_window_maximize, handle_fullscreen_keypress
+from ui.chart_common import apply_style, build_conditions, smooth_mpl_patch
 from ui.chart_utils import _ZoomableFigureCanvas
+from ui.geometry import restore_geometry, save_geometry
 from ui.theme import C
-from ui.theme.stylesheet import build_dialog_qss
-def _header_qss() -> str:
-    """Return header QSS using current theme tokens."""
-    return (
-        f'QFrame#historyHeader {{ background: {C.CARD_BG}; border-radius: 8px; border: none; }}'
-        f'QFrame#historyHeader QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
-    )
+from ui.theme.stylesheet import build_dialog_qss, qss_refresh
 
-def _row_qss() -> str:
-    """Return content-row QSS using current theme tokens."""
-    return (
-        f'_ContentRow {{ background: {C.CARD_BG}; border-radius: 6px; border: none; }}'
-        f'_ContentRow:hover {{ background: {C.BG_HOVER}; }}'
-        f'_ContentRow QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}'
-        f'_ContentRow QWidget {{ background: transparent; }}'
-    )
-def _mpl_style() -> dict:
-    """Return matplotlib style dict using current theme tokens."""
-    return {
-        'figure.facecolor': C.DIALOG_BG, 'axes.facecolor': C.INPUT_BG,
-        'axes.edgecolor': C.BORDER, 'axes.labelcolor': C.TEXT_PRIMARY,
-        'xtick.color': C.TEXT_SECONDARY, 'ytick.color': C.TEXT_SECONDARY,
-        'text.color': C.TEXT_PRIMARY, 'grid.color': C.BORDER,
-        'grid.alpha': 0.5, 'lines.color': C.ACCENT,
-    }
-
-def _apply_style(fig: Figure) -> None:
-    s = _mpl_style()
-    fig.patch.set_facecolor(s['figure.facecolor'])
-    fig.patch.set_edgecolor(s['figure.facecolor'])
-    fig.patch.set_linewidth(0)
-    for ax in fig.axes:
-        ax.set_facecolor(s['axes.facecolor'])
-        ax.tick_params(colors=s['xtick.color'])
-        ax.xaxis.label.set_color(s['axes.labelcolor'])
-        ax.yaxis.label.set_color(s['axes.labelcolor'])
-        ax.title.set_color(s['text.color'])
-        for spine in ax.spines.values():
-            spine.set_color(s['axes.edgecolor'])
-        ax.grid(True, color=s['grid.color'], alpha=s['grid.alpha'])
 def _content_url(platform: str, content_id: str, channel_name: str = '') -> str:
     if platform == 'youtube':
         return f'https://www.youtube.com/watch?v={content_id}'
@@ -96,12 +61,7 @@ class _ContentRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
-        self.setStyleSheet(
-            f'QFrame {{ background: {C.CARD_BG}; border-radius: 6px; border: none; }}'
-            f'QFrame:hover {{ background: {C.BG_HOVER}; }}'
-            f'QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}'
-            f'QWidget {{ background: transparent; }}'
-        )
+        self.setObjectName('mediaRow')
         self._build_ui()
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
@@ -111,7 +71,7 @@ class _ContentRow(QFrame):
         self._thumb_label = QLabel()
         self._thumb_label.setFixedSize(120, 68)
         self._thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_label.setStyleSheet(f'background: {C.DIALOG_BG}; border-radius: 4px;')
+        self._thumb_label.setObjectName('mediaThumb')
         self._load_thumbnail(thumb_path)
         layout.addWidget(self._thumb_label)
         mid = QVBoxLayout()
@@ -125,21 +85,23 @@ class _ContentRow(QFrame):
         title_font = QFont()
         title_font.setPointSize(10)
         self._title_label.setFont(title_font)
-        self._title_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._title_label.setObjectName('mediaLabel')
         title_row.addWidget(self._title_label, 1)
         self._type_badge = QLabel()
+        self._type_badge.setObjectName('typeBadge')
         self._type_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._update_type_badge()
         title_row.addWidget(self._type_badge)
         mid.addLayout(title_row)
         upload_date = self._media.get('upload_date', '')
         self._age_label = QLabel(relative_time(upload_date))
-        self._age_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 10px; background: transparent;')
+        self._age_label.setObjectName('mediaMeta')
         mid.addWidget(self._age_label)
         layout.addLayout(mid, 1)
         verified = bool(self._media.get('is_verified', 0))
         self._verify_btn = QPushButton()
         self._verify_btn.setFixedSize(110, 32)
+        self._verify_btn.setObjectName('verifyBtn')
         self._verify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._set_verify_style(verified)
         self._verify_btn.clicked.connect(self._toggle_verified)
@@ -152,7 +114,7 @@ class _ContentRow(QFrame):
         self._views_label.setFont(views_font)
         self._views_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._views_label.setMinimumWidth(80)
-        self._views_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._views_label.setObjectName('mediaLabel')
         layout.addWidget(self._views_label)
     def _load_thumbnail(self, path: str) -> None:
         if path and Path(path).exists() and (Path(path).stat().st_size > 0):
@@ -198,18 +160,9 @@ class _ContentRow(QFrame):
         except Exception:
             pass
     def _set_verify_style(self, verified: bool) -> None:
-        if verified:
-            self._verify_btn.setText('In Community')
-            self._verify_btn.setStyleSheet(
-                f'QPushButton {{ background: {C.VERIFY_GREEN}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: 4px; font-size: 11px; }}'
-                f'QPushButton:hover {{ background: {C.VERIFY_GREEN_HOVER}; }}'
-            )
-        else:
-            self._verify_btn.setText('Verify')
-            self._verify_btn.setStyleSheet(
-                f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.TEXT_MUTED}; border-radius: 4px; font-size: 11px; }}'
-                f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
-            )
+        self._verify_btn.setProperty('verified', 'true' if verified else 'false')
+        self._verify_btn.setText('In Community' if verified else 'Verify')
+        qss_refresh(self._verify_btn)
     def _toggle_verified(self) -> None:
         current = bool(self._media.get('is_verified', 0))
         new_val = not current
@@ -241,25 +194,12 @@ class _ContentRow(QFrame):
         if override:
             text += ' ✎'  # pencil indicator for manual override
         self._type_badge.setText(text)
-        colors = {
-            'short': (C.ACCENT_BLUE, C.ACCENT_BLUE_BORDER),
-            'stream': (C.DANGER, C.DANGER_RED_BORDER if hasattr(C, 'DANGER_RED_BORDER') else C.BORDER),
-            'video': (C.BG_HOVER, C.BORDER),
-        }
-        bg, border = colors.get(ct, (C.BG_HOVER, C.BORDER))
-        self._type_badge.setStyleSheet(
-            f'QLabel {{ background: {bg}; color: {C.TEXT_PRIMARY}; border: 1px solid {border};'
-            f' border-radius: 3px; padding: 1px 5px; font-size: 9px; background: {bg}; }}'
-        )
+        self._type_badge.setProperty('ct', ct)
+        qss_refresh(self._type_badge)
 
     def _show_context_menu(self, pos) -> None:
         """Show a context menu for setting the content type."""
         menu = QMenu(self)
-        menu.setStyleSheet(
-            f'QMenu {{ background-color: {C.BG_RAISED}; border: 1px solid {C.BORDER}; }}'
-            f'QMenu::item {{ color: {C.TEXT_PRIMARY}; padding: 6px 20px; }}'
-            f'QMenu::item:selected {{ background-color: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; }}'
-        )
         ct = self._effective_type()
         content_id = self._media.get('content_id', '')
         if not content_id:
@@ -347,32 +287,12 @@ class _CreatorTimelineChart(_ZoomableFigureCanvas, FigureCanvas):
 
     def _render(self) -> None:
         self._fig.clear()
+        self._series_data = []
         ax = self._fig.add_subplot(111)
-        conditions = ["upload_date != ''", "creator_id = ?"]
-        params: list[Any] = [self._creator_id]
-        if self._verified_only:
-            conditions.append('is_verified = 1')
-        ct = self._content_type
-        if ct == 'short':
-            conditions.append('is_short = 1')
-        elif ct == 'video':
-            conditions.append('is_short = 0')
-            conditions.append('is_stream = 0')
-        elif ct == 'stream':
-            conditions.append('is_stream = 1')
-        if self._time_range:
-            now = datetime.now(timezone.utc)
-            if self._time_range == 'week':
-                since = now - timedelta(weeks=1)
-            elif self._time_range == 'month':
-                since = now - timedelta(days=30)
-            elif self._time_range == 'year':
-                since = now - timedelta(days=365)
-            else:
-                since = None
-            if since:
-                conditions.append('upload_date >= ?')
-                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        conditions, params = build_conditions(
+            verified_only=self._verified_only, content_type=self._content_type,
+            time_range=self._time_range, creator_id=self._creator_id, table_prefix='',
+        )
         where = ' AND '.join(conditions)
         rows = self._db._read(
             f'SELECT upload_date, view_count FROM media_content WHERE {where} ORDER BY upload_date ASC',
@@ -382,7 +302,7 @@ class _CreatorTimelineChart(_ZoomableFigureCanvas, FigureCanvas):
         label = f"{'Verified' if self._verified_only else 'All'} {type_labels.get(self._content_type, 'Content')}"
         if not rows:
             ax.text(0.5, 0.5, f'No {label.lower()} yet', ha='center', va='center', fontsize=12, color='#888')
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self.draw()
             self._save_home_limits()
         else:
@@ -397,15 +317,23 @@ class _CreatorTimelineChart(_ZoomableFigureCanvas, FigureCanvas):
                     pass
             if not dates:
                 ax.text(0.5, 0.5, 'No parseable dates', ha='center', va='center', fontsize=12, color='#888')
-                _apply_style(self._fig)
+                apply_style(self._fig)
                 self.draw()
                 self._save_home_limits()
             else:
-                ax.plot(dates, views, marker='o', markersize=4, color=C.ACCENT, linewidth=1.5)
+                patch = smooth_mpl_patch(date2num(dates), views, C.ACCENT,
+                                        floor=0.0, linewidth=1.5, zorder=3)
+                if patch is not None:
+                    ax.add_patch(patch)
+                ax.scatter(dates, views, marker='o', s=16, color=C.ACCENT, zorder=4)
+                self._series_data.append({
+                    'xnum': date2num(dates), 'dates': dates,
+                    'views': views, 'label': '',
+                })
                 ax.set_xlabel('Date')
                 ax.set_ylabel('Views')
                 ax.set_title(f'{label} — View Trajectory')
-                _apply_style(self._fig)
+                apply_style(self._fig)
                 self._fig.autofmt_xdate()
                 self.draw()
                 self._save_home_limits()
@@ -449,31 +377,10 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
     def _render(self) -> None:
         self._fig.clear()
         ax = self._fig.add_subplot(111)
-        conditions = ["upload_date != ''", "creator_id = ?"]
-        params: list[Any] = [self._creator_id]
-        if self._verified_only:
-            conditions.append('is_verified = 1')
-        ct = self._content_type
-        if ct == 'short':
-            conditions.append('is_short = 1')
-        elif ct == 'video':
-            conditions.append('is_short = 0')
-            conditions.append('is_stream = 0')
-        elif ct == 'stream':
-            conditions.append('is_stream = 1')
-        if self._time_range:
-            now = datetime.now(timezone.utc)
-            if self._time_range == 'week':
-                since = now - timedelta(weeks=1)
-            elif self._time_range == 'month':
-                since = now - timedelta(days=30)
-            elif self._time_range == 'year':
-                since = now - timedelta(days=365)
-            else:
-                since = None
-            if since:
-                conditions.append('upload_date >= ?')
-                params.append(since.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        conditions, params = build_conditions(
+            verified_only=self._verified_only, content_type=self._content_type,
+            time_range=self._time_range, creator_id=self._creator_id, table_prefix='',
+        )
         where = ' AND '.join(conditions)
         rows = self._db._read(
             f'SELECT upload_date FROM media_content WHERE {where} ORDER BY upload_date ASC',
@@ -483,7 +390,7 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
         label = f"{'Verified' if self._verified_only else 'All'} {type_labels.get(self._content_type, 'Uploads')}"
         if not rows:
             ax.text(0.5, 0.5, f'No {label.lower()} yet', ha='center', va='center', fontsize=12, color='#888')
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self.draw()
             self._save_home_limits()
         else:
@@ -509,7 +416,7 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
             ax.set_xticklabels(labels, rotation=45, fontsize=8)
             ax.set_ylabel('Uploads')
             ax.set_title(f'Monthly {label}')
-            _apply_style(self._fig)
+            apply_style(self._fig)
             self._fig.tight_layout()
             self.draw()
             self._save_home_limits()
@@ -543,12 +450,22 @@ keeping the UI responsive even with 1000+ videos.
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(680, 480)
         self.resize(780, 560)
-        self.setStyleSheet(build_dialog_qss())
+        self.reapply_theme()
+        restore_geometry(self, 'HistoryDialog', self._db)
+        self.finished.connect(lambda _r: save_geometry(self, 'HistoryDialog', self._db))
         self._build_ui()
         self._animated = False
         self._opacity_effect = QGraphicsOpacityEffect(self)
         self._opacity_effect.setOpacity(0.0)
         self.setGraphicsEffect(self._opacity_effect)
+    def reapply_theme(self) -> None:
+        """Rebuild the dialog stylesheet and recolor charts from live tokens."""
+        self.setStyleSheet(build_dialog_qss())
+        # On-demand charts read C.* inside _render(); re-render so they follow
+        # a theme switch without reopening the dialog.
+        for chart in (getattr(self, '_creator_timeline', None), getattr(self, '_creator_bar', None)):
+            if chart is not None and not sip.isdeleted(chart):
+                chart._render()
     def _animate_entry(self) -> None:
         """Scale + fade in from screen center using OutExpo curve."""
         final_geo = self.geometry()
@@ -592,31 +509,18 @@ keeping the UI responsive even with 1000+ videos.
         control_bar.setSpacing(8)
         self._sort_combo = QComboBox()
         self._sort_combo.addItems(['Date (newest)', 'Date (oldest)', 'Title A-Z', 'Views (high-low)'])
-        self._sort_combo.setStyleSheet(
-            f'QComboBox {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
-            f'border-radius: 4px; padding: 4px 8px; min-width: 130px; }}'
-            f'QComboBox::drop-down {{ border: none; }}'
-            f'QComboBox QAbstractItemView {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
-            f'selection-background-color: {C.BG_HOVER}; }}')
+        self._sort_combo.setMinimumWidth(130)
         self._sort_combo.currentIndexChanged.connect(self._apply_sort_filter)
         control_bar.addWidget(self._sort_combo)
 
         self._filter_combo = QComboBox()
         self._filter_combo.addItems(['All', 'Verified only', 'Shorts only', 'Videos only', 'Streams only'])
-        self._filter_combo.setStyleSheet(
-            f'QComboBox {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
-            f'border-radius: 4px; padding: 4px 8px; min-width: 120px; }}'
-            f'QComboBox::drop-down {{ border: none; }}'
-            f'QComboBox QAbstractItemView {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
-            f'selection-background-color: {C.BG_HOVER}; }}')
+        self._filter_combo.setMinimumWidth(120)
         self._filter_combo.currentIndexChanged.connect(self._apply_sort_filter)
         control_bar.addWidget(self._filter_combo)
 
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText('Search content...')
-        self._search_edit.setStyleSheet(
-            f'QLineEdit {{ background: {C.INPUT_BG}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.INPUT_BORDER}; '
-            f'border-radius: 4px; padding: 4px 8px; }}')
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(200)
@@ -625,9 +529,9 @@ keeping the UI responsive even with 1000+ videos.
         control_bar.addWidget(self._search_edit, 1)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.viewport().setStyleSheet(f'background: {C.BG_LAYER};')
+        self._scroll.viewport().setObjectName('historyViewport')
         self._list_container = QWidget()
-        self._list_container.setStyleSheet(f'background: {C.BG_LAYER};')
+        self._list_container.setObjectName('historyList')
         self._list_layout = QVBoxLayout(self._list_container)
         self._list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._list_layout.setSpacing(6)
@@ -642,16 +546,12 @@ keeping the UI responsive even with 1000+ videos.
         media_layout.addLayout(control_bar)
         media_layout.addWidget(self._scroll, 1)
         self._count_label = QLabel()
-        self._count_label.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px; background: transparent;')
+        self._count_label.setObjectName('historyCount')
+        self._count_label.setProperty('state', 'more')
         media_layout.addWidget(self._count_label)
         self._load_more_btn = QPushButton('Load More')
         self._load_more_btn.setObjectName('loadMoreBtn')
         self._load_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._load_more_btn.setStyleSheet(
-            f'QPushButton#loadMoreBtn {{ background: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER};'
-            f' border-radius: 4px; padding: 8px 20px; }}'
-            f'QPushButton#loadMoreBtn:hover {{ background: {C.BORDER}; }}'
-        )
         self._load_more_btn.clicked.connect(self._load_more)
         media_layout.addWidget(self._load_more_btn)
         self._tabs.addTab(media_page, 'Media')
@@ -683,24 +583,14 @@ keeping the UI responsive even with 1000+ videos.
         filter_row.addStretch(1)
         filter_row.addWidget(QLabel('Chart:'))
         self._btn_timeline = QPushButton('Timeline')
+        self._btn_timeline.setObjectName('chartToggle')
         self._btn_timeline.setCheckable(True)
         self._btn_timeline.setChecked(True)
-        self._btn_timeline.setStyleSheet(
-            f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
-            f'border-radius: 4px; padding: 4px 12px; }}'
-            f'QPushButton:checked {{ background: {C.ACCENT}; border-color: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; }}'
-            f'QPushButton:hover {{ background: {C.BORDER}; }}'
-            f'QPushButton:checked:hover {{ background: {C.ACCENT_HOVER}; }}')
         self._btn_timeline.clicked.connect(lambda: self._chart_stack.setCurrentIndex(0))
         filter_row.addWidget(self._btn_timeline)
         self._btn_bar = QPushButton('Upload Activity')
+        self._btn_bar.setObjectName('chartToggle')
         self._btn_bar.setCheckable(True)
-        self._btn_bar.setStyleSheet(
-            f'QPushButton {{ background: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
-            f'border-radius: 4px; padding: 4px 12px; }}'
-            f'QPushButton:checked {{ background: {C.ACCENT}; border-color: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; }}'
-            f'QPushButton:hover {{ background: {C.BORDER}; }}'
-            f'QPushButton:checked:hover {{ background: {C.ACCENT_HOVER}; }}')
         self._btn_bar.clicked.connect(lambda: self._chart_stack.setCurrentIndex(1))
         filter_row.addWidget(self._btn_bar)
         chart_group = QButtonGroup(self)
@@ -751,7 +641,6 @@ keeping the UI responsive even with 1000+ videos.
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         header = QFrame()
         header.setObjectName('historyHeader')
-        header.setStyleSheet(_header_qss())
         h_layout = QVBoxLayout(header)
         h_layout.setSpacing(4)
         h_layout.setContentsMargins(12, 10, 12, 10)
@@ -762,57 +651,43 @@ keeping the UI responsive even with 1000+ videos.
         name_font.setBold(True)
         name_font.setPointSize(14)
         name_label.setFont(name_font)
-        name_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
+        name_label.setObjectName('cardName')
         name_row.addWidget(name_label)
         sub_counts = self._db.bulk_subscriber_counts().get(self._creator['id'], {})
         sub_text = format_subscriber_count(sub_counts.get('youtube', 0), sub_counts.get('twitch', 0))
         if sub_text != 'N/A':
             sub_label = QLabel(sub_text)
-            sub_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+            sub_label.setObjectName('countLabel')
             name_row.addWidget(sub_label)
         name_row.addStretch(1)
         self._refresh_btn = QPushButton('Refresh Content')
         self._refresh_btn.setObjectName('refreshContentBtn')
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._refresh_btn.setStyleSheet(
-            f'QPushButton#refreshContentBtn {{ background-color: {C.ACCENT_BLUE_BG}; color: {C.ACCENT_HOVER}; border: 1px solid {C.ACCENT_BLUE_BORDER}; border-radius: 4px; padding: 6px 12px; }}'
-            f'QPushButton#refreshContentBtn:hover {{ background-color: {C.ACCENT_BLUE_BORDER}; color: {C.ACCENT_HOVER}; }}'
-        )
         self._refresh_btn.clicked.connect(self._on_refresh_content)
         name_row.addWidget(self._refresh_btn)
         self._delete_btn = QPushButton('Delete Member')
         self._delete_btn.setObjectName('deleteMemberBtn')
         self._delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._delete_btn.setStyleSheet(
-            f'QPushButton#deleteMemberBtn {{ background-color: {C.DANGER_RED_BG}; color: {C.DANGER}; border: 1px solid {C.DANGER_RED_BORDER}; border-radius: 4px; padding: 6px 12px; }}'
-            f'QPushButton#deleteMemberBtn:hover {{ background-color: {C.DANGER_RED_BORDER}; color: {C.TEXT_PRIMARY}; }}'
-        )
         self._delete_btn.clicked.connect(self._on_delete_member)
         name_row.addWidget(self._delete_btn)
         self._export_btn = QPushButton('Export')
         self._export_btn.setObjectName('exportCreatorBtn')
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._export_btn.setStyleSheet(
-            f'QPushButton#exportCreatorBtn {{ background-color: {C.BG_PRESS}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 12px; }}'
-            f'QPushButton#exportCreatorBtn:hover {{ background-color: {C.BG_HOVER}; }}'
-        )
         self._export_btn.clicked.connect(self._on_export_creator)
         name_row.addWidget(self._export_btn)
         h_layout.addLayout(name_row)
         self._last_verified_label = QLabel()
-        self._last_verified_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        self._last_verified_label.setObjectName('cardActivity')
         self._update_last_verified()
         h_layout.addWidget(self._last_verified_label)
         # Notes section
         notes_label = QLabel('Notes:')
-        notes_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        notes_label.setObjectName('cardActivity')
         h_layout.addWidget(notes_label)
         self._notes_edit = QTextEdit()
+        self._notes_edit.setObjectName('notesEdit')
         self._notes_edit.setPlaceholderText('Add notes about this member…')
         self._notes_edit.setMaximumHeight(60)
-        self._notes_edit.setStyleSheet(
-            f'QTextEdit {{ background: {C.BG_LAYER}; color: {C.TEXT_PRIMARY}; border: 1px solid {C.BORDER}; '
-            f'border-radius: 4px; padding: 4px; font-size: 12px; }}')
         self._notes_edit.setPlainText(self._creator.get('notes', '') or '')
         self._notes_timer = QTimer(self)
         self._notes_timer.setSingleShot(True)
@@ -821,7 +696,7 @@ keeping the UI responsive even with 1000+ videos.
         self._notes_edit.textChanged.connect(self._notes_timer.start)
         h_layout.addWidget(self._notes_edit)
         self._notes_save_label = QLabel('')
-        self._notes_save_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+        self._notes_save_label.setObjectName('countLabel')
         h_layout.addWidget(self._notes_save_label)
         self._notes_save_clear_timer = QTimer(self)
         self._notes_save_clear_timer.setSingleShot(True)
@@ -933,12 +808,14 @@ keeping the UI responsive even with 1000+ videos.
         self._count_label.setText(f'Showing {self._rendered_count} of {total}')
         if self._rendered_count >= total:
             self._load_more_btn.hide()
-            self._count_label.setStyleSheet(f'color: {C.INPUT_PLACEHOLDER}; font-size: 11px; background: transparent;')
+            self._count_label.setProperty('state', 'done')
+            qss_refresh(self._count_label)
         else:
             self._load_more_btn.show()
             remaining = total - self._rendered_count
             self._load_more_btn.setText(f'Load More ({remaining} remaining)')
-            self._count_label.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px; background: transparent;')
+            self._count_label.setProperty('state', 'more')
+            qss_refresh(self._count_label)
 
     def _load_more(self) -> None:
         """Handle the Load More button click — render the next page."""

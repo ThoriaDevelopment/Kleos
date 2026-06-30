@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 from core.db_manager import DatabaseManager
 from ui.dialog_utils import dark_warning, enable_window_maximize
+from ui.geometry import restore_geometry, save_geometry
 from ui.theme import C
 from ui.theme.stylesheet import build_dialog_qss
 
@@ -65,37 +66,11 @@ _PROVIDERS = {
     },
 }
 
-# ── Card button stylesheet ────────────────────────────────────────────
-
-_CARD_QSS = (
-    f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY};'
-    f'  border: 2px solid {C.BORDER}; border-radius: 8px;'
-    f'  padding: 24px 16px; min-height: 100px; font-size: 15px; }}'
-    f'QPushButton:hover {{ background: {C.BG_HOVER}; border-color: {C.ACCENT}; }}'
-    f'QPushButton:pressed {{ background: {C.BG_PRESS}; }}'
-)
-
-_MODEL_CARD_QSS = (
-    f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY};'
-    f'  border: 2px solid {C.BORDER}; border-radius: 6px;'
-    f'  padding: 14px 16px; min-height: 48px; font-size: 14px; }}'
-    f'QPushButton:hover {{ background: {C.BG_HOVER}; border-color: {C.ACCENT}; }}'
-    f'QPushButton:pressed {{ background: {C.BG_PRESS}; }}'
-)
-
-_ACCENT_BTN_QSS = (
-    f'QPushButton {{ background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT};'
-    f'  border: none; border-radius: 4px; padding: 8px 20px; font-weight: bold; }}'
-    f'QPushButton:hover {{ background: {C.ACCENT_HOVER}; }}'
-    f'QPushButton:pressed {{ background: {C.ACCENT_PRESS}; }}'
-    f'QPushButton:disabled {{ background: {C.BG_PRESS}; color: {C.TEXT_MUTED}; }}'
-)
-
-_NAV_BTN_QSS = (
-    f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY};'
-    f'  border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 14px; }}'
-    f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
-)
+# ── Card button styles ────────────────────────────────────────────────
+# These were previously frozen module-level f-strings that captured the
+# import-time theme tokens and never re-evaluated on a theme switch.
+# They now live as object-name rules in build_global_qss() so they follow
+# theme changes live. Set the matching objectName on each button below.
 
 
 class VerifyDialog(QDialog):
@@ -124,10 +99,9 @@ class VerifyDialog(QDialog):
         self.setMinimumWidth(500)
         self.setMinimumHeight(380)
         enable_window_maximize(self)
-        self.setStyleSheet(
-            build_dialog_qss()
-            + f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}\n'
-        )
+        self.reapply_theme()
+        restore_geometry(self, 'VerifyDialog', self._db)
+        self.finished.connect(lambda _r: save_geometry(self, 'VerifyDialog', self._db))
 
         # ── Root layout ────────────────────────────────────────────
         root = QVBoxLayout(self)
@@ -135,7 +109,7 @@ class VerifyDialog(QDialog):
 
         # Title
         title = QLabel('Choose Verification Method')
-        title.setStyleSheet(f'font-size: 16px; font-weight: bold; color: {C.TEXT_PRIMARY}; background: transparent;')
+        title.setObjectName('dialogTitle')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._title_label = title
         root.addWidget(title)
@@ -156,17 +130,24 @@ class VerifyDialog(QDialog):
         nav = QHBoxLayout()
         nav.setSpacing(8)
         self._back_btn = QPushButton('← Back')
-        self._back_btn.setStyleSheet(_NAV_BTN_QSS)
+        self._back_btn.setObjectName('verifyNavBtn')
         self._back_btn.clicked.connect(self._on_back)
         nav.addWidget(self._back_btn)
         nav.addStretch(1)
         cancel_btn = QPushButton('Cancel')
-        cancel_btn.setStyleSheet(_NAV_BTN_QSS)
+        cancel_btn.setObjectName('verifyNavBtn')
         cancel_btn.clicked.connect(self.reject)
         nav.addWidget(cancel_btn)
         root.addLayout(nav)
 
         self._update_nav_buttons()
+
+    def reapply_theme(self) -> None:
+        """Rebuild the dialog stylesheet from current theme tokens."""
+        self.setStyleSheet(
+            build_dialog_qss()
+            + f'QLineEdit::placeholder {{ color: {C.INPUT_PLACEHOLDER}; }}\n'
+        )
 
     # ── Page builders ──────────────────────────────────────────────
 
@@ -180,12 +161,12 @@ class VerifyDialog(QDialog):
         cards.setSpacing(12)
 
         kw_btn = QPushButton('🔑\nKeyword Verify\n\nMatch videos by keywords\n(no AI needed)')
-        kw_btn.setStyleSheet(_CARD_QSS)
+        kw_btn.setObjectName('verifyCard')
         kw_btn.clicked.connect(self._on_method_keyword)
         cards.addWidget(kw_btn)
 
         ai_btn = QPushButton('🤖\nAI Verify\n\nClassify videos using\nAI models')
-        ai_btn.setStyleSheet(_CARD_QSS)
+        ai_btn.setObjectName('verifyCard')
         ai_btn.clicked.connect(self._on_method_ai)
         cards.addWidget(ai_btn)
 
@@ -200,7 +181,7 @@ class VerifyDialog(QDialog):
         layout.setSpacing(10)
 
         kw_label = QLabel('Verification Keywords:')
-        kw_label.setStyleSheet('font-weight: bold; background: transparent;')
+        kw_label.setObjectName('formLabel')
         layout.addWidget(kw_label)
 
         self._keywords_edit = QLineEdit()
@@ -213,7 +194,7 @@ class VerifyDialog(QDialog):
             'Keywords match as case-insensitive whole words in video titles '
             'and descriptions. Separate multiple keywords with commas.'
         )
-        hint.setStyleSheet(f'color: {C.TEXT_MUTED}; font-size: 11px; background: transparent;')
+        hint.setObjectName('hintLabel')
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -225,13 +206,13 @@ class VerifyDialog(QDialog):
         else:
             count_text = f'{count} unverified video{"s" if count != 1 else ""} will be checked.'
         self._kw_count_label = QLabel(count_text)
-        self._kw_count_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 12px; background: transparent;')
+        self._kw_count_label.setObjectName('countLabel')
         layout.addWidget(self._kw_count_label)
 
         layout.addStretch(1)
 
         start_btn = QPushButton('Start Verification')
-        start_btn.setStyleSheet(_ACCENT_BTN_QSS)
+        start_btn.setObjectName('verifyAccentBtn')
         start_btn.clicked.connect(self._on_start_keyword)
         layout.addWidget(start_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -248,7 +229,7 @@ class VerifyDialog(QDialog):
 
         for key, info in _PROVIDERS.items():
             btn = QPushButton(f'{info["icon"]}\n{info["label"]}\n\n{info["subtitle"]}')
-            btn.setStyleSheet(_CARD_QSS)
+            btn.setObjectName('verifyCard')
             btn.clicked.connect(lambda checked, k=key: self._on_provider_selected(k))
             cards.addWidget(btn)
 
@@ -280,7 +261,7 @@ class VerifyDialog(QDialog):
         # Insert cards before the stretch.
         for model_id, model_name, speed in info['models']:
             btn = QPushButton(f'{model_name}  —  {speed}')
-            btn.setStyleSheet(_MODEL_CARD_QSS)
+            btn.setObjectName('verifyModelCard')
             btn.clicked.connect(lambda checked, mid=model_id: self._on_model_selected(mid))
             self._model_layout.insertWidget(self._model_layout.count() - 1, btn)
 

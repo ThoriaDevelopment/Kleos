@@ -10,7 +10,6 @@ from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QGridLayout, QHBoxLayout, QLabel, QMenu, QWidget
 if TYPE_CHECKING:
     from core.db_manager import DatabaseManager
-_ACCENT_R, _ACCENT_G, _ACCENT_B = (QColor(C.ACCENT).red(), QColor(C.ACCENT).green(), QColor(C.ACCENT).blue())
 _SHADOW_INIT = QColor(0, 0, 0, 0)
 
 
@@ -35,7 +34,9 @@ class _SparklineWidget(QWidget):
         for i, val in enumerate(self._data):
             alpha = max(40, min(220, int(40 + 180 * (val / max_val))))
             radius = max(2, min(4, int(2 + 2 * (val / max_val))))
-            painter.setBrush(QColor(_ACCENT_R, _ACCENT_G, _ACCENT_B, alpha))
+            dot = QColor(C.ACCENT)
+            dot.setAlpha(alpha)
+            painter.setBrush(dot)
             painter.setPen(Qt.PenStyle.NoPen)
             center_x = 4 + i * 8
             center_y = 7
@@ -229,21 +230,27 @@ class _RippleOverlay(QWidget):
         r = int(self._radius)
         painter.drawEllipse(self._origin, r, r)
 def card_stylesheet(role_color: str | None=None, focused: bool=False) -> str:
-    """Build a per-card stylesheet from design-system tokens."""
+    """Build the per-card frame stylesheet from design-system tokens.
+
+    This is the dynamic-style escape hatch: the role colour is an arbitrary
+    runtime hex string that cannot be expressed as a static QSS selector, so
+    the card frame (border, background tint, focus ring) is rebuilt here and
+    re-applied by :meth:`CreatorCard.reapply_theme` on theme switches. Child
+    labels are styled by object-name rules in ``build_global_qss`` and so
+    follow theme changes automatically without this call.
+    """
     base = f'border-radius: 6px; padding: 4px; background: {C.CARD_BG};'
     if focused:
         base += f' border: 2px solid {C.ACCENT};'
-    child = f'CreatorCard QLabel {{ background: transparent; color: {C.TEXT_PRIMARY}; }}CreatorCard QWidget {{ background: transparent; }}'
+    child = 'CreatorCard QWidget { background: transparent; }'
     if not role_color:
         return f'CreatorCard {{ {base} }}' + child
-    else:
-        c = QColor(role_color)
-        if not c.isValid():
-            return f'CreatorCard {{ {base} }}' + child
-        else:
-            border = c.name()
-            bg = QColor(c.red(), c.green(), c.blue(), 30).name(QColor.NameFormat.HexArgb)
-            return f'CreatorCard {{ {base} border-left: 4px solid {border}; background: {bg}; }}' + child
+    c = QColor(role_color)
+    if not c.isValid():
+        return f'CreatorCard {{ {base} }}' + child
+    border = c.name()
+    bg = QColor(c.red(), c.green(), c.blue(), 30).name(QColor.NameFormat.HexArgb)
+    return f'CreatorCard {{ {base} border-left: 4px solid {border}; background: {bg}; }}' + child
 class CreatorCardAnimMixin:
     """Mixin providing hover animation using design-system motion tokens."""
     def enterEvent(self, event) -> None:
@@ -283,7 +290,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
     role_change_requested = pyqtSignal(int, int)
     tags_changed = pyqtSignal(int)
 
-    def __init__(self, creator: dict[str, Any], role: dict[str, Any] | None, last_activity: str, has_new_activity: bool, subscriber_text: str='N/A', roles: list[dict[str, Any]] | None=None, activity_data: list[int] | None=None, parent: QWidget | None=None) -> None:
+    def __init__(self, creator: dict[str, Any], role: dict[str, Any] | None, last_activity: str, has_new_activity: bool, subscriber_text: str='N/A', roles: list[dict[str, Any]] | None=None, activity_data: list[int] | None=None, trend: str='none', parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self._creator = creator
         self._role = role
@@ -292,7 +299,9 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._subscriber_text = subscriber_text
         self._roles = roles or []
         self._activity_data = activity_data or []
+        self._trend = trend if trend in ('up', 'down', 'flat', 'none') else 'none'
         self._hover_anim = None
+        self._focused = False
         self._shadow_timer = QTimer(self)
         self._shadow_timer.setSingleShot(False)
         self._shadow_timer.setInterval(16)
@@ -316,6 +325,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         role_color = self._role.get('role_color') if self._role else None
         self.setStyleSheet(card_stylesheet(role_color))
         self._build_ui()
+        self._refresh_trend_label()
     def _build_ui(self) -> None:
         """\nGrid columns (fixed widths keep all rows in perfect alignment):\n\n  col 0  nickname        stretch\n  col 1  avatar          32 px\n  col 2  platform tag   120 px\n  col 3  subscriber      130 px\n  col 4  alert icon      24 px  ← always present, hidden when unused\n  col 5  sparkline       64 px  ← activity dots\n  col 6  last activity  140 px\n  col 7  duration        90 px\n"""
         grid = QGridLayout(self)
@@ -326,13 +336,12 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         name_font.setPointSize(11)
         self._name_label = QLabel(self._creator.get('nickname', 'Unknown'))
         self._name_label.setFont(name_font)
-        self._name_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; background: transparent;')
+        self._name_label.setObjectName('cardName')
         grid.addWidget(self._name_label, 0, 0)
         grid.setColumnStretch(0, 1)
         self._avatar_label = QLabel()
         self._avatar_label.setFixedSize(28, 28)
         self._avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._avatar_label.setStyleSheet('background: transparent;')
         self._load_avatar()
         grid.addWidget(self._avatar_label, 0, 1)
         grid.setColumnMinimumWidth(1, 32)
@@ -343,19 +352,19 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         tag_text = _platform_label(platforms)
         self._platform_label = QLabel(tag_text)
         self._platform_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._platform_label.setStyleSheet(f'background: {C.BG_HOVER}; border-radius: 4px; padding: 2px 10px; font-size: 11px; color: {C.TEXT_SECONDARY};')
+        self._platform_label.setObjectName('cardPlatformTag')
         grid.addWidget(self._platform_label, 0, 2)
         grid.setColumnMinimumWidth(2, 120)
         self._sub_label = QLabel(self._subscriber_text)
         self._sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_label.setStyleSheet(f'color: {C.TEXT_SECONDARY}; font-size: 11px; background: transparent;')
+        self._sub_label.setObjectName('cardSubs')
         grid.addWidget(self._sub_label, 0, 3)
         grid.setColumnMinimumWidth(3, 130)
         self._review_dot = QLabel('⚠')
         self._review_dot.setFixedWidth(24)
         self._review_dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._review_dot.setToolTip('New activity — click to inspect')
-        self._review_dot.setStyleSheet(f'color: {C.DANGER}; font-size: 16px; background: transparent;')
+        self._review_dot.setObjectName('cardAlert')
         self._review_dot.setVisible(self._has_new_activity)
         grid.addWidget(self._review_dot, 0, 4)
         grid.setColumnMinimumWidth(4, 24)
@@ -365,35 +374,44 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         grid.setColumnMinimumWidth(5, 64)
         self._activity_label = QLabel(relative_time(self._last_activity_iso))
         self._activity_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._activity_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        self._activity_label.setObjectName('cardActivity')
         grid.addWidget(self._activity_label, 0, 6)
         grid.setColumnMinimumWidth(6, 140)
         date_added = self._creator.get('date_added', '')
         self._duration_label = QLabel(membership_duration(date_added))
         self._duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._duration_label.setStyleSheet(f'color: {C.TEXT_PRIMARY}; font-size: 11px; background: transparent;')
+        self._duration_label.setObjectName('cardActivity')
         grid.addWidget(self._duration_label, 0, 7)
         grid.setColumnMinimumWidth(7, 90)
-        # Tags row
+        # Tags row (always placed in the grid; shown only when there are tags
+        # so refresh_tags() can reveal it later without touching the layout).
         self._tags_row = QWidget(self)
-        self._tags_row.setStyleSheet('background: transparent;')
         tags_layout = QHBoxLayout(self._tags_row)
         tags_layout.setContentsMargins(0, 0, 0, 0)
         tags_layout.setSpacing(4)
         tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(self._tags_row, 1, 0, 1, 8)
+        self._render_tags()
+    def _render_tags(self) -> None:
+        """Rebuild the tag chips from the creator's current ``tags`` value.
+
+        Clears ``self._tags_row`` and repopulates it, hiding the row when
+        there are no tags.  Called at construction and after any tag edit.
+        """
+        layout = self._tags_row.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         try:
             tags = json.loads(self._creator.get('tags', '[]'))
         except (json.JSONDecodeError, TypeError):
             tags = []
         for tag in tags:
             chip = QLabel(tag)
-            chip.setStyleSheet(
-                f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; '
-                f'border-radius: 8px; padding: 1px 6px; font-size: 10px;'
-            )
-            tags_layout.addWidget(chip)
-        if tags:
-            grid.addWidget(self._tags_row, 1, 0, 1, 8)
+            chip.setObjectName('tagChip')
+            layout.addWidget(chip)
+        self._tags_row.setVisible(bool(tags))
     def _load_avatar(self) -> None:
         pfp = self._creator.get('pfp_url')
         if pfp:
@@ -431,7 +449,9 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
                     new_blur = start_blur + (blur_target - start_blur) * t
                     new_alpha = int(start_alpha + (alpha_target - start_alpha) * t)
                     self._shadow.setBlurRadius(new_blur)
-                    self._shadow.setColor(QColor(_ACCENT_R, _ACCENT_G, _ACCENT_B, new_alpha))
+                    shadow_color = QColor(C.ACCENT)
+                    shadow_color.setAlpha(new_alpha)
+                    self._shadow.setColor(shadow_color)
                     step_ref[0] += 1
                     if step_ref[0] >= steps:
                         self._shadow_timer.stop()
@@ -510,11 +530,6 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._review_dot.setVisible(visible)
     def _show_context_menu(self, pos) -> None:
         menu = QMenu(self)
-        menu.setStyleSheet(
-            f'QMenu {{ background-color: {C.BG_RAISED}; border: 1px solid {C.BORDER}; }}'
-            f'QMenu::item {{ color: {C.TEXT_PRIMARY}; padding: 6px 20px; }}'
-            f'QMenu::item:selected {{ background-color: {C.BG_HOVER}; color: {C.TEXT_PRIMARY}; }}'
-        )
         edit_nick = QAction('Edit Nickname', self)
         edit_nick.triggered.connect(lambda: self.edit_requested.emit(self._creator['id'], 'nickname', self._creator.get('nickname', '')))
         menu.addAction(edit_nick)
@@ -527,7 +542,6 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         # Change Role submenu
         if self._roles:
             role_menu = QMenu('Change Role', self)
-            role_menu.setStyleSheet(menu.styleSheet())
             current_role_id = self._creator.get('role_id')
             for r in self._roles:
                 action = role_menu.addAction(r['role_name'])
@@ -612,7 +626,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
 
     def focusInEvent(self, event) -> None:  # noqa: N802
         super().focusInEvent(event)
-        # Add focus ring
+        self._focused = True
         self.setStyleSheet(card_stylesheet(
             self._role.get('role_color') if self._role else None,
             focused=True,
@@ -620,10 +634,69 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
 
     def focusOutEvent(self, event) -> None:  # noqa: N802
         super().focusOutEvent(event)
+        self._focused = False
         self.setStyleSheet(card_stylesheet(
             self._role.get('role_color') if self._role else None,
             focused=False,
         ))
+
+    def reapply_theme(self) -> None:
+        """Re-apply token-driven styling after a theme switch (in place).
+
+        The card frame uses the dynamic ``card_stylesheet`` (role colour is a
+        runtime value), so it must be rebuilt here. Child labels are styled by
+        object-name rules in the global stylesheet and update automatically;
+        the sparkline repaints from the live accent on its next paint.
+        """
+        if sip.isdeleted(self):
+            return
+        self.setStyleSheet(card_stylesheet(
+            self._role.get('role_color') if self._role else None,
+            focused=self._focused,
+        ))
+        self._sparkline.update()
+        # Re-color the trend glyph from live theme tokens.
+        self._refresh_trend_label()
+        self.update()
+
+    # ── Subscriber trend arrow ────────────────────────────────────────
+
+    _TREND_GLYPH = {'up': '▲', 'down': '▼', 'flat': '◆', 'none': ''}
+    _TREND_COLOR = {'up': 'SUCCESS', 'down': 'DANGER', 'flat': 'TEXT_MUTED', 'none': 'TEXT_MUTED'}
+    _TREND_TIP = {
+        'up': 'Subscribers trending up over the last week',
+        'down': 'Subscribers trending down over the last week',
+        'flat': 'Subscriber count stable over the last week',
+        'none': 'No trend data yet',
+    }
+
+    def set_trend(self, arrow: str) -> None:
+        """Set the subscriber trend arrow ('up'|'down'|'flat'|'none')."""
+        self._trend = arrow if arrow in ('up', 'down', 'flat', 'none') else 'none'
+        self._refresh_trend_label()
+
+    def _refresh_trend_label(self) -> None:
+        """Render the trend glyph as a coloured suffix on the subscriber label.
+
+        Uses rich text so the glyph can take a trend-specific colour while the
+        subscriber count keeps the ``cardSubs`` stylesheet colour. Re-reads the
+        colour token each call so a theme switch recolours the glyph in place.
+        """
+        if sip.isdeleted(self) or not hasattr(self, '_sub_label'):
+            return
+        glyph = self._TREND_GLYPH.get(self._trend, '')
+        if not glyph:
+            self._sub_label.setTextFormat(Qt.TextFormat.PlainText)
+            self._sub_label.setText(self._subscriber_text)
+            self._sub_label.setToolTip('')
+            return
+        color_attr = self._TREND_COLOR.get(self._trend, 'TEXT_MUTED')
+        color = getattr(C, color_attr, C.TEXT_MUTED)
+        self._sub_label.setTextFormat(Qt.TextFormat.RichText)
+        self._sub_label.setText(
+            f'{self._subscriber_text} <span style="color:{color};"> {glyph}</span>'
+        )
+        self._sub_label.setToolTip(self._TREND_TIP.get(self._trend, ''))
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
@@ -678,7 +751,7 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
                 break
             scroll = scroll.parent()
 
-    def update_data(self, creator: dict, role: dict | None, last_activity: str, has_new_activity: bool, subscriber_text: str, roles: list | None = None, activity_data: list[int] | None = None) -> None:
+    def update_data(self, creator: dict, role: dict | None, last_activity: str, has_new_activity: bool, subscriber_text: str, roles: list | None = None, activity_data: list[int] | None = None, trend: str | None = None) -> None:
         """Update this card's data in-place without destroying/recreating the widget."""
         self._creator = creator
         self._role = role
@@ -690,31 +763,28 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         # Update visible widgets
         self._name_label.setText(creator.get('nickname', 'Unknown'))
         self._activity_label.setText(relative_time(last_activity))
-        self._sub_label.setText(subscriber_text)
         self._review_dot.setVisible(has_new_activity)
         self._load_avatar()
         if activity_data is not None:
             self._sparkline.update_data(activity_data)
+        if trend is not None:
+            self.set_trend(trend)
+        else:
+            self._refresh_trend_label()
         # Update role color stylesheet
         role_color = role.get('role_color') if role else None
         self.setStyleSheet(card_stylesheet(role_color))
         # Update tags row
-        try:
-            tags = json.loads(creator.get('tags', '[]'))
-        except (json.JSONDecodeError, TypeError):
-            tags = []
-        # Clear existing tag chips
-        while self._tags_row.layout().count():
-            item = self._tags_row.layout().takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        for tag in tags:
-            chip = QLabel(tag)
-            chip.setStyleSheet(
-                f'background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; '
-                f'border-radius: 8px; padding: 1px 6px; font-size: 10px;'
-            )
-            self._tags_row.layout().addWidget(chip)
+        self._render_tags()
+
+    def refresh_tags(self) -> None:
+        """Rebuild tag chips from the current creator record (no data reload).
+
+        Use after the creator's ``tags`` field has been mutated in place,
+        e.g. from the tag-management dialog, to refresh the chips without a
+        full card rebuild.
+        """
+        self._render_tags()
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button()!= Qt.MouseButton.LeftButton:
             event.accept()

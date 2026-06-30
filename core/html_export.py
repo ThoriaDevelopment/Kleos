@@ -12,10 +12,12 @@ from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Any
 
+from matplotlib.dates import date2num
 from matplotlib.figure import Figure
 
 from core.db_manager import DatabaseManager
 from core.report_generator import generate_report, _build_filter_clause, _filter_label
+from ui.chart_common import series_colors, smooth_mpl_patch
 from ui.components.creator_card import _compact_number
 from ui.theme.tokens import C
 
@@ -41,12 +43,6 @@ _PALETTE: dict[str, str] = {
     'danger':          C.DANGER,
     'success':         C.SUCCESS,
 }
-
-# Multi-creator line chart colours (cycled)
-_CHART_COLORS = [
-    C.ACCENT, '#9B59B6', '#2ECC71', '#E74C3C', '#F39C12',
-    '#1ABC9C', '#E67E22', '#3498DB',
-]
 
 # ---------------------------------------------------------------------------
 # Inline CSS (embedded in every generated page)
@@ -196,6 +192,8 @@ def _generate_timeline_svg(
 
     fig = Figure(figsize=(8, 4), dpi=100)
     ax = fig.add_subplot(111)
+    colors = series_colors()
+    plotted = False
     for i, (nick, points) in enumerate(by_creator.items()):
         dates = []
         views = []
@@ -207,9 +205,14 @@ def _generate_timeline_svg(
             except (ValueError, TypeError):
                 pass
         if dates:
-            ax.plot(dates, views, marker='o', markersize=3, label=nick,
-                    color=_CHART_COLORS[i % len(_CHART_COLORS)], linewidth=1.5)
-    if not ax.lines:
+            color = colors[i % len(colors)]
+            patch = smooth_mpl_patch(date2num(dates), views, color,
+                                     floor=0.0, linewidth=1.5, label=nick, zorder=3)
+            if patch is not None:
+                ax.add_patch(patch)
+                plotted = True
+            ax.scatter(dates, views, marker='o', s=9, color=color, zorder=4)
+    if not plotted:
         fig.clear()
         return ''
 
@@ -373,15 +376,11 @@ def generate_html_report(
     total_uploads = 0
     creator_cards: list[str] = []
 
+    # One grouped query instead of an N+1 loop over creators.
+    media_stats = db.bulk_media_stats(content_clause, date_clause)
     for c in creators:
         cid = c['id']
-        rows = db._read(
-            f"SELECT COALESCE(SUM(view_count), 0) AS views, COUNT(*) AS count "
-            f"FROM media_content WHERE creator_id = ? {content_clause} {date_clause}",
-            (cid,),
-        )
-        views = rows[0]['views'] if rows else 0
-        count = rows[0]['count'] if rows else 0
+        views, count = media_stats.get(cid, (0, 0))
         total_views += views
         total_uploads += count
 
