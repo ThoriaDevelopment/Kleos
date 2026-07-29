@@ -12,7 +12,51 @@ from PyQt6.QtCore import QObject, pyqtSignal
 # set on class C below.
 
 THEMES: dict[str, dict[str, Any]] = {
+    # ── Default (Kleos Soft) ── warm paper white + softened brick red,
+    #    aligned to the Kleos website (thoria.fyi/Kleos) palette but toned
+    #    down so pure red-on-white isn't harsh on the eyes.  Light theme.
     'default': {
+        'BG_DEEP':           '#EDE9E4',
+        'BG_BASE':           '#F7F5F2',
+        'BG_LAYER':          '#FBFAF8',
+        'BG_RAISED':         '#FFFFFF',
+        'BG_FLOAT':          '#FFFFFF',
+        'BG_HOVER':          '#EDE9E4',
+        'BG_PRESS':          '#E2DDD6',
+        'TEXT_PRIMARY':      '#1A1A1A',
+        'TEXT_SECONDARY':    '#484B4F',
+        'TEXT_MUTED':        '#8A8A8E',
+        'ACCENT':            '#C83232',
+        'ACCENT_HOVER':      '#D74747',
+        'ACCENT_PRESS':      '#A82626',
+        'BORDER':            '#E2DDD6',
+        'DANGER':            '#9B1C1C',
+        'SUCCESS':           '#2E7D32',
+        'INPUT_BG':          '#FFFFFF',
+        'INPUT_BORDER':      '#E2DDD6',
+        'INPUT_PLACEHOLDER': 'rgba(26,26,26,0.4)',
+        'CHECK_ACCENT':      '#A82626',
+        'TEXT_ON_ACCENT':    '#FFFFFF',
+        'AVATAR_BG':         '#E2DDD6',
+        'AVATAR_FG':         '#484B4F',
+        'DIALOG_BG':         '#FFFFFF',
+        'CARD_BG':           '#FFFFFF',
+        'VERIFY_GREEN':      '#2E7D32',
+        'VERIFY_GREEN_HOVER': '#388E3C',
+        'DANGER_RED_BG':     '#F5E8E8',
+        'DANGER_RED_BORDER': '#E1BBBB',
+        'ACCENT_BLUE':       '#C83232',
+        'ACCENT_BLUE_BG':    '#FAEAEA',
+        'ACCENT_BLUE_BORDER':'#EEC1C1',
+        'TOPBAR_BG':         'rgba(247,245,242,0.88)',
+        'SERIES_COLORS':     ['#C83232', '#2B2B2B', '#2563EB', '#B45309',
+                              '#2E7D32', '#6D28D9', '#0E7490', '#BE185D'],
+    },
+
+    # ── Midnight Blue ── the previous dark default, preserved as a pickable
+    #    theme so existing users who prefer the dark blue/grey look can switch
+    #    back from Settings → Appearance.
+    'midnight_blue': {
         'BG_DEEP':           '#09090C',
         'BG_BASE':           '#0F0F14',
         'BG_LAYER':          '#141418',
@@ -247,7 +291,8 @@ THEMES: dict[str, dict[str, Any]] = {
 }
 
 THEME_NAMES: dict[str, str] = {
-    'default':        'Default',
+    'default':        'Default (Kleos Soft)',
+    'midnight_blue':  'Midnight Blue',
     'biophilic':      'Biophilic',
     'frutiger_aero':  'Frutiger Aero',
     'dorfic':         'DORFic',

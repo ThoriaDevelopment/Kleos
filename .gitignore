@@ -143,6 +143,12 @@ cython_debug/
 # Kleos-specific local data
 .claude/
 .kleos/
+# Fetched third-party skills stay local-only (extracted from the Claude Code
+# bundled-skills archive, not MIT-relicensable — do not commit). The .claude/
+# line above already covers these; kept explicit for documentation.
+.claude/skills/code-review/
+.claude/skills/security-review/
+.claude/skills/dataviz/
 *.db
 *.db-shm
 *.db-wal
@@ -154,6 +160,11 @@ dist/
 
 # Installer output
 Kleos-Setup.exe
+
+# Node (local tooling experiments, not part of the Python app)
+node_modules/
+package.json
+package-lock.json
 
 # OS files
 .DS_Store

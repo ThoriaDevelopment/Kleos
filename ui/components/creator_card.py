@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from ui.theme import C, M
+from ui.dialog_utils import compact_count as _compact_number
 from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt, QTimer, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPixmap
@@ -122,14 +123,6 @@ def _platform_label(platforms: list[str]) -> str:
             return 'Creator'
         else:
             return 'Unknown'
-
-def _compact_number(n: int) -> str:
-    """Format a number in compact form: 1200 → 1.2K, 1500000 → 1.5M."""
-    if n >= 1_000_000:
-        return f'{n / 1_000_000:.1f}M'
-    if n >= 1_000:
-        return f'{n / 1_000:.1f}K'
-    return str(n)
 
 def format_subscriber_count(yt_subs: int = 0, tw_follows: int = 0) -> str:
     """Format subscriber/follower counts for display on cards and headers.

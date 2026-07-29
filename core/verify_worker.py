@@ -4,7 +4,6 @@ Claude API or Google Gemini API.
 Communicates **exclusively** via signals — no GUI code lives here.
 """
 from __future__ import annotations
-import json
 import logging
 import threading
 import time
@@ -25,6 +24,7 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
+from .ai_client import is_gemini_model, load_ai_api_key
 from .db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class VerifyWorker(QThread):
         self._cancel.set()
 
     def run(self) -> None:
-        is_gemini = self._model.startswith('gemini-')
+        is_gemini = is_gemini_model(self._model)
 
         # Check that the required SDK is installed.
         if is_gemini:
@@ -122,14 +122,9 @@ class VerifyWorker(QThread):
                 )
                 return
 
-        # Read the appropriate API key.
-        key_field = 'gemini' if is_gemini else 'anthropic'
-        raw = self._db.get_global_setting("api_keys_json") or "{}"
-        try:
-            parsed = json.loads(raw)
-            api_key = parsed.get(key_field, "").strip() if isinstance(parsed, dict) else ""
-        except (json.JSONDecodeError, AttributeError):
-            api_key = ""
+        # Read the appropriate API key (shared loader — same logic the
+        # Discover AI workers use, so the key source stays consistent).
+        api_key, _err = load_ai_api_key(self._db, self._model)
         if not api_key:
             self.api_key_missing.emit()
             return

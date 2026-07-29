@@ -19,6 +19,15 @@ _BACKUP_DEBOUNCE_S = 60.0
 _PROFILE_RE = re.compile(r'^[A-Za-z0-9 _-]+$')
 
 
+def _utc_now() -> str:
+    """Return the current UTC time as an ISO 8601 string (``Z`` suffix).
+
+    Matches the ``strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`` SQL defaults
+    used across the schema so Python-side and DB-side timestamps agree.
+    """
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 def _validate_profile_name(name: str) -> None:
     """Raise ValueError if *name* contains path separators or unsafe chars."""
     if not name or not _PROFILE_RE.match(name):
@@ -59,14 +68,14 @@ def _write_global_settings(settings: dict[str, str]) -> None:
             pass
         raise
 _SCHEMA = '\nCREATE TABLE IF NOT EXISTS settings (\n    key     TEXT PRIMARY KEY,\n    value   TEXT NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS roles (\n    id          INTEGER PRIMARY KEY AUTOINCREMENT,\n    role_name   TEXT    NOT NULL UNIQUE,\n    role_color  TEXT    NOT NULL\n);\n\nCREATE TABLE IF NOT EXISTS creators (\n    id            INTEGER PRIMARY KEY AUTOINCREMENT,\n    nickname      TEXT    NOT NULL,\n    platforms     TEXT    NOT NULL DEFAULT \'[]\',\n    role_id       INTEGER NOT NULL,\n    youtube_type  TEXT,\n    youtube_channel_id TEXT,\n    youtube_link  TEXT,\n    twitch_link   TEXT,\n    pfp_url       TEXT,\n    date_added       TEXT    NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')),\n    is_new_activity  INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE RESTRICT\n);\n\nCREATE TABLE IF NOT EXISTS media_content (\n    id              INTEGER PRIMARY KEY AUTOINCREMENT,\n    creator_id      INTEGER NOT NULL,\n    platform        TEXT    NOT NULL CHECK(platform IN (\'youtube\', \'twitch\')),\n    content_id      TEXT    NOT NULL UNIQUE,\n    title           TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_path  TEXT    NOT NULL DEFAULT \'\',\n    thumbnail_url   TEXT    NOT NULL DEFAULT \'\',\n    upload_date     TEXT    NOT NULL DEFAULT \'\',\n    view_count      INTEGER NOT NULL DEFAULT 0,\n    is_verified     INTEGER NOT NULL DEFAULT 0,\n    is_short        INTEGER NOT NULL DEFAULT 0,\n    is_stream       INTEGER NOT NULL DEFAULT 0,\n    type_override   TEXT    DEFAULT NULL,\n    description     TEXT    NOT NULL DEFAULT \'\',\n    FOREIGN KEY (creator_id) REFERENCES creators(id) ON DELETE CASCADE\n);\n\nCREATE INDEX IF NOT EXISTS idx_media_creator  ON media_content(creator_id);\nCREATE INDEX IF NOT EXISTS idx_media_platform  ON media_content(platform);\nCREATE INDEX IF NOT EXISTS idx_content_id      ON media_content(content_id);\n'
-_SCHEMA_VERSION = 7  # Increment when adding new migrations
+_SCHEMA_VERSION = 8  # Increment when adding new migrations
 
 # Migrate old invalid Anthropic model IDs to valid API identifiers.
 _MODEL_ID_MIGRATION = {
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
 }
 
-_DEFAULT_SETTINGS = {'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'verify_keywords': '', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notification_view_thresholds': '10000,100000,1000000'}
+_DEFAULT_SETTINGS = {'community_name': '', 'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'verify_keywords': '', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notification_view_thresholds': '10000,100000,1000000', 'discover_sub_ceiling': '0', 'discover_min_subscribers': '0', 'discover_min_views_per_sub': '10', 'discover_default_sort': 'potential', 'discover_shorts': 'ask', 'discover_notifications': '1'}
 class DatabaseManager:
     """Thread-safe SQLite manager with profile switching and auto-backup.
 
@@ -248,6 +257,71 @@ class DatabaseManager:
                     'ON alerts(creator_id, alert_type, threshold)'
                 )
                 conn.execute('DROP TABLE alerts_old_v6')
+        if version == 8:
+            # v7→v8: Market Research / Recruitment.  Four new tables for the
+            # Discover feature — all per-profile, isolated from the tracked
+            # roster.  See core/discover_worker.py and ui/discover_window.py.
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS search_cache ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'query_hash TEXT NOT NULL, '
+                'params_json TEXT NOT NULL, '
+                'created_at TEXT NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')), '
+                'results_json TEXT NOT NULL DEFAULT \'[]\')'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_search_cache_hash '
+                'ON search_cache(query_hash)'
+            )
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS discovered_creators ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'channel_id TEXT NOT NULL UNIQUE, '
+                'handle TEXT NOT NULL DEFAULT \'\', '
+                'title TEXT NOT NULL DEFAULT \'\', '
+                'pfp_url TEXT NOT NULL DEFAULT \'\', '
+                'subscriber_count INTEGER NOT NULL DEFAULT 0, '
+                'view_count INTEGER NOT NULL DEFAULT 0, '
+                'video_count INTEGER NOT NULL DEFAULT 0, '
+                'cadence_per_week REAL NOT NULL DEFAULT 0, '
+                'growth_signal REAL NOT NULL DEFAULT 0, '
+                'engagement REAL NOT NULL DEFAULT 0, '
+                'niche_fit REAL NOT NULL DEFAULT 0, '
+                'views_per_sub REAL NOT NULL DEFAULT 0, '
+                'potential_score INTEGER NOT NULL DEFAULT 0, '
+                'recent_titles_json TEXT NOT NULL DEFAULT \'[]\', '
+                'is_short_channel INTEGER NOT NULL DEFAULT 0, '
+                'first_discovered_at TEXT NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')), '
+                'last_refreshed_at TEXT NOT NULL DEFAULT \'\')'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_discovered_channel '
+                'ON discovered_creators(channel_id)'
+            )
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS candidate_pool ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'channel_id TEXT NOT NULL UNIQUE, '
+                'notes TEXT NOT NULL DEFAULT \'\', '
+                'flagged_at TEXT NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')), '
+                'last_updated_at TEXT NOT NULL DEFAULT \'\', '
+                'FOREIGN KEY (channel_id) REFERENCES discovered_creators(channel_id) ON DELETE CASCADE)'
+            )
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS ai_evaluations ('
+                'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+                'channel_id TEXT NOT NULL, '
+                'provider TEXT NOT NULL, '
+                'model TEXT NOT NULL, '
+                'verdict TEXT NOT NULL DEFAULT \'\', '
+                'rationale TEXT NOT NULL DEFAULT \'\', '
+                'created_at TEXT NOT NULL DEFAULT (strftime(\'%Y-%m-%dT%H:%M:%SZ\', \'now\')), '
+                'FOREIGN KEY (channel_id) REFERENCES discovered_creators(channel_id) ON DELETE CASCADE)'
+            )
+            conn.execute(
+                'CREATE INDEX IF NOT EXISTS idx_ai_eval_channel '
+                'ON ai_evaluations(channel_id, created_at DESC)'
+            )
     @property
     def profile(self) -> str:
         return self._profile
@@ -1273,6 +1347,270 @@ class DatabaseManager:
             self.set_setting(f'yt_channel_views_{new_id}', str(stats['youtube_views']))
         if 'twitch_followers' in stats:
             self.set_setting(f'twitch_followers_{new_id}', str(stats['twitch_followers']))
+        return new_id
+
+    # ── Discover / Market Research ────────────────────────────────────
+    # All Discover data is per-profile and isolated from the tracked
+    # roster.  ``search_cache`` stores raw API results keyed by a hash of
+    # the query params so re-running the same search costs 0 quota units.
+    # ``discovered_creators`` holds scored channels.  ``candidate_pool``
+    # is the flagged subset with outreach notes.  ``ai_evaluations`` is a
+    # log of on-demand AI verdicts per channel.
+
+    def get_cached_search(self, query_hash: str) -> dict[str, Any] | None:
+        """Return a cached search result by query hash, or None."""
+        rows = self._read(
+            'SELECT id, params_json, results_json, created_at '
+            'FROM search_cache WHERE query_hash = ? ORDER BY id DESC LIMIT 1',
+            (query_hash,),
+        )
+        if rows:
+            row = rows[0]
+            try:
+                row['results'] = json.loads(row['results_json'])
+                row['params'] = json.loads(row['params_json'])
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return row
+        return None
+
+    def save_cached_search(self, query_hash: str, params_json: str, results_json: str) -> None:
+        """Persist a search result so re-running the same query is free."""
+        self._write(
+            'INSERT INTO search_cache (query_hash, params_json, results_json) VALUES (?, ?, ?)',
+            (query_hash, params_json, results_json),
+        )
+
+    def list_cached_searches(self) -> list[dict[str, Any]]:
+        """Return a summary of cached searches (id, created_at).
+
+        Deliberately omits the ``results_json`` blob — callers (the cache
+        status label in Settings/Discover) only need the count and the
+        timestamps, so loading the full JSON payload for every cached
+        search would be wasted work as the cache grows.
+        """
+        return self._read(
+            'SELECT id, created_at FROM search_cache ORDER BY id DESC'
+        )
+
+    def count_cached_searches(self) -> int:
+        """Return the number of cached searches (cheap COUNT, no payload)."""
+        rows = self._read('SELECT COUNT(*) AS n FROM search_cache')
+        return int(rows[0]['n']) if rows else 0
+
+    def is_candidate_flagged(self, channel_id: str) -> bool:
+        """Cheap EXISTS check for one channel's flag state.
+
+        Used per flag-toggle instead of loading the full candidate pool
+        (which joins discovered_creators) just to test membership.
+        """
+        if not channel_id:
+            return False
+        rows = self._read(
+            'SELECT 1 FROM candidate_pool WHERE channel_id = ? LIMIT 1',
+            (channel_id,),
+        )
+        return bool(rows)
+
+    def tracked_channel_ids(self) -> set[str]:
+        """Return the set of YouTube channel IDs already on the roster.
+
+        Shared by the discover workers so they don't each re-implement the
+        loop over ``get_creators()``.
+        """
+        ids: set[str] = set()
+        for c in self.get_creators():
+            cid = c.get('youtube_channel_id')
+            if cid:
+                ids.add(cid)
+        return ids
+
+    def clear_discover_cache(self) -> int:
+        """Delete all cached search results.  Returns the number deleted.
+
+        Flagged candidates (candidate_pool) and their discovered_creators
+        rows are preserved so outreach notes survive a cache clear.
+        """
+        cur = self._write('DELETE FROM search_cache')
+        # Also drop discovered_creators that are NOT flagged — flagged ones
+        # are kept because candidate_pool references them via FK.
+        self._write(
+            'DELETE FROM discovered_creators WHERE channel_id NOT IN '
+            '(SELECT channel_id FROM candidate_pool)'
+        )
+        return cur.rowcount
+
+    def upsert_discovered_creator(self, data: dict[str, Any]) -> None:
+        """Insert or update a discovered channel by channel_id.
+
+        Preserves flagged/notes state in candidate_pool (joined by
+        channel_id) and does not touch first_discovered_at on update.
+        """
+        cols = (
+            'channel_id, handle, title, pfp_url, subscriber_count, view_count, '
+            'video_count, cadence_per_week, growth_signal, engagement, niche_fit, '
+            'views_per_sub, potential_score, recent_titles_json, is_short_channel, '
+            'last_refreshed_at'
+        )
+        placeholders = '?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?'
+        vals = (
+            data['channel_id'], data.get('handle', ''), data.get('title', ''),
+            data.get('pfp_url', ''), int(data.get('subscriber_count', 0)),
+            int(data.get('view_count', 0)), int(data.get('video_count', 0)),
+            float(data.get('cadence_per_week', 0.0)), float(data.get('growth_signal', 0.0)),
+            float(data.get('engagement', 0.0)), float(data.get('niche_fit', 0.0)),
+            float(data.get('views_per_sub', 0.0)), int(data.get('potential_score', 0)),
+            json.dumps(data.get('recent_titles', [])), int(data.get('is_short_channel', 0)),
+            data.get('last_refreshed_at', ''),
+        )
+        self._write(
+            f'INSERT INTO discovered_creators ({cols}) VALUES ({placeholders}) '
+            'ON CONFLICT(channel_id) DO UPDATE SET '
+            'handle=excluded.handle, title=excluded.title, pfp_url=excluded.pfp_url, '
+            'subscriber_count=excluded.subscriber_count, view_count=excluded.view_count, '
+            'video_count=excluded.video_count, cadence_per_week=excluded.cadence_per_week, '
+            'growth_signal=excluded.growth_signal, engagement=excluded.engagement, '
+            'niche_fit=excluded.niche_fit, views_per_sub=excluded.views_per_sub, '
+            'potential_score=excluded.potential_score, '
+            'recent_titles_json=excluded.recent_titles_json, '
+            'is_short_channel=excluded.is_short_channel, '
+            'last_refreshed_at=excluded.last_refreshed_at',
+            vals,
+        )
+
+    def get_discovered_creators(self, sort: str = 'potential', limit: int | None = None) -> list[dict[str, Any]]:
+        """Return discovered creators, sorted.  Joins candidate_pool to
+        expose is_flagged + notes for the UI without a second query."""
+        order = {
+            'potential': 'potential_score DESC',
+            'views_per_sub': 'views_per_sub DESC',
+            'subscribers': 'subscriber_count ASC',
+            'views': 'view_count DESC',
+            'cadence': 'cadence_per_week DESC',
+        }.get(sort, 'potential_score DESC')
+        sql = (
+            'SELECT d.*, '
+            'CASE WHEN c.channel_id IS NOT NULL THEN 1 ELSE 0 END AS is_flagged, '
+            'COALESCE(c.notes, \'\') AS notes '
+            'FROM discovered_creators d '
+            'LEFT JOIN candidate_pool c ON c.channel_id = d.channel_id '
+            f'ORDER BY {order}'
+        )
+        rows = self._read(sql)
+        for r in rows:
+            try:
+                r['recent_titles'] = json.loads(r.get('recent_titles_json', '[]'))
+            except (json.JSONDecodeError, TypeError):
+                r['recent_titles'] = []
+            r['is_short_channel'] = bool(r.get('is_short_channel', 0))
+            r['is_flagged'] = bool(r.get('is_flagged', 0))
+        if limit is not None:
+            rows = rows[:limit]
+        return rows
+
+    def get_discovered_creator(self, channel_id: str) -> dict[str, Any] | None:
+        rows = self._read(
+            'SELECT * FROM discovered_creators WHERE channel_id = ?', (channel_id,)
+        )
+        if rows:
+            r = rows[0]
+            try:
+                r['recent_titles'] = json.loads(r.get('recent_titles_json', '[]'))
+            except (json.JSONDecodeError, TypeError):
+                r['recent_titles'] = []
+            r['is_short_channel'] = bool(r.get('is_short_channel', 0))
+            return r
+        return None
+
+    def flag_candidate(self, channel_id: str, notes: str = '') -> None:
+        """Add a discovered creator to the flagged candidate pool."""
+        self._write(
+            'INSERT INTO candidate_pool (channel_id, notes, last_updated_at) '
+            'VALUES (?, ?, ?) '
+            'ON CONFLICT(channel_id) DO UPDATE SET notes = excluded.notes, '
+            'last_updated_at = excluded.last_updated_at',
+            (channel_id, notes, _utc_now()),
+        )
+
+    def unflag_candidate(self, channel_id: str) -> None:
+        self._write('DELETE FROM candidate_pool WHERE channel_id = ?', (channel_id,))
+
+    def set_candidate_notes(self, channel_id: str, notes: str) -> None:
+        self._write(
+            'UPDATE candidate_pool SET notes = ?, last_updated_at = ? WHERE channel_id = ?',
+            (notes, _utc_now(), channel_id),
+        )
+
+    def get_candidate_pool(self) -> list[dict[str, Any]]:
+        """Return flagged candidates joined with their discovered-creator stats."""
+        rows = self._read(
+            'SELECT d.channel_id, d.handle, d.title, d.pfp_url, d.subscriber_count, '
+            'd.view_count, d.views_per_sub, d.potential_score, d.cadence_per_week, '
+            'c.notes, c.flagged_at, c.last_updated_at '
+            'FROM candidate_pool c '
+            'JOIN discovered_creators d ON d.channel_id = c.channel_id '
+            'ORDER BY c.flagged_at DESC'
+        )
+        return rows
+
+    def get_candidate_count(self) -> int:
+        rows = self._read('SELECT COUNT(*) AS n FROM candidate_pool')
+        return int(rows[0]['n']) if rows else 0
+
+    def save_ai_evaluation(self, channel_id: str, provider: str, model: str, verdict: str, rationale: str) -> None:
+        self._write(
+            'INSERT INTO ai_evaluations (channel_id, provider, model, verdict, rationale) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (channel_id, provider, model, verdict, rationale),
+        )
+
+    def get_latest_ai_evaluation(self, channel_id: str) -> dict[str, Any] | None:
+        rows = self._read(
+            'SELECT provider, model, verdict, rationale, created_at '
+            'FROM ai_evaluations WHERE channel_id = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (channel_id,),
+        )
+        return rows[0] if rows else None
+
+    def promote_candidate_to_roster(self, channel_id: str, role_id: int) -> int | None:
+        """Promote a discovered creator into the tracked roster.
+
+        Inserts a creators row with the discovered channel's YouTube link
+        and PFP, then removes the candidate_pool entry (keeping the
+        discovered_creators row for history).  Returns the new creator id,
+        or None if the channel is unknown.
+        """
+        d = self.get_discovered_creator(channel_id)
+        if not d:
+            return None
+        # resolve_channels stores the YouTube customUrl with its leading '@'
+        # intact, so strip any '@' prefix before re-adding exactly one.
+        handle = (d.get('handle', '') or '').lstrip('@')
+        # Guard against re-promoting a channel already on the roster —
+        # creators.youtube_channel_id has no UNIQUE constraint, so an
+        # unconditional insert would duplicate the member.
+        existing = self._read(
+            'SELECT id FROM creators WHERE youtube_channel_id = ? LIMIT 1',
+            (channel_id,),
+        )
+        if existing:
+            self.unflag_candidate(channel_id)
+            return int(existing[0]['id'])
+        nickname = d.get('title', '') or handle or channel_id
+        yt_link = f'https://www.youtube.com/{("@" + handle) if handle else "channel/" + channel_id}'
+        new_id = self.add_creator(
+            nickname=nickname, role_id=role_id, platforms=['youtube'],
+            youtube_channel_id=channel_id, youtube_link=yt_link,
+            pfp_url=d.get('pfp_url') or None,
+            notes=f'Promoted from Discover. Potential score: {d.get("potential_score", 0)}.',
+        )
+        # Stash discovered stats so the new roster member's first refresh
+        # has a baseline, mirroring creator import behaviour.
+        self.set_setting(f'yt_channel_subscribers_{new_id}', str(d.get('subscriber_count', 0)))
+        self.set_setting(f'yt_channel_views_{new_id}', str(d.get('view_count', 0)))
+        # Remove from the flagged pool so it stops appearing as a candidate.
+        self.unflag_candidate(channel_id)
         return new_id
 
     def close(self) -> None:

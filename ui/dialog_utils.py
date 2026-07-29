@@ -1,8 +1,51 @@
 from __future__ import annotations
+import sys
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import QMessageBox, QWidget
-_DARK_QSS = 'QMessageBox { background: #1A1A1A; }QMessageBox QLabel { color: #E0E0E0; background: transparent; }QPushButton { background: #2E2E2E; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 4px; padding: 6px 14px; }QPushButton:hover { background: #4A4A4A; }'
+
+from ui.theme.tokens import C
+
+
+def apply_native_title_bar(window: QWidget) -> None:
+    """Match the Windows native title bar to the active theme via DWM API.
+
+    Dark themes get the immersive dark title bar; light themes get the default
+    light title bar so it doesn't clash with a light window background.  Decided
+    from the luminance of ``C.BG_BASE``.  No-op off Windows.
+    """
+    if sys.platform != 'win32':
+        return
+    import ctypes
+    hexcol = (C.BG_BASE or '').lstrip('#')
+    dark = True
+    if len(hexcol) == 6:
+        try:
+            r, g, b = (int(hexcol[i:i + 2], 16) for i in (0, 2, 4))
+            dark = (0.299 * r + 0.587 * g + 0.114 * b) < 140
+        except ValueError:
+            dark = True
+    hwnd = int(window.winId())
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+    value = ctypes.c_int(1 if dark else 0)
+    ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
+
+
+def _msg_qss() -> str:
+    """Build a theme-aware QMessageBox stylesheet from the active tokens.
+
+    Previously this was a hardcoded dark string; it is now derived from ``C`` so
+    message boxes match the current theme (light or dark) instead of always
+    rendering dark over a potentially light window.
+    """
+    return (
+        f'QMessageBox {{ background: {C.DIALOG_BG}; }}'
+        f'QMessageBox QLabel {{ color: {C.TEXT_PRIMARY}; background: transparent; }}'
+        f'QPushButton {{ background: {C.BG_RAISED}; color: {C.TEXT_PRIMARY}; '
+        f'border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px 14px; }}'
+        f'QPushButton:hover {{ background: {C.BG_HOVER}; }}'
+    )
 
 
 def toggle_fullscreen(window: QWidget) -> None:
@@ -45,13 +88,28 @@ def enable_window_maximize(window: QWidget) -> None:
     )
 
 
+def compact_count(n: int) -> str:
+    """Format an integer in compact form: 1200 → '1.2K', 1500000 → '1.5M'.
+
+    Shared by every UI surface that shows subscriber/view counts (creator
+    cards, the Discover results, the Candidate Pool) so they don't each
+    re-implement the same threshold ladder.
+    """
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f'{n / 1_000_000:.1f}M'
+    if n >= 1_000:
+        return f'{n / 1_000:.1f}K'
+    return str(n)
+
+
 def dark_warning(parent: QWidget, title: str, text: str) -> None:
     """Show a dark-themed warning message box."""
     msg = QMessageBox(parent)
     msg.setIcon(QMessageBox.Icon.Warning)
     msg.setWindowTitle(title)
     msg.setText(text)
-    msg.setStyleSheet(_DARK_QSS)
+    msg.setStyleSheet(_msg_qss())
     msg.exec()
 def dark_info(parent: QWidget, title: str, text: str) -> None:
     """Show a dark-themed information message box."""
@@ -59,7 +117,7 @@ def dark_info(parent: QWidget, title: str, text: str) -> None:
     msg.setIcon(QMessageBox.Icon.Information)
     msg.setWindowTitle(title)
     msg.setText(text)
-    msg.setStyleSheet(_DARK_QSS)
+    msg.setStyleSheet(_msg_qss())
     msg.exec()
 def dark_question(parent: QWidget, title: str, text: str, buttons: QMessageBox.StandardButton=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default: QMessageBox.StandardButton=QMessageBox.StandardButton.No) -> QMessageBox.StandardButton:
     """Show a dark-themed question message box and return the clicked button."""
@@ -71,5 +129,5 @@ def dark_question(parent: QWidget, title: str, text: str, buttons: QMessageBox.S
     msg.setText(text)
     msg.setStandardButtons(buttons)
     msg.setDefaultButton(default)
-    msg.setStyleSheet(_DARK_QSS)
+    msg.setStyleSheet(_msg_qss())
     return msg.exec()

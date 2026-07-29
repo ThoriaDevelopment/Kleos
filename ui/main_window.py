@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import CreatorCard, format_subscriber_count
 from ui.components.history_dialog import HistoryDialog
-from ui.dialog_utils import dark_question, dark_warning, dark_info, handle_fullscreen_keypress
+from ui.dialog_utils import dark_question, dark_warning, dark_info, handle_fullscreen_keypress, apply_native_title_bar
 from ui.settings_dialog import SettingsDialog
 from ui.analytics_window import AnalyticsWindow
+from ui.discover_window import DiscoverWindow
 from ui.notification import NotificationToast
 class GradientCanvasV2(QWidget):
     """Full-window underlay widget that paints a slow-breathing gradient\nusing design-system colour tokens.\n\nThe gradient alternates between C.BG_BASE and C.BG_DEEP at ±4% opacity\nover a 10-second sinusoidal loop driven by QVariantAnimation.\nNo layout geometry is recalculated — only a paint event fires.\n"""
@@ -318,6 +319,7 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._refresh_relative_times)
         self._timer.start(60000)
         self._refresh_cards()
+        self._refresh_candidates_badge()
         theme_manager.theme_changed.connect(self._on_theme_changed)
     def _build_ui(self) -> None:
         central = QWidget()
@@ -347,6 +349,11 @@ class MainWindow(QMainWindow):
         self._verify_btn.setToolTip('Verify media using keywords or AI')
         self._verify_btn.clicked.connect(self._on_verify)
         top_row1.addWidget(self._verify_btn)
+        top_row1.addSpacing(8)
+        self._discover_btn = QPushButton('🔍 Discover')
+        self._discover_btn.setToolTip('Market research — find small, high-potential creators to recruit. Flagged candidates live here.')
+        self._discover_btn.clicked.connect(self._on_discover)
+        top_row1.addWidget(self._discover_btn)
         top_row1.addSpacing(8)
         settings_btn = QPushButton('⚙ Settings')
         settings_btn.setToolTip('Open settings (API keys, profiles, roles)')
@@ -498,6 +505,8 @@ class MainWindow(QMainWindow):
         for card in self._cards.values():
             if not sip.isdeleted(card):
                 card.reapply_theme()
+        # Re-match the Windows native title bar to the new theme (dark vs light).
+        apply_native_title_bar(self)
     _CARD_BATCH_SIZE = 20
 
     def _refresh_cards(self) -> None:
@@ -719,6 +728,7 @@ class MainWindow(QMainWindow):
         self._db.switch_profile(name)
         self._refresh_cards()
         self._refresh_profile_combo()
+        self._refresh_candidates_badge()
 
     def _on_fetch_done_for_profile_switch(self) -> None:
         """Complete a deferred profile switch after the fetch worker finishes."""
@@ -738,6 +748,7 @@ class MainWindow(QMainWindow):
                 theme_manager.apply(saved_theme)
             self._refresh_cards()
             self._refresh_profile_combo()
+            self._refresh_candidates_badge()
 
     def _on_fetch_done_for_import(self) -> None:
         """Complete a deferred profile import after the fetch worker finishes."""
@@ -962,6 +973,25 @@ class MainWindow(QMainWindow):
         """Open the analytics & leaderboard window."""
         dlg = AnalyticsWindow(self._db, self)
         dlg.exec()
+    def _on_discover(self) -> None:
+        """Open the Discover & Recruit market-research window."""
+        dlg = DiscoverWindow(self._db, self, on_roster_changed=self._refresh_cards, on_pool_changed=self._refresh_candidates_badge)
+        dlg.exec()
+        # A promotion may have added roster members while the dialog was open.
+        self._refresh_cards()
+        self._refresh_candidates_badge()
+    def _refresh_candidates_badge(self) -> None:
+        """Update the Discover button with the flagged-candidate count.
+
+        The standalone Candidates button moved into the Discover window; the
+        main-dashboard Discover button now carries the at-a-glance count so
+        the user knows flagged candidates are waiting.
+        """
+        try:
+            n = self._db.get_candidate_count()
+        except Exception:
+            n = 0
+        self._discover_btn.setText(f'🔍 Discover · ⚑ {n}' if n else '🔍 Discover')
     def _on_verify(self) -> None:
         """Open the Verify dialog and dispatch based on the user's choice."""
         if (self._verify_worker is not None and self._verify_worker.isRunning()) or \

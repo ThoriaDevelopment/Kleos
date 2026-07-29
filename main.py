@@ -30,15 +30,13 @@ class _KleosStyle(QProxyStyle):
 
 
 def _enable_dwm_dark_title_bar(window) -> None:
-    """Force the Windows native title bar to dark mode via DWM API."""
-    if sys.platform != 'win32':
-        return None
-    else:
-        import ctypes
-        hwnd = int(window.winId())
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        value = ctypes.c_int(1)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
+    """Match the Windows native title bar to the active theme (DWM API).
+
+    Thin wrapper around the shared ``ui.dialog_utils.apply_native_title_bar``
+    helper so the same logic is reused on runtime theme switches.
+    """
+    from ui.dialog_utils import apply_native_title_bar
+    apply_native_title_bar(window)
 
 
 logger = logging.getLogger(__name__)

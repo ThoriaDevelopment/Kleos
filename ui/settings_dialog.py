@@ -2,10 +2,11 @@ from __future__ import annotations
 import json
 from typing import Any
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QColorDialog, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from PyQt6.QtGui import QColor
 from core.db_manager import DatabaseManager
 from ui.dialog_utils import dark_info, dark_question, dark_warning
+from ui.discover_window import _SHORTS_MODES, _SORTS
 from ui.geometry import restore_geometry, save_geometry
 from ui.theme.stylesheet import build_dialog_qss, qss_refresh
 from ui.theme.tokens import C, theme_manager, THEMES, THEME_NAMES
@@ -100,6 +101,22 @@ class _VerifyTab(QWidget):
         super().__init__(parent)
         self._db = db
         layout = QVBoxLayout(self)
+        name_label = QLabel('Community Name:')
+        name_label.setObjectName('formLabel')
+        layout.addWidget(name_label)
+        name_hint = QLabel(
+            'A short name for your community (e.g. "ArchMC"). Used as the '
+            'query for media-coverage searches and as a fallback when you '
+            'run Discover without entering keywords.'
+        )
+        name_hint.setObjectName('hintLabel')
+        name_hint.setWordWrap(True)
+        layout.addWidget(name_hint)
+        self._name_edit = QLineEdit()
+        self._name_edit.setText(db.get_setting('community_name') or '')
+        self._name_edit.setPlaceholderText('e.g. ArchMC')
+        layout.addWidget(self._name_edit)
+        layout.addSpacing(12)
         desc_label = QLabel('Community Description:')
         desc_label.setObjectName('formLabel')
         layout.addWidget(desc_label)
@@ -171,6 +188,7 @@ class _VerifyTab(QWidget):
             )
             return False
         self._db.set_setting('community_description', text)
+        self._db.set_setting('community_name', self._name_edit.text().strip())
         self._db.set_setting('auto_verify_model', self._model_combo.currentData())
         self._db.set_setting('verify_keywords', self._keywords_edit.text().strip())
         return True
@@ -402,7 +420,7 @@ class _RoleManagerTab(QWidget):
         self._name_input = QLineEdit()
         self._name_input.setPlaceholderText('Role name…')
         form.addWidget(self._name_input, 1)
-        self._color_hex = QLineEdit('#4A90D9')
+        self._color_hex = QLineEdit('#C83232')
         self._color_hex.setFixedWidth(90)
         self._color_hex.setAlignment(Qt.AlignmentFlag.AlignCenter)
         form.addWidget(self._color_hex)
@@ -432,7 +450,7 @@ class _RoleManagerTab(QWidget):
     def _pick_color(self) -> None:
         current = QColor(self._color_hex.text())
         if not current.isValid():
-            current = QColor('#4A90D9')
+            current = QColor('#C83232')
         color = QColorDialog.getColor(current, self, 'Choose Role Color')
         if color.isValid():
             self._color_hex.setText(color.name())
@@ -498,7 +516,7 @@ class _RoleManagerTab(QWidget):
         def pick():
             current = QColor(color_hex.text())
             if not current.isValid():
-                current = QColor('#4A90D9')
+                current = QColor('#C83232')
             color = QColorDialog.getColor(current, dlg, 'Choose Role Color')
             if color.isValid():
                 color_hex.setText(color.name())
@@ -664,6 +682,119 @@ class _NotificationsTab(QWidget):
         return True
 
 
+class _DiscoverTab(QWidget):
+    """Discover & Recruit settings: sub ceiling, min views/sub, shorts,
+    notifications toggle, and cached-search management."""
+
+    def __init__(self, db: DatabaseManager, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._db = db
+        layout = QVBoxLayout(self)
+
+        # ── Recruitment filters ──
+        filters_label = QLabel('Recruitment filters')
+        filters_label.setObjectName('formLabel')
+        layout.addWidget(filters_label)
+
+        form = QFormLayout()
+        self._sub_ceiling = QSpinBox()
+        self._sub_ceiling.setRange(0, 10_000_000)
+        self._sub_ceiling.setValue(int(db.get_setting('discover_sub_ceiling') or 0))
+        self._sub_ceiling.setToolTip('0 = no ceiling (consider creators of any size)')
+        form.addRow('Sub ceiling (max subs):', self._sub_ceiling)
+
+        self._min_vps = QSpinBox()
+        self._min_vps.setRange(0, 10000)
+        self._min_vps.setValue(int(db.get_setting('discover_min_views_per_sub') or 10))
+        form.addRow('Min views per sub:', self._min_vps)
+
+        self._shorts_combo = QComboBox()
+        for sid, slabel in _SHORTS_MODES:
+            self._shorts_combo.addItem(slabel, sid)
+        saved_shorts = db.get_setting('discover_shorts') or 'ask'
+        # Map legacy 'ask' → default to 'always' in settings (the Discover
+        # window itself offers the per-search toggle).
+        if saved_shorts not in ('always', 'never'):
+            saved_shorts = 'always'
+        for i in range(self._shorts_combo.count()):
+            if self._shorts_combo.itemData(i) == saved_shorts:
+                self._shorts_combo.setCurrentIndex(i)
+                break
+        form.addRow('Shorts in results:', self._shorts_combo)
+
+        self._sort_combo = QComboBox()
+        for sid, slabel in _SORTS:
+            self._sort_combo.addItem(slabel, sid)
+        saved_sort = db.get_setting('discover_default_sort') or 'potential'
+        for i in range(self._sort_combo.count()):
+            if self._sort_combo.itemData(i) == saved_sort:
+                self._sort_combo.setCurrentIndex(i)
+                break
+        form.addRow('Default sort:', self._sort_combo)
+        layout.addLayout(form)
+
+        hints = QLabel(
+            'These are the defaults used when Discover opens. The Discover window '
+            'lets you override them per search.\n\n'
+            'Sub ceiling = only surface creators with this many subscribers or '
+            'fewer. Min views/sub = only surface creators whose total views ÷ '
+            'subscribers meets this ratio (the “underviewed audience” signal).'
+        )
+        hints.setObjectName('countLabel')
+        hints.setWordWrap(True)
+        layout.addWidget(hints)
+
+        layout.addSpacing(16)
+
+        # ── Notifications ──
+        notif_label = QLabel('Notifications')
+        notif_label.setObjectName('formLabel')
+        layout.addWidget(notif_label)
+        self._notif_check = QCheckBox('Notify me about Discover activity')
+        self._notif_check.setChecked((db.get_setting('discover_notifications') or '1') == '1')
+        self._notif_check.setToolTip('When on, future Discover-related alerts are enabled.')
+        layout.addWidget(self._notif_check)
+
+        layout.addSpacing(16)
+
+        # ── Cache management ──
+        cache_label = QLabel('Cache')
+        cache_label.setObjectName('formLabel')
+        layout.addWidget(cache_label)
+        self._cache_status = QLabel()
+        self._cache_status.setObjectName('countLabel')
+        self._cache_status.setWordWrap(True)
+        layout.addWidget(self._cache_status)
+        self._refresh_cache_status()
+
+        clear_btn = QPushButton('Clear cached searches')
+        clear_btn.setToolTip('Delete cached Discover search results (flagged candidates are kept)')
+        clear_btn.clicked.connect(self._on_clear_cache)
+        layout.addWidget(clear_btn)
+
+        layout.addStretch(1)
+
+    def _refresh_cache_status(self) -> None:
+        n = self._db.count_cached_searches()
+        self._cache_status.setText(
+            f'{n} cached search{"es" if n != 1 else ""}. Cached searches make '
+            f're-running the same query free (0 quota units). Flagged '
+            f'candidates survive a cache clear.'
+        )
+
+    def _on_clear_cache(self) -> None:
+        deleted = self._db.clear_discover_cache()
+        dark_info(self, 'Cache Cleared', f'Deleted {deleted} cached search(es). Flagged candidates were kept.')
+        self._refresh_cache_status()
+
+    def save(self) -> None:
+        self._db.set_setting('discover_sub_ceiling', str(self._sub_ceiling.value()))
+        self._db.set_setting('discover_min_views_per_sub', str(self._min_vps.value()))
+        self._db.set_setting('discover_shorts', self._shorts_combo.currentData())
+        self._db.set_setting('discover_default_sort', self._sort_combo.currentData())
+        self._db.set_setting('discover_notifications', '1' if self._notif_check.isChecked() else '0')
+
+
 class SettingsDialog(QDialog):
     """Multi-tab settings dialog: API Keys, Profiles, Role Manager."""
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None, cancel_fetch: Any=None) -> None:
@@ -683,12 +814,14 @@ class SettingsDialog(QDialog):
         self._roles_tab = _RoleManagerTab(db)
         self._appearance_tab = _AppearanceTab(db)
         self._notifications_tab = _NotificationsTab(db)
+        self._discover_tab = _DiscoverTab(db)
         self._tabs.addTab(self._api_tab, 'API Keys')
         self._tabs.addTab(self._verify_tab, 'Verify')
         self._tabs.addTab(self._profiles_tab, 'Profiles')
         self._tabs.addTab(self._roles_tab, 'Roles')
         self._tabs.addTab(self._appearance_tab, 'Appearance')
         self._tabs.addTab(self._notifications_tab, 'Notifications')
+        self._tabs.addTab(self._discover_tab, 'Discover')
         layout.addWidget(self._tabs)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._on_save)
@@ -708,6 +841,7 @@ class SettingsDialog(QDialog):
         if not self._verify_tab.save():
             return
         self._appearance_tab.save()
+        self._discover_tab.save()
         if not self._notifications_tab.save():
             self._tabs.setCurrentWidget(self._notifications_tab)
             return

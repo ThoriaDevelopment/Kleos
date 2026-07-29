@@ -257,6 +257,173 @@ class YouTubeClient:
             if not uploads_playlist_id and channel_id.startswith('UC'):
                 uploads_playlist_id = 'UU' + channel_id[2:]
             return {'channel_id': channel_id, 'display_name': display_name, 'pfp_url': pfp_url, 'subscriber_count': subscriber_count, 'view_count': view_count, 'uploads_playlist_id': uploads_playlist_id}
+
+    # ── Discover / Market Research ────────────────────────────────────
+    # These power the Discover window.  Quota budget on the free 10K/day
+    # plan is dominated by /search (100 units/call); the /videos and
+    # /channels follow-ups are 1 unit per call and batch 50 IDs at a time.
+
+    def search_videos(
+        self,
+        query: str,
+        *,
+        max_results: int = 100,
+        region_code: str | None = None,
+        relevance_language: str | None = None,
+        video_category_id: str | None = None,
+        order: str = 'relevance',
+        published_after: str | None = None,
+        cancel_check=None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Search YouTube for videos matching *query*.
+
+        Costs **100 quota units per page** (the expensive call), so
+        pagination is capped: at most ``ceil(max_results/50)`` pages are
+        fetched.  Returns ``(items, complete)`` where each item is a dict
+        with ``video_id``, ``channel_id``, ``title``, ``published_at``,
+        ``description`` and ``thumbnail_url``.  *complete* is False on
+        partial failure or cancellation (partial items are still returned).
+
+        ``cancel_check`` is an optional callable returning True to abort
+        between pages — mirrors ``fetch_latest``.
+        """
+        items: list[dict[str, Any]] = []
+        complete = True
+        next_page_token: str | None = None
+        pages = max(1, (max_results + 49) // 50)
+        for _ in range(pages):
+            if cancel_check and cancel_check():
+                complete = False
+                break
+            params: dict[str, Any] = {
+                'key': self._key,
+                'part': 'snippet',
+                'type': 'video',
+                'maxResults': str(min(50, max_results - len(items))),
+                'order': order,
+            }
+            if query:
+                params['q'] = query
+            if region_code:
+                params['regionCode'] = region_code
+            if relevance_language:
+                params['relevanceLanguage'] = relevance_language
+            if video_category_id:
+                params['videoCategoryId'] = video_category_id
+            if published_after:
+                params['publishedAfter'] = published_after
+            if next_page_token:
+                params['pageToken'] = next_page_token
+            try:
+                resp = self._session.get(YT_SEARCH_URL, params=params, timeout=_REQUEST_TIMEOUT)
+                _diag_response(resp, f'YouTube search q={query!r} page={next_page_token!r}')
+            except requests.RequestException as exc:
+                logger.warning('YouTube search page fetch failed for %r: %s', query, exc)
+                complete = False
+                break
+            try:
+                data = resp.json()
+            except (ValueError, json.JSONDecodeError):
+                logger.warning('YouTube search returned invalid JSON for %r', query)
+                complete = False
+                break
+            for it in data.get('items', []):
+                vid = it.get('id', {}).get('videoId')
+                if not vid:
+                    continue
+                snip = it.get('snippet', {})
+                thumbs = snip.get('thumbnails', {})
+                thumb = (
+                    thumbs.get('high', {}).get('url')
+                    or thumbs.get('medium', {}).get('url')
+                    or thumbs.get('default', {}).get('url', '')
+                )
+                items.append({
+                    'video_id': vid,
+                    'channel_id': snip.get('channelId', ''),
+                    'title': snip.get('title', ''),
+                    'published_at': snip.get('publishedAt', ''),
+                    'description': snip.get('description', ''),
+                    'thumbnail_url': thumb,
+                    'channel_title': snip.get('channelTitle', ''),
+                })
+            if len(items) >= max_results:
+                items = items[:max_results]
+                break
+            next_page_token = data.get('nextPageToken')
+            if not next_page_token:
+                break
+        return items, complete
+
+    def fetch_video_stats(self, video_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Public wrapper around the batched ``/videos`` stats call.
+
+        Returns ``{video_id: stats}`` where each stats dict carries
+        ``view_count``, ``like_count``, ``comment_count`` (when the
+        channel exposes them), plus ``is_short`` and ``is_stream``.
+        """
+        stats = self._fetch_stats(video_ids)
+        # Normalise the raw statistics keys into friendly names so callers
+        # don't have to know the YouTube API's camelCase.
+        out: dict[str, dict[str, Any]] = {}
+        for vid, s in stats.items():
+            out[vid] = {
+                'view_count': int(s.get('viewCount', 0) or 0),
+                'like_count': int(s.get('likeCount', 0) or 0),
+                'comment_count': int(s.get('commentCount', 0) or 0),
+                'is_short': bool(s.get('is_short', False)),
+                'is_stream': bool(s.get('is_stream', False)),
+            }
+        return out
+
+    def resolve_channels(self, channel_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Batch-resolve channel metadata for up to many channel IDs.
+
+        Costs 1 unit per call (50 IDs per call).  Returns
+        ``{channel_id: {channel_id, handle, title, pfp_url,
+        subscriber_count, view_count, video_count}}``.  Unknown IDs are
+        simply absent from the result.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        if not channel_ids:
+            return out
+        for i in range(0, len(channel_ids), 50):
+            chunk = channel_ids[i:i + 50]
+            params = {'key': self._key, 'id': ','.join(chunk), 'part': 'snippet,statistics,contentDetails'}
+            try:
+                resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
+                _diag_response(resp, f'YouTube resolve channels n={len(chunk)}')
+            except requests.RequestException as exc:
+                logger.warning('YouTube channel resolve failed: %s', exc)
+                continue
+            try:
+                data = resp.json()
+            except (ValueError, json.JSONDecodeError):
+                logger.warning('YouTube channel resolve returned invalid JSON')
+                continue
+            for item in data.get('items', []):
+                cid = item.get('id', '')
+                snip = item.get('snippet', {})
+                stats = item.get('statistics', {})
+                cd = item.get('contentDetails', {})
+                thumbs = snip.get('thumbnails', {})
+                pfp = ''
+                for key in ('high', 'medium', 'default'):
+                    t = thumbs.get(key, {})
+                    if t.get('url'):
+                        pfp = t['url']
+                        break
+                out[cid] = {
+                    'channel_id': cid,
+                    'handle': (snip.get('customUrl') or '').lstrip('/'),
+                    'title': snip.get('title', ''),
+                    'pfp_url': pfp,
+                    'subscriber_count': int(stats.get('subscriberCount', 0) or 0),
+                    'view_count': int(stats.get('viewCount', 0) or 0),
+                    'video_count': int(stats.get('videoCount', 0) or 0),
+                    'uploads_playlist_id': cd.get('relatedPlaylists', {}).get('uploads') or '',
+                }
+        return out
 class TwitchClient:
     """Fetches live/recent streams for a given user login via Twitch Helix."""
     def __init__(self, client_id: str, client_secret: str) -> None:

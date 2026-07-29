@@ -18,15 +18,16 @@
 10. [API Integration](#api-integration)
 11. [Auto-Verification](#auto-verification)
 12. [Keyword Verification](#keyword-verification)
-13. [Charts & Visualization](#charts--visualization)
-14. [Import / Export](#import--export)
-15. [License](#license)
+13. [Market Research & Recruitment](#market-research--recruitment)
+14. [Charts & Visualization](#charts--visualization)
+15. [Import / Export](#import--export)
+16. [License](#license)
 
 ---
 
 ## Overview
 
-Kleos is designed for community managers who need to monitor a roster of content creators and streamers. It maintains a local SQLite database per-profile, pulls public metadata from the YouTube Data API v3 and Twitch Helix API, caches thumbnails and profile pictures locally, and exposes everything through a dark-themed PyQt6 GUI with matplotlib-powered charts.
+Kleos is designed for community managers who need to monitor a roster of content creators and streamers. It maintains a local SQLite database per-profile, pulls public metadata from the YouTube Data API v3 and Twitch Helix API, caches thumbnails and profile pictures locally, and exposes everything through a themeable PyQt6 GUI (default **Kleos Soft** — a light red-and-white palette matching thoria.fyi/Kleos, with dark and other themes selectable in Settings → Appearance) with matplotlib-powered charts.
 
 Key design goals:
 - **Offline-first**: Once data is fetched, the entire dashboard and history work without internet.
@@ -113,6 +114,20 @@ Key design goals:
   - Cancelable background workers with progress reporting.
   - Cooldown timer with live countdown when fetches are rate-limited.
 
+- **Market Research & Recruitment (Discover)**
+  - Search YouTube for small, high-potential creators outside your roster — the second half of media management beyond tracking your existing members. Two tabs: **Channels** and **Videos**.
+  - **Channels tab**: five search modes — **Keywords**, **Category**, **Region/Language**, **Seed channels** (derives keywords from seed channels' recent uploads), and **Community keywords** (falls back to your `verify_keywords` / community name when no query is given).
+  - **Videos tab**: a parallel search that returns *individual videos* with the same filters (keywords, region, language, category, sub ceiling, min subs, shorts, max results) plus a **Timeframe** (any time / last day / week / month / year) that narrows the search via `publishedAfter`. Results render in a table with per-row **Open** (watch on YouTube) and **+ Add** (promote the video's channel to the roster) actions. Sort by views, upload date, engagement, or title (client-side, 0 quota).
+  - **★ Media Coverage** (Videos tab): one-click search pre-filled with your community name — finds videos that *mention* your community.
+  - **📊 Stats** (Videos tab): opens a 2-chart stats panel that mirrors the roster's per-creator "Media History" Stats tab — a view-count timeline and an upload-activity bar chart — treating all found videos as one community's uploads. Charts use **only data the search already fetched, so opening them costs 0 extra YouTube quota.** Type (all/shorts/videos/streams) and Range (all/year/month/week) filters re-render client-side.
+  - Pure-code **potential score** (0–100) per creator — views/sub ratio (35), upload consistency (20), recent growth signal (20), niche fit (15), engagement (10). No AI required.
+  - Hard filters: sub ceiling (default 10k, configurable) and minimum views-per-sub ratio. Sort channels by potential, views/sub, smallest-first, total views, or cadence.
+  - Channel results as a card grid or a dense table (toggle), with per-creator **+ Add to roster**, **Eval** (AI), and **⚑ Flag** actions.
+  - **AI Evaluate**: one prompt per discovered creator asks the AI whether they're worth reaching out to and why (verdict + rationale, cached).
+  - **Candidate Pool**: flagged creators persist (survive cache clears) with freeform notes — your own status, no fixed enum. One-click **+ Add to roster** promotes a candidate into the tracked dashboard.
+  - Quota-optimized for the free 10K/day plan: a channel or video search ≈ 100–200 units (/search is the only expensive call; /videos and /channels batch 50 IDs at 1 unit each). Both are cached — re-running an identical search (including the same timeframe) costs 0 units.
+  - No monitoring of non-roster creators; discovery notifications toggle in Settings.
+
 - **Import / Export**
   - Full profile export/import as JSON (versioned schema v6, includes `tags`, `community_description`, and `type_override`).
   - Single-creator export/import (includes notes, tags, and community description).
@@ -187,9 +202,15 @@ Alternatively, set environment variables before launching:
 - `fetch_video_limit` – integer cap per creator (0 = unlimited)
 - `thumbnail_quality` – `"low"` (cached) or `"high"` (re-fetch)
 - `community_description` – up to 300 words for auto-verify context
+- `community_name` – short name for your community (e.g. `ArchMC`). Used as the **★ Media Coverage** search query and as a Discover fallback when no keywords/query are given.
 - `auto_verify_model` – AI model for auto-verify. Claude: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-8`. Gemini: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.5-flash-lite`, `gemini-3.5-flash`
-- `verify_keywords` – comma-separated keywords for keyword-based verification (no AI required)
+- `verify_keywords` – comma-separated community keywords. Used for keyword-based verification (no AI) and as the primary Discover search fallback when no query is given.
 - `notification_view_thresholds` – comma-separated view counts that trigger alerts (default: `10000,100000,1000000`)
+- `discover_sub_ceiling` – max subscriber count for a creator to be considered "small" in Discover (default: `10000`)
+- `discover_min_views_per_sub` – minimum views-per-sub ratio required to keep a discovered creator (default: `10`)
+- `discover_default_sort` – default result sort: `potential`, `vps`, `smallest`, `views`, or `cadence` (default: `potential`)
+- `discover_shorts` – whether to include Shorts-only channels in discovery: `always` or `never` (default: `ask`)
+- `discover_notifications` – `1` to surface a toast when a search finds high-potential creators, `0` to suppress (default: `1`)
 
 ---
 
@@ -204,14 +225,18 @@ Kleos/
 │
 ├── core/
 │   ├── __init__.py
-│   ├── api_client.py       # YouTubeClient, TwitchClient, FetchWorker (QThread)
-│   ├── cache_manager.py    # Thumbnail/PFP download, local caching, pre-scaling
-│   ├── db_manager.py       # DatabaseManager: SQLite, dual-conn, schema v6, CRUD, import/export
-│   ├── html_export.py      # Self-contained HTML community dashboard generator
-│   ├── paths.py            # APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR, GLOBAL_SETTINGS_PATH
-│   ├── report_generator.py # Plain-text report generation (clipboard)
-│   └── verify_worker.py    # VerifyWorker (QThread) for Claude/Gemini auto-verify
-│   └── keyword_verify.py   # KeywordVerifyWorker (QThread) for keyword-based verify
+│   ├── api_client.py        # YouTubeClient, TwitchClient, FetchWorker (QThread)
+│   ├── cache_manager.py     # Thumbnail/PFP download, local caching, pre-scaling
+│   ├── db_manager.py        # DatabaseManager: SQLite, dual-conn, schema v8, CRUD, import/export
+│   ├── html_export.py       # Self-contained HTML community dashboard generator
+│   ├── paths.py             # APP_DIR, STORAGE_DIR, BACKUPS_DIR, THUMBNAILS_DIR, GLOBAL_SETTINGS_PATH
+│   ├── report_generator.py  # Plain-text report generation (clipboard)
+│   ├── verify_worker.py     # VerifyWorker (QThread) for Claude/Gemini auto-verify
+│   ├── keyword_verify.py    # KeywordVerifyWorker (QThread) for keyword-based verify
+│   ├── discover_scorer.py   # Pure-code potential score (no AI)
+│   ├── discover_worker.py   # DiscoverWorker (channels) + VideoSearchWorker (videos): YouTube search → resolve → score/persist
+│   ├── ai_client.py         # Shared single-prompt Claude/Gemini call helper (retries, cancel)
+│   └── discover_ai_worker.py # EvaluateWorker (single-prompt AI evaluation)
 ├── ui/
 │   ├── __init__.py
 │
@@ -222,8 +247,11 @@ Kleos/
     ├── dialog_utils.py       # Dark QMessageBox wrappers, fullscreen helpers
     ├── main_window.py        # MainWindow, GradientCanvasV2, _AddCreatorDialog, _InlineEditDialog
     ├── analytics_window.py   # AnalyticsWindow: leaderboard, charts, HTML export
+    ├── discover_window.py    # DiscoverWindow (Channels + Videos tabs), EvaluateDialog (market research)
+    ├── video_search_stats.py # VideoSearchStatsDialog — 0-quota stats panel for video search results
+    ├── candidate_pool.py     # CandidatePoolDialog: flagged creators + outreach notes
     ├── notification.py       # NotificationToast: slide-in toast with auto-dismiss
-    ├── settings_dialog.py    # SettingsDialog: API Keys, Verify, Profiles, Roles, Appearance, Notifications tabs
+    ├── settings_dialog.py    # SettingsDialog: API Keys, Verify, Profiles, Roles, Appearance, Notifications, Discover tabs
     ├── verify_dialog.py      # VerifyDialog: card-based verification method wizard
     ├── theme/
     │   ├── __init__.py       # build_global_qss()
@@ -252,7 +280,7 @@ Kleos/
 ### Database Layer (`DatabaseManager`)
 - Uses two SQLite connections per profile: `_conn` (writes) with `_write_lock` and `_read_conn` (reads) with `_read_lock`, enabling lock-free concurrent reads in WAL mode.
 - Foreign keys enforced (`PRAGMA foreign_keys=ON`).
-- Schema versioning via `PRAGMA user_version` with migrations (currently v6 — includes `tags` column, `alerts` table, and `type_override` column).
+- Schema versioning via `PRAGMA user_version` with migrations (currently v8 — adds `tags`, `alerts`, `type_override`, and the Discover tables: `search_cache`, `discovered_creators`, `candidate_pool`, `ai_evaluations`).
 - Global settings (API keys, last profile, first-run flag) stored in `global_settings.json` with atomic writes.
 - Auto-backup runs in a background thread after writes, keeping the last 3 snapshots per profile.
 
@@ -269,7 +297,21 @@ media_content   (id PRIMARY KEY, creator_id FK, platform CHECK('youtube','twitch
                  type_override TEXT DEFAULT NULL, description)
 alerts          (id PRIMARY KEY AUTOINCREMENT, creator_id FK, alert_type, threshold,
                  triggered_at, UNIQUE(creator_id, alert_type, threshold))
+
+-- Discover & Recruitment (schema v8)
+search_cache         (id PRIMARY KEY, params_hash UNIQUE, mode, query, results_json,
+                      result_count, run_at)
+discovered_creators  (channel_id PRIMARY KEY, handle, title, pfp_url,
+                      subscriber_count, view_count, video_count, cadence_per_week,
+                      growth_signal, engagement, niche_fit, views_per_sub,
+                      potential_score, recent_titles_json, is_short_channel,
+                      first_discovered_at, last_refreshed_at)
+candidate_pool       (channel_id PRIMARY KEY FK, notes, flagged_at, last_updated_at)
+ai_evaluations      (id PRIMARY KEY AUTOINCREMENT, channel_id FK, provider, model,
+                      verdict, rationale, created_at)
 ```
+
+The **Discover** tables support market research without tracking non-roster creators: `search_cache` persists prior searches (keyed by a SHA-1 of their parameters) for 0-quota re-runs, `discovered_creators` holds the scored candidate set, `candidate_pool` holds the flagged subset with freeform notes, and `ai_evaluations` caches AI verdicts per creator. Promoting a candidate inserts a row into `creators` and unflags it; non-roster creators are never monitored or notified.
 
 ### Caching
 - Thumbnails and profile pictures are downloaded to `%APPDATA%\.kleos\thumbnails`.
@@ -357,6 +399,59 @@ If **any** keyword matches the title **or** description of an unverified video, 
 2. Edit keywords in the dialog (pre-filled from Settings → Verify), then click **Start Verification**.
 
 Like AI verification, keyword verification runs in a background `QThread`, shows a progress bar, and can be cancelled at any time. It also respects the cooperative profile guard.
+
+---
+
+## Market Research & Recruitment
+
+Discover is the second half of media management — it finds small, high-potential YouTube creators *outside* your tracked roster so you can recruit them. The window has two tabs: **Channels** (creator search, scored and persisted) and **Videos** (individual-video search with a stats panel).
+
+### Channels search pipeline (`DiscoverWorker`)
+1. **Search** — one of five modes builds a `/search` query:
+   - **Keywords** — raw query string.
+   - **Category** — YouTube video category ID.
+   - **Region/Language** — `regionCode` + `relevanceLanguage`.
+   - **Seed channels** — Kleos fetches each seed's recent uploads, pools title/description tokens, and uses the top keywords as the query.
+   - **Community keywords** — when no query/seed is given, Kleos falls back to your `verify_keywords` (community keywords), then the `community_name` setting.
+   `/search` is the only expensive call (100 units/page); results are capped at `max_results` (default 200). Each search is hashed (SHA-1 of its mode + query + filters + `result_mode`) and cached in `search_cache`, so re-running an identical search costs 0 units.
+2. **Stats** — `/videos` is batched at 50 IDs per call (1 unit each) to fetch view/like/comment counts and short/stream detection.
+3. **Resolve** — `/channels` is batched at 50 IDs per call (1 unit each) for handle, title, PFP, and aggregate subscriber/view/video counts.
+4. **Filter** — drop channels already on the roster, channels above the sub ceiling, and (optionally) Shorts-only channels.
+5. **Score** — `core/discover_scorer.py` computes a pure-code 0–100 potential score per creator (no AI):
+   | Component | Weight | Signal |
+   |----------|-------|--------|
+   | Views / sub ratio | 35 | how much each subscriber is "worth" |
+   | Upload consistency | 20 | uploads per week over the last 90 days |
+   | Growth signal | 20 | view velocity of recent videos relative to channel size |
+   | Niche fit | 15 | whole-word overlap of recent titles vs your keywords |
+   | Engagement | 10 | (likes + comments) / views |
+6. **Sort & persist** — sort by potential (default), views/sub, smallest-first, total views, or cadence; `upsert_discovered_creator()` writes each result.
+
+### Videos search pipeline (`VideoSearchWorker`)
+The Videos tab runs a parallel search that returns individual videos using the same filters plus a **Timeframe**:
+1. **Search** — `client.search_videos(...)` (the same `/search`, `type=video`) with `published_after` from the timeframe (any / day / week / month / year). The query falls back to `verify_keywords` → `community_name` when empty; the **★ Media Coverage** button pre-fills the query with `community_name`.
+2. **Resolve channels** — one batched `/channels` call for subscriber counts (so the sub-ceiling / min-subs filters apply).
+3. **Filter** — drop videos whose channel is above the sub ceiling / below min subs / already on the roster; drop Shorts when shorts = never.
+4. **Stats** — one batched `/videos` call for per-video view/like/comment counts and short/stream detection.
+5. **Results** — per-video dicts (title, channel, subs, views, likes, comments, upload date, type) cached in `search_cache` with `result_mode='videos'` so a repeat (same filters + timeframe) costs 0 units.
+6. **📊 Stats panel** — `VideoSearchStatsDialog` plots a view-count timeline + an upload-activity bar chart from the in-memory results, mirroring the roster's per-creator Stats tab. **0 extra YouTube quota** — charts use only the data the search already fetched.
+
+A single channel or video search typically costs 100–200 quota units against the free 10K/day allowance. `/videos` and `/channels` batch at 50 IDs per call to minimize spend.
+
+### AI (minimal, single-prompt)
+To stay within free-tier limits, Discover uses exactly one AI prompt per action — no per-video calls:
+
+- **AI Evaluate** (`EvaluateWorker`) — one prompt per discovered creator sends their stats + recent titles and asks for `{"worth_it": bool, "reason": str}`. The verdict and rationale are cached in `ai_evaluations` so re-evaluating is free.
+
+It uses the shared `core/ai_client.py` helper (same retry/backoff/cancel pattern as `VerifyWorker`) and is triggered only on a button click — never automatically.
+
+### Recruitment & outreach
+- **+ Add to roster** on a discovered card (or in the Candidate Pool) promotes a creator into the tracked dashboard — `promote_candidate_to_roster()` inserts a `creators` row with the first role, seeds the YouTube stat settings, and unflags them.
+- **⚑ Flag** moves a creator into the **Candidate Pool**, which persists across cache clears. Each candidate has a freeform notes field (your own status text — no fixed enum) that auto-saves with a 400ms debounce.
+- **Non-roster creators are never monitored or notified.** Discovery toast notifications are opt-in via `discover_notifications` in Settings.
+
+### Cache management
+Re-running an identical search reads from `search_cache` (0 quota). **Settings → Discover → Clear cached searches** drops the cache and any *unflagged* discovered rows; flagged candidates in the Candidate Pool are preserved.
 
 ---
 

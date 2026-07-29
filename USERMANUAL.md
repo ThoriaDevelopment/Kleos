@@ -22,11 +22,13 @@
 14. [Roles](#roles)
 15. [Tags & Labels](#tags--labels)
 16. [Milestone Notifications](#milestone-notifications)
-17. [Settings](#settings)
-18. [Importing & Exporting Creators](#importing--exporting-creators)
-19. [Importing & Exporting Profiles](#importing--exporting-profiles)
-20. [Search, Sort & Filter](#search-sort--filter)
-21. [Tips & Shortcuts](#tips--shortcuts)
+17. [Market Research & Recruitment (Discover)](#market-research--recruitment-discover)
+18. [The Candidate Pool](#the-candidate-pool)
+19. [Settings](#settings)
+20. [Importing & Exporting Creators](#importing--exporting-creators)
+21. [Importing & Exporting Profiles](#importing--exporting-profiles)
+22. [Search, Sort & Filter](#search-sort--filter)
+23. [Tips & Shortcuts](#tips--shortcuts)
 
 ---
 
@@ -97,6 +99,7 @@ The main window is your home base. It shows every person in your community as a 
 - **+ Add Media Member** — Opens a form to add someone new.
 - **⟳ Refresh All** — Fetches the latest videos, streams, stats, and thumbnails for everyone at once.
 - **✓ Verify** — Opens a dialog to verify videos using keywords or AI.
+- **🔍 Discover** — Opens the Market Research window to find new creators outside your roster. When you've flagged creators for follow-up, the button shows a `⚑ N` count so you can tell at a glance. Your Candidate Pool lives inside this window (top-right). (See [Market Research & Recruitment](#market-research--recruitment-discover) and [The Candidate Pool](#the-candidate-pool).)
 - **⚙ Settings** — Opens the settings panel for keys, profiles, roles, appearance, and notifications.
 - **♛ Leaderboard** — Opens the global analytics and ranking window.
 
@@ -331,7 +334,7 @@ Kleos builds a clean, plain-text summary and copies it directly to your clipboar
 
 ## Exporting a Community Page
 
-Also in the Analytics window, next to **Copy Report**, you'll find an **Export HTML** button. This generates a self-contained HTML page — a beautiful, dark-themed community dashboard that you can share with anyone.
+Also in the Analytics window, next to **Copy Report**, you'll find an **Export HTML** button. This generates a self-contained HTML page — a beautiful, theme-matched community dashboard (it uses the colours of whichever theme you're currently on) that you can share with anyone.
 
 1. Choose the time period and role filter (same as for reports).
 2. Optionally check **Verified only** and choose a **Type** filter.
@@ -452,6 +455,106 @@ If you want previously-triggered alerts to fire again (for example, after a data
 
 ---
 
+## Market Research & Recruitment (Discover)
+
+Tracking your current members is only half of media management. The other half is *finding new people to recruit*. The **🔍 Discover** window searches YouTube for small, high-potential creators who aren't on your roster yet, scores each one, and helps you reach out. It has two tabs: **Channels** (find creators) and **Videos** (find individual videos + a stats panel).
+
+> **Note:** Discover only searches YouTube, and it uses only the official YouTube API — no scraping. It's designed to be light on your free 10,000-units-per-day quota.
+
+### Running a Channels Search
+Click **🔍 Discover** on the main dashboard and stay on the **Channels** tab. At the top of the window, choose a **search mode**:
+
+- **Keywords** — Type a search query (for example, `minecraft SMP let's play`).
+- **Category** — Pick a YouTube content category (for example, Gaming, Music, Education).
+- **Region/Language** — Search within a specific country and language.
+- **Seed channels** — Paste one or more YouTube channel links or handles you consider similar to what you want. Kleos reads each seed's recent uploads, pulls the most common keywords from their titles/descriptions, and searches for channels producing similar content.
+- **Community keywords** — If you leave the keywords box empty (and give no seeds), Kleos falls back to your **Verification Keywords** from **Settings → Verify**, then your **Community Name**. Great for finding creators who fit your community's niche without retyping your keywords.
+
+Then set your **filters**:
+- **Sub ceiling** — Only show creators with fewer than this many subscribers (default 10,000). This is what makes a creator "small."
+- **Min views/sub** — Only keep creators whose views-to-subscribers ratio is at least this high (default 10). A high ratio means each subscriber watches a lot — a sign of an engaged audience.
+- **Shorts** — Choose whether to include channels that mostly post Shorts (`Always` or `Never`, or `Ask` to decide per search).
+- **Max results** — How many results to fetch (default 200).
+
+Click **Run Search**. Kleos searches YouTube, resolves each channel, drops anyone already on your roster or above your sub ceiling, scores the rest, and shows them ranked by **potential**.
+
+### Finding Videos (Videos Tab)
+Switch to the **Videos** tab to search for individual videos instead of channels, using the same filters (keywords, region, language, category, sub ceiling, min subs, shorts, max results) plus a **Timeframe** dropdown:
+
+- **Timeframe** — Narrows the search to videos uploaded within **Any time / Last day / Last week / Last month / Last year**. Each timeframe is cached separately, so re-running the same search in the same window costs 0 quota.
+
+Click **🔍 Run Search**. Results appear in a table showing each video's title, channel, subscriber count, views, likes, comments, upload date, and type (Video / Short / Stream). Each row has two actions:
+- **Open** — Opens the video on YouTube in your browser.
+- **+ Add** — Promotes the video's channel into your tracked roster (same as adding a discovered channel).
+
+Use the **Sort** dropdown to reorder by Views, Upload date, Engagement (likes + comments), or Title — this is done client-side from the fetched data, so it costs 0 quota.
+
+#### ★ Media Coverage
+The **★ Media Coverage** button runs a video search pre-filled with your **Community Name** (set in **Settings → Verify**) — it finds videos that *mention* your community. If you haven't set a community name yet, you'll be prompted to add one first.
+
+#### 📊 Stats Panel
+Click **📊 Stats** to open a stats panel for the current video results. It mirrors the per-creator **Media History → Stats** tab you already use on your roster, but treats all the found videos as one community's uploads:
+- **View Trajectory** — a timeline of each video's view count at its upload date.
+- **Upload Activity** — a bar chart of how many videos were uploaded per day (or per month for wider timeframes).
+
+Use the **Type** dropdown (All / Shorts / Videos / Streams) and **Range** dropdown (All / Last year / Last month / Last week) to filter, and toggle between the two charts. Everything is computed from the data the search already fetched — **opening the stats panel costs 0 extra YouTube quota.**
+
+### Reading a Discovered Creator Card
+Each result card shows:
+- The creator's **name**, **handle**, and a **potential score** (0–100) with a gradient bar.
+- Their subscriber and view counts, and their **views/sub** ratio.
+- A preview of their **recent upload titles** (so you can see what they make at a glance).
+- Three action buttons: **+ Add to roster**, **Eval**, and **⚑ Flag**.
+
+You can switch between the **Cards** grid view and a dense **Table** view, and change the sort order (Potential, Views/sub, Smallest first, Total views, or Cadence).
+
+### The Potential Score
+The potential score is computed purely by code — no AI, no quota cost — from five signals:
+
+| Signal | Weight | What it measures |
+|--------|--------|------------------|
+| Views / sub ratio | 35 | How much each subscriber is "worth" (high = engaged audience) |
+| Upload consistency | 20 | How often they upload per week over the last 90 days |
+| Growth signal | 20 | How much their recent videos are outperforming their channel size |
+| Niche fit | 15 | How well their recent titles match your search keywords |
+| Engagement | 10 | (likes + comments) ÷ views |
+
+Sort by **Potential** to surface the highest-scoring creators first.
+
+### Flagging and Promoting Creators
+For each discovered creator you have three options:
+- **+ Add to roster** — Promotes them straight into your tracked dashboard. They get assigned your first role and become a normal member (with stats fetched the next time you refresh).
+- **⚑ Flag** — Adds them to your [Candidate Pool](#the-candidate-pool) so you can keep an eye on them and write outreach notes without committing to adding them yet.
+- **Eval** — Spends one AI prompt to ask the AI whether this creator is worth reaching out to and why. (See below.)
+
+### AI Evaluate (Eval)
+Clicking **Eval** on a discovered card sends **one** AI prompt containing that creator's stats and recent titles and asks whether they're worth contacting, returning a **verdict** (worth it / not worth it) and a short **rationale**. The verdict is cached, so re-evaluating the same creator later is free.
+
+> **Tip on AI costs:** Discover is deliberately minimal with AI. Each Eval is exactly one prompt. Nothing runs automatically — AI only fires when you click a button. For the no-AI path, just read the potential score and recent titles yourself.
+
+### Caching and Quota
+Kleos remembers every search you run. Re-running an **identical** search (same mode, query, and filters) reads from the cache and costs **0 quota units**. If your database gets heavy, you can clear the cache from **Settings → Discover → Clear cached searches** — this also removes unflagged discovered creators, but keeps anyone you've flagged in your Candidate Pool.
+
+> **Note:** Discover never monitors or notifies you about creators who aren't on your main roster. Discovery toast notifications are optional and can be turned off in Settings.
+
+---
+
+## The Candidate Pool
+
+The **⚑ Candidates** button at the top-right of the Discover window opens your Candidate Pool — the list of creators you've flagged from Discover but haven't added to your roster yet.
+
+Each candidate row shows their name, handle, subscriber and view counts, views/sub ratio, and potential score, alongside a **freeform notes field** and two actions:
+
+- **Notes** — Type whatever you want: a status, a contact angle, a reminder ("contacted," "reach out Monday," "collab on SMP series"). There's no fixed list of statuses — it's just your own notes. Notes auto-save a moment after you stop typing.
+- **+ Add to roster** — Promotes this candidate into your tracked dashboard, same as from Discover. They're then unflagged from the pool.
+- **✕ Unflag** — Removes them from the Candidate Pool (the discovered row is kept in the cache, just no longer flagged).
+
+The **🔍 Discover** button on the main dashboard shows a live `⚑ N` count of how many creators you've flagged, so you can tell at a glance whether you have people waiting to follow up with. The Candidates button inside Discover shows the same count and updates live as you flag or promote creators.
+
+Flagged candidates persist across cache clears — they're your outreach shortlist, kept safe until you either promote them or unflag them.
+
+---
+
 ## Settings
 
 The Settings window is split into tabs for easy navigation.
@@ -469,9 +572,10 @@ There is also a **Videos per creator** spinner. Set this to limit how many recen
 
 ### Verify
 This tab is home to the verification features:
+- **Community Name** — A short name for your community (for example, `ArchMC`). Used as the **★ Media Coverage** search query in Discover's Videos tab, and as a fallback Discover query when no keywords are given.
 - **Community Description** — Describe what your community is about in 300 words or fewer (used by AI Auto-Verify).
 - **AI Model** — Pick the AI model and provider you want for automatic verification. Choose from Anthropic Claude (Haiku 4.5, Sonnet 4.6, Opus 4.8) or Google Gemini (2.5 Flash, 2.5 Pro, 2.5 Flash Lite, 3.5 Flash).
-- **Verification Keywords** — Comma-separated keywords for Keyword Verification (no AI needed). Keywords are matched as case-insensitive whole words against video titles and descriptions.
+- **Verification Keywords** — Comma-separated community keywords. Used for Keyword Verification (no AI needed; matched as case-insensitive whole words against video titles and descriptions) and as the primary fallback query for Discover when no keywords are given.
 
 ### Profiles
 See [Working with Profiles](#working-with-profiles) above.
@@ -480,12 +584,22 @@ See [Working with Profiles](#working-with-profiles) above.
 See [Roles](#roles) above.
 
 ### Appearance
+- **Theme** — Pick the colour scheme for the whole app. The default **Default (Kleos Soft)** is a light red-and-white palette matching the Kleos website (thoria.fyi/Kleos). Other options include **Midnight Blue** (the previous dark default), **Biophilic**, **Frutiger Aero**, **DORFic**, **Indigo Citrus**, and **Y2K Futurism**. A colour-swatch preview updates as you change the selection; click **Apply** to switch. The HTML report export uses whichever theme is active.
 - **Thumbnail Quality** — Choose between Low (uses cached thumbnails, faster) or High (re-downloads original thumbnails, sharper but slower).
 
 ### Notifications
 - **View Count Alert Thresholds** — Comma-separated numbers (for example, `10000,100000,1000000`). Kleos will notify you when a creator's total views cross each threshold.
 - **Subscriber Milestones** — Informational display showing the fixed milestones (1K, 5K, etc.).
 - **Reset All Triggered Alerts** — Clears all previously-triggered alerts so they can fire again on the next data refresh.
+
+### Discover
+This tab configures the [Market Research & Recruitment](#market-research--recruitment-discover) feature:
+- **Sub Ceiling** — The maximum subscriber count for a creator to be considered "small" (default 10,000). Raise it to include larger creators in your searches.
+- **Min Views/Sub** — The minimum views-per-subscriber ratio required to keep a discovered creator (default 10).
+- **Shorts** — Whether to include channels that mostly post Shorts: **Always** or **Never**.
+- **Default Sort** — How to sort Discover results by default: **Potential**, **Views/sub**, **Smallest first**, **Total views**, or **Cadence**.
+- **Discovery Notifications** — Check this to show a toast when a search finds high-potential creators. Uncheck to stay quiet.
+- **Clear cached searches** — Removes all saved searches and unflagged discovered creators to free up space. Flagged candidates in your Candidate Pool are kept.
 
 ---
 
@@ -584,6 +698,8 @@ Inside any member's Media History window, you can also sort and filter the conte
 - **HTML Export:** Use the **Export HTML** button in the Analytics window or any member's Stats tab to create a shareable community dashboard page.
 - **Content Type Override:** Right-click any content row in a member's Media History to manually set its type (Video, Short, Stream) if Kleos misclassified it. Overrides persist across data refreshes.
 - **Maximize:** The Analytics and Media History windows can be maximized using the standard maximize button in the title bar.
+- **Discover is quota-friendly:** Re-running the same search costs 0 units because results are cached. Sort by Potential to surface the best-fit small creators without spending any AI prompts.
+- **Candidate Pool:** Flag creators from Discover instead of adding them right away — they persist across cache clears, and the 🔍 Discover button's `⚑ N` badge shows how many you have waiting to follow up with.
 
 ---
 
