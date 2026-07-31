@@ -287,6 +287,10 @@ class DiscoverWindow(QDialog):
         self._on_pool_changed = on_pool_changed
         self._results: list[dict[str, Any]] = []
         self._worker: QThread | None = None
+        # Monotonic id stamped on each search so a queued results_ready from a
+        # cancelled/superseded worker can be ignored instead of overwriting
+        # fresh results.
+        self._search_id = 0
         self.setWindowTitle('Discover & Recruit')
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(900, 640)
@@ -573,6 +577,8 @@ class DiscoverWindow(QDialog):
 
         self._v_results: list[dict[str, Any]] = []
         self._v_worker: QThread | None = None
+        # Monotonic id for the video search (see self._search_id).
+        self._v_search_id = 0
         return page
 
     def _build_inputs_row_1(self) -> QHBoxLayout:
@@ -786,9 +792,14 @@ class DiscoverWindow(QDialog):
         self._cancel_worker()
         self._set_running(True)
         self._run_btn.setEnabled(False)
+        # Stamp this search with a fresh monotonic id; the results_ready
+        # lambda checks it so a queued emit from a cancelled/superseded
+        # worker can't overwrite fresh results.
+        self._search_id += 1
+        sid = self._search_id
         self._worker = DiscoverWorker(self._db, params)
         self._worker.progress.connect(self._on_progress)
-        self._worker.results_ready.connect(self._on_results)
+        self._worker.results_ready.connect(lambda r, _sid=sid: self._on_results(r, _sid))
         self._worker.error.connect(self._on_error)
         self._worker.api_key_missing.connect(self._on_api_key_missing)
         self._worker.aborted.connect(self._on_aborted)
@@ -806,6 +817,15 @@ class DiscoverWindow(QDialog):
             # and without its ``finished`` signal re-enabling the UI while a
             # new search is starting.
             _retire_worker(w)
+            # Race guard: if the worker finished between the isRunning() check
+            # above and the cleanup connect inside _retire_worker, the cleanup
+            # lambda would never fire — clean up directly so it can't leak.
+            if not w.isRunning():
+                _RETIRING_WORKERS.discard(w)
+                try:
+                    w.deleteLater()
+                except (RuntimeError, TypeError):
+                    pass
         else:
             w.deleteLater()
 
@@ -822,7 +842,10 @@ class DiscoverWindow(QDialog):
     def _on_progress(self, msg: str) -> None:
         self._progress_label.setText(msg)
 
-    def _on_results(self, results: list[dict[str, Any]]) -> None:
+    def _on_results(self, results: list[dict[str, Any]], sid: int) -> None:
+        # Ignore stale results from a cancelled or superseded search.
+        if sid != self._search_id:
+            return
         self._results = results
         self._render_results()
         n = len(results)
@@ -913,9 +936,12 @@ class DiscoverWindow(QDialog):
         self._v_set_running(True)
         self._v_run_btn.setEnabled(False)
         self._v_coverage_btn.setEnabled(False)
+        # Stamp this video search with a fresh id (see _start_worker).
+        self._v_search_id += 1
+        sid = self._v_search_id
         self._v_worker = VideoSearchWorker(self._db, params)
         self._v_worker.progress.connect(self._v_on_progress)
-        self._v_worker.results_ready.connect(self._v_on_results)
+        self._v_worker.results_ready.connect(lambda r, _sid=sid: self._v_on_results(r, _sid))
         self._v_worker.error.connect(self._v_on_error)
         self._v_worker.api_key_missing.connect(self._on_api_key_missing)
         self._v_worker.aborted.connect(self._v_on_aborted)
@@ -930,6 +956,13 @@ class DiscoverWindow(QDialog):
         if w.isRunning():
             w.cancel()
             _retire_worker(w)
+            # Race guard: see _cancel_worker.
+            if not w.isRunning():
+                _RETIRING_WORKERS.discard(w)
+                try:
+                    w.deleteLater()
+                except (RuntimeError, TypeError):
+                    pass
         else:
             w.deleteLater()
 
@@ -947,7 +980,10 @@ class DiscoverWindow(QDialog):
     def _v_on_progress(self, msg: str) -> None:
         self._v_progress_label.setText(msg)
 
-    def _v_on_results(self, results: list[dict[str, Any]]) -> None:
+    def _v_on_results(self, results: list[dict[str, Any]], sid: int) -> None:
+        # Ignore stale results from a cancelled or superseded video search.
+        if sid != self._v_search_id:
+            return
         self._v_results = results
         self._v_render_table()
         n = len(results)
@@ -1265,6 +1301,11 @@ class EvaluateDialog(QDialog):
             self._db.get_setting('discover_ai_model')
             or self._db.get_setting('auto_verify_model') or None
         )
+        # Track whether the user has manually moved the combo so the async
+        # local-models fetch doesn't override a deliberate pick made while
+        # waiting for Ollama to respond.
+        self._model_user_interacted = False
+        self._model_combo.activated.connect(self._on_model_combo_interacted)
         self._load_local_models_async()
         model_row.addWidget(self._model_combo, 1)
         vbox.addLayout(model_row)
@@ -1293,6 +1334,9 @@ class EvaluateDialog(QDialog):
         prev = self._db.get_latest_ai_evaluation(d.get('channel_id', ''))
         self._verdict_label = QLabel('')
         self._verdict_label.setWordWrap(True)
+        # Plain-text format so model output can't render <img>/HTML and trigger
+        # outbound requests or rich-text injection.
+        self._verdict_label.setTextFormat(Qt.TextFormatFlag.PlainText)
         self._verdict_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._verdict_label.setStyleSheet(f'color: {C.TEXT_PRIMARY};')
         inner = QWidget()
@@ -1349,6 +1393,9 @@ class EvaluateDialog(QDialog):
         worker.finished.connect(self._retire_list_worker)
         worker.start()
 
+    def _on_model_combo_interacted(self, _index: int) -> None:
+        self._model_user_interacted = True
+
     def _on_local_models_done(self, tags: list) -> None:
         if sip.isdeleted(self) or sip.isdeleted(self._model_combo):
             return
@@ -1359,7 +1406,8 @@ class EvaluateDialog(QDialog):
         # (currentIndex == 0 means the saved model wasn't a cloud one, so the
         # combo was left on the first cloud item). We never override a
         # deliberate pick made while waiting for Ollama.
-        if (self._saved_model and self._saved_model.startswith('ollama:')
+        if (not self._model_user_interacted
+                and self._saved_model and self._saved_model.startswith('ollama:')
                 and self._model_combo.currentIndex() == 0):
             for i in range(self._model_combo.count()):
                 if self._model_combo.itemData(i) == self._saved_model:
@@ -1383,7 +1431,11 @@ class EvaluateDialog(QDialog):
         # module-level registry in core.local_llm.
         w = self._list_worker
         if w is not None and not sip.isdeleted(w):
-            for name in ('done', 'error', 'finished'):
+            # Disconnect only the GUI-mutating signals; leave ``finished``
+            # connected so the worker's self-cleanup lambda (registered in
+            # ListLocalModelsWorker.start) still discards it from
+            # _LIVE_LIST_WORKERS and deleteLater()s it.
+            for name in ('done', 'error'):
                 try:
                     getattr(w, name).disconnect()
                 except (TypeError, RuntimeError):

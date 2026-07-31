@@ -296,6 +296,17 @@ class VerifyDialog(QDialog):
 
     def _start_local_list(self) -> None:
         """Kick off the off-GUI-thread fetch of installed local models."""
+        # Retire any prior in-flight fetch so it can't insert cards after the
+        # user backs out of the Local page or starts a new fetch. Leave
+        # ``finished`` connected so the worker still self-deletes.
+        prior = self._list_worker
+        if prior is not None and not sip.isdeleted(prior):
+            for name in ('done', 'error'):
+                try:
+                    getattr(prior, name).disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._list_worker = None
         worker = ListLocalModelsWorker(get_ollama_host(self._db))
         self._list_worker = worker
         worker.done.connect(self._on_local_list_done)
@@ -305,6 +316,10 @@ class VerifyDialog(QDialog):
 
     def _on_local_list_done(self, tags: list) -> None:
         if sip.isdeleted(self):
+            return
+        # Ignore a stale fetch that arrives after the user moved off the Local
+        # provider page — its ollama:* cards must not land on another page.
+        if self._selected_provider != 'local':
             return
         self._discard_loading_label()
         if not tags:
@@ -406,7 +421,11 @@ class VerifyDialog(QDialog):
         # worker self-retires via its module-level registry.
         w = self._list_worker
         if w is not None and not sip.isdeleted(w):
-            for name in ('done', 'error', 'finished'):
+            # Disconnect only the GUI-mutating signals; leave ``finished``
+            # connected so the worker's self-cleanup lambda (registered in
+            # ListLocalModelsWorker.start) still discards it from
+            # _LIVE_LIST_WORKERS and deleteLater()s it.
+            for name in ('done', 'error'):
                 try:
                     getattr(w, name).disconnect()
                 except (TypeError, RuntimeError):

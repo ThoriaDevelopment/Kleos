@@ -124,14 +124,22 @@ def _call_anthropic(client, model, system_prompt, user_message, max_tokens, canc
                 _sleep(_RETRY_DELAYS[attempt], cancel_check)
             else:
                 return None, "Anthropic API rate limit exceeded. Please wait a moment and try again."
-        except anthropic.APIConnectionError:
-            return None, "Network error connecting to Anthropic. Check your internet connection."
-        except anthropic.APITimeoutError:
-            return None, "Anthropic API request timed out. Check your internet connection and try again."
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError):
+            # Transient network/timeout errors — retry with backoff instead of
+            # aborting the whole Verify/Evaluate run on a single blip.
+            if attempt < _MAX_RETRIES:
+                _sleep(_RETRY_DELAYS[attempt], cancel_check)
+            else:
+                return None, "Network error connecting to Anthropic. Check your internet connection and try again."
         except anthropic.BadRequestError as exc:
             return None, f"Anthropic request error: {exc}"
         except anthropic.APIStatusError as exc:
-            return None, f"Anthropic API error: {exc}"
+            # 5xx is transient — retry. Other status errors (e.g. 4xx not
+            # matched above) are fatal.
+            if getattr(exc, 'status_code', 0) >= 500 and attempt < _MAX_RETRIES:
+                _sleep(_RETRY_DELAYS[attempt], cancel_check)
+            else:
+                return None, f"Anthropic API error: {exc}"
         except Exception as exc:
             return None, f"Unexpected error: {exc}"
     return None, "Anthropic API call failed after retries."
@@ -160,10 +168,20 @@ def _call_gemini(client, model, system_prompt, user_message, max_tokens, cancel_
                     _sleep(_GEMINI_RETRY_DELAYS[attempt], cancel_check)
                 else:
                     return None, "Gemini API rate limit exceeded. Please wait a moment and try again."
+            elif code >= 500:
+                # Transient server error — retry with backoff.
+                if attempt < _MAX_RETRIES:
+                    _sleep(_GEMINI_RETRY_DELAYS[attempt], cancel_check)
+                else:
+                    return None, f"Gemini API error: {exc}"
             else:
                 return None, f"Gemini API error: {exc}"
         except ConnectionError:
-            return None, "Network error connecting to Gemini. Check your internet connection."
+            # Transient network error — retry instead of aborting the run.
+            if attempt < _MAX_RETRIES:
+                _sleep(_GEMINI_RETRY_DELAYS[attempt], cancel_check)
+            else:
+                return None, "Network error connecting to Gemini. Check your internet connection."
         except Exception as exc:
             return None, f"Unexpected error: {exc}"
     return None, "Gemini API call failed after retries."
@@ -187,13 +205,11 @@ def load_ai_api_key(db, model: str) -> tuple[str | None, str | None]:
     Only resolves cloud (Gemini/Anthropic) keys.  Callers must gate on
     ``is_local_model(model)`` themselves for local models, which need no key.
     """
-    import json
-    raw = db.get_global_setting('api_keys_json') or '{}'
     try:
-        parsed = json.loads(raw)
+        keys = db.get_api_keys()
         key_field = 'gemini' if is_gemini_model(model) else 'anthropic'
-        api_key = parsed.get(key_field, '').strip() if isinstance(parsed, dict) else ''
-    except (json.JSONDecodeError, AttributeError):
+        api_key = (keys.get(key_field, '') or '').strip()
+    except Exception:
         api_key = ''
     if not api_key:
         provider = 'Gemini' if is_gemini_model(model) else 'Anthropic'

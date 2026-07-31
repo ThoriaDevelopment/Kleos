@@ -153,60 +153,12 @@ class VerifyWorker(QThread):
 
         verified_count = 0
 
-        for i, row in enumerate(unverified, start=1):
-            if self._cancel.is_set():
-                break
+        try:
+            for i, row in enumerate(unverified, start=1):
+                if self._cancel.is_set():
+                    break
 
-            # Abort if the user switched profiles mid-verification.
-            if self._db.current_profile != self._expected_profile:
-                logger.warning(
-                    'Profile changed from \'%s\' to \'%s\' during verification — aborting.',
-                    self._expected_profile, self._db.current_profile,
-                )
-                self.aborted.emit()
-                return
-
-            self.progress.emit(i, total)
-            self.progress_text.emit(f"Verifying {i}/{total} videos…")
-
-            content_id = row["content_id"]
-            title = row["title"] or "(untitled)"
-            description = row.get("description", "") or ""
-
-            user_message = f'Video title: "{title}"\n\n'
-            if description:
-                user_message += f'Description: "{description}"\n\n'
-            user_message += "Does this video fit the community described above?"
-
-            # Dispatch to the provider via the shared helper.  call_ai handles
-            # retries, rate-limit backoff, auth/network errors, and (for local)
-            # the Ollama host — so this worker no longer keeps its own
-            # per-provider call methods.  max_tokens=10 matches the YES/NO task.
-            response_text, err = call_ai(
-                model=self._model,
-                system_prompt=system_prompt,
-                user_message=user_message,
-                api_key=api_key,
-                max_tokens=10,
-                cancel_check=self._cancel.is_set,
-                db=self._db,
-            )
-
-            if response_text is None:
-                if err:
-                    # Fatal error from the provider.
-                    self.error.emit(err)
-                    return
-                # Cancelled mid-call — fall through to done.emit().
-                break
-
-            if self._cancel.is_set():
-                break
-
-            if response_text.strip().upper().startswith("YES"):
-                # Cooperative guard: verify the profile hasn't changed
-                # before writing to the database, preventing cross-profile
-                # data corruption.
+                # Abort if the user switched profiles mid-verification.
                 if self._db.current_profile != self._expected_profile:
                     logger.warning(
                         'Profile changed from \'%s\' to \'%s\' during verification — aborting.',
@@ -214,22 +166,75 @@ class VerifyWorker(QThread):
                     )
                     self.aborted.emit()
                     return
-                self._db.set_verified(content_id, True)
-                self.video_verified.emit(content_id)
-                verified_count += 1
 
-            # Pace requests to avoid hitting rate limits.
-            # Local models run locally — no rate limit, no pacing.
-            if i < total and not self._cancel.is_set():
-                if is_local:
-                    delay = 0
-                else:
-                    delay = _REQUEST_DELAY_GEMINI if is_gemini else _REQUEST_DELAY_ANTHROPIC
-                if delay > 0:
-                    end_time = time.monotonic() + delay
-                    while time.monotonic() < end_time:
-                        if self._cancel.is_set():
-                            break
-                        time.sleep(0.1)
+                self.progress.emit(i, total)
+                self.progress_text.emit(f"Verifying {i}/{total} videos…")
+
+                content_id = row["content_id"]
+                title = row["title"] or "(untitled)"
+                description = row.get("description", "") or ""
+
+                user_message = f'Video title: "{title}"\n\n'
+                if description:
+                    user_message += f'Description: "{description}"\n\n'
+                user_message += "Does this video fit the community described above?"
+
+                # Dispatch to the provider via the shared helper.  call_ai handles
+                # retries, rate-limit backoff, auth/network errors, and (for local)
+                # the Ollama host — so this worker no longer keeps its own
+                # per-provider call methods.  max_tokens=10 matches the YES/NO task.
+                response_text, err = call_ai(
+                    model=self._model,
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    api_key=api_key,
+                    max_tokens=10,
+                    cancel_check=self._cancel.is_set,
+                    db=self._db,
+                )
+
+                if response_text is None:
+                    if err:
+                        # Fatal error from the provider.
+                        self.error.emit(err)
+                        return
+                    # Cancelled mid-call — fall through to done.emit().
+                    break
+
+                if self._cancel.is_set():
+                    break
+
+                if response_text.strip().upper().startswith("YES"):
+                    # Atomic profile guard + write: set_verified_if_profile checks
+                    # the profile and updates the row under a single lock so a
+                    # switch_profile can't redirect the write into the wrong DB.
+                    if not self._db.set_verified_if_profile(content_id, True, self._expected_profile):
+                        logger.warning(
+                            'Profile changed from \'%s\' during verification — aborting.',
+                            self._expected_profile,
+                        )
+                        self.aborted.emit()
+                        return
+                    self.video_verified.emit(content_id)
+                    verified_count += 1
+
+                # Pace requests to avoid hitting rate limits.
+                # Local models run locally — no rate limit, no pacing.
+                if i < total and not self._cancel.is_set():
+                    if is_local:
+                        delay = 0
+                    else:
+                        delay = _REQUEST_DELAY_GEMINI if is_gemini else _REQUEST_DELAY_ANTHROPIC
+                    if delay > 0:
+                        end_time = time.monotonic() + delay
+                        while time.monotonic() < end_time:
+                            if self._cancel.is_set():
+                                break
+                            time.sleep(0.1)
+        except RuntimeError:
+            # The database was closed under us during shutdown — fail quiet
+            # instead of raising an unhandled worker-thread exception.
+            logger.debug('VerifyWorker aborted: database closed during shutdown.')
+            return
 
         self.done.emit(verified_count)

@@ -36,6 +36,13 @@ from ui.geometry import fit_to_layout_minimum, restore_geometry, save_geometry
 from ui.theme import C
 from ui.theme.stylesheet import build_dialog_qss
 
+# Holds PullModelWorker instances that were cancelled as the dialog closed so
+# they are not destroyed (parent deleted) while still running. Each removes
+# itself on ``finished`` and schedules its own deletion. Mirrors the retire
+# pattern in discover_window / history_dialog.
+_RETIRING_PULL_WORKERS: set = set()
+
+
 # Category label per candidate tag, shown beside the tag in the install row.
 # Kept short so the row (tag + label + status + Install button) never
 # truncates; the lightest-to-heaviest ordering conveys the relative weight.
@@ -192,7 +199,7 @@ class InstallLocalModelsDialog(QDialog):
         self._progress_label.setText("Preparing…")
         self._progress_label.setVisible(True)
 
-        self._pull_worker = PullModelWorker(tag, db=self._db, parent=self)
+        self._pull_worker = PullModelWorker(tag, db=self._db)
         self._pull_worker.progress.connect(self._on_pull_progress)
         self._pull_worker.done.connect(self._on_pull_done)
         self._pull_worker.error.connect(self._on_pull_error)
@@ -265,6 +272,30 @@ class InstallLocalModelsDialog(QDialog):
             if result != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            # Retire instead of wait()ing on the GUI thread (which would freeze
+            # the dialog up to 3s). The worker is unparented so the dialog close
+            # can't destroy it mid-run; it self-deletes on finished.
             w.cancel()
-            w.wait(3000)
+            _RETIRING_PULL_WORKERS.add(w)
+            # Disconnect GUI-mutating signals so a late emit can't touch the
+            # dying dialog, but keep ``finished`` for the cleanup lambda.
+            for name in ('progress', 'done', 'error', 'aborted'):
+                try:
+                    getattr(w, name).disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+            try:
+                w.finished.connect(lambda *_: (_RETIRING_PULL_WORKERS.discard(w), w.deleteLater()))
+            except (TypeError, RuntimeError):
+                pass
+            # Race guard: if it finished between isRunning() and the connect,
+            # clean up directly so it can't leak in the set.
+            if not w.isRunning():
+                _RETIRING_PULL_WORKERS.discard(w)
+                try:
+                    if not sip.isdeleted(w):
+                        w.deleteLater()
+                except (RuntimeError, TypeError):
+                    pass
+            self._pull_worker = None
         super().closeEvent(event)

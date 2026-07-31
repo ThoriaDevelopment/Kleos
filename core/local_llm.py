@@ -63,6 +63,10 @@ def get_ollama_host(db: Any | None = None) -> str:
     Safe to call on the GUI thread — it only reads an in-memory setting, no
     network.  Pass the result into :class:`ListLocalModelsWorker` so the worker
     thread never touches the database.
+
+    The stored value is normalized: trailing slashes are stripped and a bare
+    ``host:port`` (no scheme) gets ``http://`` prepended so every call site can
+    build URLs without re-checking.
     """
     if db is not None:
         try:
@@ -70,6 +74,9 @@ def get_ollama_host(db: Any | None = None) -> str:
         except Exception:
             host = ""
         if host:
+            host = host.rstrip("/")
+            if "://" not in host:
+                host = f"http://{host}"
             return host
     return DEFAULT_HOST
 
@@ -239,6 +246,7 @@ class PullModelWorker(QThread):
                 pass
 
     def run(self) -> None:
+        emitted = False
         try:
             with requests.post(
                 f"{self._host}/api/pull",
@@ -252,6 +260,7 @@ class PullModelWorker(QThread):
                     if self._cancel.is_set():
                         resp.close()
                         self.aborted.emit()
+                        emitted = True
                         return
                     if not line:
                         continue
@@ -259,9 +268,19 @@ class PullModelWorker(QThread):
                         chunk = json.loads(line)
                     except (ValueError, json.JSONDecodeError):
                         continue
+                    # Ollama reports pull failures as an "error" field on a
+                    # status chunk (e.g. disk full mid-pull) — surface it.
+                    if chunk.get("error"):
+                        if self._cancel.is_set():
+                            self.aborted.emit()
+                        else:
+                            self.error.emit(f"Failed to pull {self._tag}: {chunk['error']}")
+                        emitted = True
+                        return
                     status = str(chunk.get("status", "") or "")
                     if status == "success":
                         self.done.emit(self._tag)
+                        emitted = True
                         return
                     if status == "downloading":
                         total = chunk.get("total") or 0
@@ -278,13 +297,20 @@ class PullModelWorker(QThread):
                 self.aborted.emit()
             else:
                 self.error.emit("Ollama is not running. Start the Ollama app and try again.")
+            emitted = True
         except Exception as exc:
             if self._cancel.is_set():
                 self.aborted.emit()
             else:
                 self.error.emit(f"Failed to pull {self._tag}: {exc}")
+            emitted = True
         finally:
             self._response = None
+        # The stream ended without a success/error/cancel signal (e.g. the
+        # connection dropped or Ollama exited without a final status line).
+        # Emit a fallback so the dialog doesn't wait on a signal that never comes.
+        if not emitted and not self._cancel.is_set():
+            self.error.emit(f"Pull ended unexpectedly for {self._tag}.")
 
 
 # Holds references to in-flight ListLocalModelsWorker instances so they are

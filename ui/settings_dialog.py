@@ -22,8 +22,7 @@ class _ApiKeysTab(QWidget):
         self._db = db
         layout = QVBoxLayout(self)
         form = QFormLayout()
-        raw = db.get_global_setting('api_keys_json') or '{}'
-        keys = json.loads(raw) if raw else {}
+        keys = db.get_api_keys()
         self._yt_key = QLineEdit(keys.get('youtube', ''))
         self._yt_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._yt_key.setPlaceholderText('AIza...')
@@ -73,13 +72,7 @@ class _ApiKeysTab(QWidget):
         anthropic_key = self._anthropic_key.text().strip()
         gemini_key = self._gemini_key.text().strip()
         # Load existing keys so we can preserve them on validation failure
-        raw = self._db.get_global_setting('api_keys_json') or '{}'
-        try:
-            existing = json.loads(raw)
-            if not isinstance(existing, dict):
-                existing = {}
-        except json.JSONDecodeError:
-            existing = {}
+        existing = self._db.get_api_keys()
         # Validate YouTube key: only update if valid; warn but preserve old value if invalid
         if yt_key:
             if not yt_key.startswith('AIza'):
@@ -88,7 +81,7 @@ class _ApiKeysTab(QWidget):
             elif len(yt_key) != 39:
                 dark_warning(self, 'YouTube Key Warning', f'YouTube API keys are typically 39 characters long (got {len(yt_key)}).\nSaving anyway — verify your key works.')
         keys = {'youtube': yt_key, 'twitch_client_id': twitch_cid, 'twitch_client_secret': twitch_secret, 'anthropic': anthropic_key, 'gemini': gemini_key}
-        self._db.set_global_setting('api_keys_json', json.dumps(keys))
+        self._db.set_api_keys(keys)
         self._db.set_setting('fetch_video_limit', str(self._limit_spin.value()))
 class _VerifyTab(QWidget):
     """Community description, AI model selection, and keyword verification settings."""
@@ -302,7 +295,9 @@ class _VerifyTab(QWidget):
         self._word_label.setText(f'{word_count} / {_VerifyTab._MAX_WORDS} words')
         self._word_label.setProperty('over', 'true' if over else 'false')
         qss_refresh(self._word_label)
-    def save(self) -> bool:
+    def validate(self) -> bool:
+        """Check inputs without writing. Returns False (with a warning) if the
+        community description exceeds the word limit."""
         text = self._desc_edit.toPlainText().strip()
         word_count = len(text.split()) if text else 0
         if word_count > _VerifyTab._MAX_WORDS:
@@ -311,6 +306,11 @@ class _VerifyTab(QWidget):
                 f'Community description must be {_VerifyTab._MAX_WORDS} words or fewer (got {word_count}).'
             )
             return False
+        return True
+    def save(self) -> bool:
+        if not self.validate():
+            return False
+        text = self._desc_edit.toPlainText().strip()
         self._db.set_setting('community_description', text)
         self._db.set_setting('community_name', self._name_edit.text().strip())
         self._db.set_setting('auto_verify_model', self._model_combo.currentData())
@@ -844,9 +844,10 @@ class _NotificationsTab(QWidget):
         self._db.clear_alerts()
         dark_info(self, 'Alerts Reset', 'All triggered alerts have been cleared.')
 
-    def save(self) -> bool:
+    def validate(self) -> bool:
+        """Check the threshold list without writing. Returns False (with a
+        warning) if the thresholds aren't comma-separated positive integers."""
         text = self._thresholds_edit.text().strip()
-        # Validate: must be comma-separated positive integers
         if text:
             try:
                 values = [int(t.strip()) for t in text.split(',') if t.strip()]
@@ -855,6 +856,11 @@ class _NotificationsTab(QWidget):
                 dark_warning(self, 'Invalid Thresholds',
                              'Enter comma-separated positive numbers (e.g. 10000,100000,1000000)')
                 return False
+        return True
+    def save(self) -> bool:
+        if not self.validate():
+            return False
+        text = self._thresholds_edit.text().strip()
         # Commit both settings only after validation passes, so a failed
         # save (and any later Cancel) can't leave the toggle persisted while
         # the thresholds were rejected.
@@ -1018,14 +1024,21 @@ class SettingsDialog(QDialog):
         )
 
     def _on_save(self) -> None:
-        self._api_tab.save()
-        if not self._verify_tab.save():
+        # Validate every tab BEFORE any save() writes, so a rejected tab
+        # can't leave a partial commit (e.g. API keys persisted while the
+        # notifications thresholds were rejected and the dialog stays open).
+        if not self._verify_tab.validate():
+            self._tabs.setCurrentWidget(self._verify_tab)
             return
-        self._appearance_tab.save()
-        self._discover_tab.save()
-        if not self._notifications_tab.save():
+        if not self._notifications_tab.validate():
             self._tabs.setCurrentWidget(self._notifications_tab)
             return
+        # All validations passed — commit every tab.
+        self._api_tab.save()
+        self._verify_tab.save()
+        self._appearance_tab.save()
+        self._discover_tab.save()
+        self._notifications_tab.save()
         # Commit a deferred profile switch *after* the other tabs have saved
         # their values to the previous profile, so the new profile is not
         # overwritten with stale data.

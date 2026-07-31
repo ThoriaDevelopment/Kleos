@@ -4,6 +4,7 @@ import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from ui.theme import C, M
+from ui.theme.stylesheet import qss_refresh
 from ui.dialog_utils import compact_count as _compact_number
 from PyQt6 import sip
 from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QSize, Qt, QTimer, pyqtProperty, pyqtSignal
@@ -53,35 +54,43 @@ def relative_time(iso_str: str) -> str:
             dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
         except (ValueError, TypeError):
             return 'N/A'
-        now = datetime.now(timezone.utc)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        diff = now - dt
-        secs = int(diff.total_seconds())
-        if secs < 0:
-            return 'moments ago'
+        return relative_time_from_dt(dt)
+
+
+def relative_time_from_dt(dt: datetime) -> str:
+    """Display string for a pre-parsed *dt*.  Assumes tz-aware UTC; naive
+    datetimes are treated as UTC.  Split from :func:`relative_time` so callers
+    that cache the parsed datetime (e.g. CreatorCard.refresh_times) can skip
+    the fromisoformat parse on every refresh."""
+    now = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    diff = now - dt
+    secs = int(diff.total_seconds())
+    if secs < 0:
+        return 'moments ago'
+    else:
+        if secs < 60:
+            return 'just now'
         else:
-            if secs < 60:
-                return 'just now'
+            mins = secs // 60
+            if mins < 60:
+                return f'{mins} minute{('s' if mins!= 1 else '')} ago'
             else:
-                mins = secs // 60
-                if mins < 60:
-                    return f'{mins} minute{('s' if mins!= 1 else '')} ago'
+                hours = mins // 60
+                if hours < 24:
+                    return f'{hours} hour{('s' if hours!= 1 else '')} ago'
                 else:
-                    hours = mins // 60
-                    if hours < 24:
-                        return f'{hours} hour{('s' if hours!= 1 else '')} ago'
+                    days = hours // 24
+                    if days < 30:
+                        return f'{days} day{('s' if days!= 1 else '')} ago'
                     else:
-                        days = hours // 24
-                        if days < 30:
-                            return f'{days} day{('s' if days!= 1 else '')} ago'
+                        months = days // 30
+                        if months < 12:
+                            return f'{months} month{('s' if months!= 1 else '')} ago'
                         else:
-                            months = days // 30
-                            if months < 12:
-                                return f'{months} month{('s' if months!= 1 else '')} ago'
-                            else:
-                                years = months // 12
-                                return f'{years} year{('s' if years!= 1 else '')} ago'
+                            years = months // 12
+                            return f'{years} year{('s' if years!= 1 else '')} ago'
 def membership_duration(iso_str: str) -> str:
     if not iso_str:
         return 'N/A'
@@ -227,14 +236,18 @@ def card_stylesheet(role_color: str | None=None, focused: bool=False) -> str:
 
     This is the dynamic-style escape hatch: the role colour is an arbitrary
     runtime hex string that cannot be expressed as a static QSS selector, so
-    the card frame (border, background tint, focus ring) is rebuilt here and
+    the card frame (border-left, background tint) is rebuilt here and
     re-applied by :meth:`CreatorCard.reapply_theme` on theme switches. Child
     labels are styled by object-name rules in ``build_global_qss`` and so
     follow theme changes automatically without this call.
+
+    The focus ring is no longer part of this string — it is driven by a
+    ``focused`` dynamic property matched in the global stylesheet
+    (``CreatorCard[focused="true"]``), toggled in focusInEvent/focusOutEvent so
+    focusing a card no longer rebuilds the entire per-card stylesheet.
+    ``focused`` is accepted for backward-compatibility but ignored.
     """
     base = f'border-radius: 6px; padding: 4px; background: {C.CARD_BG};'
-    if focused:
-        base += f' border: 2px solid {C.ACCENT};'
     child = 'CreatorCard QWidget { background: transparent; }'
     if not role_color:
         return f'CreatorCard {{ {base} }}' + child
@@ -293,8 +306,18 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._roles = roles or []
         self._activity_data = activity_data or []
         self._trend = trend if trend in ('up', 'down', 'flat', 'none') else 'none'
+        # Cache of parsed tags joined+lowered for fast filter matching without
+        # re-running json.loads on every keystroke. Set by _render_tags.
+        self._tags_lower = ''
+        # Parsed datetime of last_activity, cached so refresh_times only
+        # rebuilds the display string. None when not yet parsed.
+        self._last_activity_dt: datetime | None = None
         self._hover_anim = None
         self._focused = False
+        # Dynamic property matched by the global ``CreatorCard[focused="true"]``
+        # selector for the focus ring. Initialised to False so the selector does
+        # not match until the card is actually focused.
+        self.setProperty('focused', False)
         self._shadow_timer = QTimer(self)
         self._shadow_timer.setSingleShot(False)
         self._shadow_timer.setInterval(16)
@@ -400,6 +423,9 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
             tags = json.loads(self._creator.get('tags', '[]'))
         except (json.JSONDecodeError, TypeError):
             tags = []
+        # Cache the joined+lowered tag string for O(1) filter matching so
+        # _apply_filter doesn't json.loads every card on every keystroke.
+        self._tags_lower = ' '.join(tags).lower()
         for tag in tags:
             chip = QLabel(tag)
             chip.setObjectName('tagChip')
@@ -529,7 +555,17 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
             self._shadow.setColor(_SHADOW_INIT)
         self.setGraphicsEffect(self._shadow)
     def refresh_times(self) -> None:
-        self._activity_label.setText(relative_time(self._last_activity_iso))
+        # Parse the ISO timestamp once and cache it so subsequent refreshes
+        # (e.g. every minute from the dashboard timer) skip fromisoformat.
+        if self._last_activity_dt is None and self._last_activity_iso:
+            try:
+                self._last_activity_dt = datetime.fromisoformat(self._last_activity_iso.replace('Z', '+00:00'))
+            except (ValueError, TypeError):
+                self._last_activity_dt = None
+        if self._last_activity_dt is not None:
+            self._activity_label.setText(relative_time_from_dt(self._last_activity_dt))
+        else:
+            self._activity_label.setText('N/A')
         date_added = self._creator.get('date_added', '')
         self._duration_label.setText(membership_duration(date_added))
     def set_new_activity_visible(self, visible: bool) -> None:
@@ -634,33 +670,33 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
     def focusInEvent(self, event) -> None:  # noqa: N802
         super().focusInEvent(event)
         self._focused = True
-        self.setStyleSheet(card_stylesheet(
-            self._role.get('role_color') if self._role else None,
-            focused=True,
-        ))
+        self.setProperty('focused', True)
+        qss_refresh(self)
 
     def focusOutEvent(self, event) -> None:  # noqa: N802
         super().focusOutEvent(event)
         self._focused = False
-        self.setStyleSheet(card_stylesheet(
-            self._role.get('role_color') if self._role else None,
-            focused=False,
-        ))
+        self.setProperty('focused', False)
+        qss_refresh(self)
 
     def reapply_theme(self) -> None:
         """Re-apply token-driven styling after a theme switch (in place).
 
         The card frame uses the dynamic ``card_stylesheet`` (role colour is a
-        runtime value), so it must be rebuilt here. Child labels are styled by
-        object-name rules in the global stylesheet and update automatically;
-        the sparkline repaints from the live accent on its next paint.
+        runtime value), so it must be rebuilt here. The focus ring is handled
+        by the global ``CreatorCard[focused="true"]`` selector + the ``focused``
+        property, so this rebuild only needs the role-colour base. Child labels
+        are styled by object-name rules in the global stylesheet and update
+        automatically; the sparkline repaints from the live accent on its next
+        paint.
         """
         if sip.isdeleted(self):
             return
         self.setStyleSheet(card_stylesheet(
             self._role.get('role_color') if self._role else None,
-            focused=self._focused,
         ))
+        # Re-evaluate the property-driven focus selector against new tokens.
+        qss_refresh(self)
         self._sparkline.update()
         # Re-color the trend glyph from live theme tokens.
         self._refresh_trend_label()
@@ -763,6 +799,8 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
         self._creator = creator
         self._role = role
         self._last_activity_iso = last_activity
+        # Invalidate the parsed-datetime cache; refresh_times will re-parse.
+        self._last_activity_dt = None
         self._has_new_activity = has_new_activity
         self._subscriber_text = subscriber_text
         if roles is not None:

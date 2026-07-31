@@ -1257,6 +1257,16 @@ keeping the UI responsive even with 1000+ videos.
             if w.isRunning():
                 w.cancel()
                 _retire_verify_worker(w)
+                # Race guard: if the worker finished between the isRunning()
+                # check and the cleanup connect inside _retire_verify_worker,
+                # the cleanup lambda would never fire — clean up directly.
+                if not w.isRunning():
+                    _RETIRED_VERIFY_WORKERS.discard(w)
+                    try:
+                        if not sip.isdeleted(w):
+                            w.deleteLater()
+                    except (RuntimeError, TypeError):
+                        pass
             setattr(self, attr, None)
 
     def closeEvent(self, event) -> None:

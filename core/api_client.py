@@ -43,10 +43,19 @@ def _diag_response(resp: requests.Response, context: str) -> None:
 def _api_error_reason(resp: requests.Response) -> str | None:
     """Return the Google API error ``reason`` for a non-200 response, if any."""
     try:
-        errors = resp.json().get('error', {}).get('errors', [])
-    except (ValueError, json.JSONDecodeError):
+        parsed = resp.json()
+    except (ValueError, json.JSONDecodeError, AttributeError, TypeError):
         return None
-    return errors[0].get('reason') if errors else None
+    if not isinstance(parsed, dict):
+        return None
+    errors = parsed.get('error', {})
+    if not isinstance(errors, dict):
+        return None
+    err_list = errors.get('errors', [])
+    if not isinstance(err_list, list) or not err_list:
+        return None
+    reason = err_list[0].get('reason') if isinstance(err_list[0], dict) else None
+    return reason
 class YouTubeVideo:
     __slots__ = ('content_id', 'title', 'thumbnail_url', 'upload_date', 'view_count', 'is_short', 'is_stream', 'description')
     def __init__(self, content_id: str, title: str, thumbnail_url: str, upload_date: str, view_count: int, is_short: bool, is_stream: bool = False, description: str = '') -> None:
@@ -121,7 +130,7 @@ class YouTubeClient:
             try:
                 resp = self._session.get(YT_PLAYLIST_ITEMS_URL, params=params, timeout=_REQUEST_TIMEOUT)
             except requests.RequestException as exc:
-                logger.warning('YouTube playlistItems request failed for %s: %s', channel_id, exc)
+                logger.warning('YouTube playlistItems request failed for %s: %s', channel_id, type(exc).__name__)
                 complete = False
                 break
             # A 404 playlistNotFound means the channel's uploads playlist
@@ -136,7 +145,7 @@ class YouTubeClient:
             try:
                 _diag_response(resp, f'YouTube playlistItems playlist={playlist_id} page={next_page_token!r}')
             except requests.RequestException as exc:
-                logger.warning('YouTube playlistItems page fetch failed for %s: %s', channel_id, exc)
+                logger.warning('YouTube playlistItems page fetch failed for %s: %s', channel_id, type(exc).__name__)
                 complete = False
                 break
             try:
@@ -210,7 +219,7 @@ class YouTubeClient:
                     info['is_stream'] = v.get('liveStreamingDetails') is not None or (is_zero_duration and not info['is_short'])
                     result[v['id']] = info
             except requests.RequestException as exc:
-                logger.warning('YouTube video stats fetch failed: %s', exc)
+                logger.warning('YouTube video stats fetch failed: %s', type(exc).__name__)
         return result
     @staticmethod
     def _is_short_duration(iso_duration: str) -> bool:
@@ -245,9 +254,13 @@ class YouTubeClient:
             resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
             _diag_response(resp, f'YouTube channel profile id={identifier}')
         except requests.RequestException as exc:
-            logger.warning('YouTube channel profile fetch failed: %s', exc)
+            logger.warning('YouTube channel profile fetch failed: %s', type(exc).__name__)
             return None
-        items = resp.json().get('items', [])
+        try:
+            items = resp.json().get('items', [])
+        except (ValueError, json.JSONDecodeError):
+            logger.warning('YouTube channel profile returned invalid JSON for %s', identifier)
+            return None
         if not items:
             return None
         else:
@@ -341,7 +354,7 @@ class YouTubeClient:
                 resp = self._session.get(YT_SEARCH_URL, params=params, timeout=_REQUEST_TIMEOUT)
                 _diag_response(resp, f'YouTube search q={query!r} page={next_page_token!r}')
             except requests.RequestException as exc:
-                logger.warning('YouTube search page fetch failed for %r: %s', query, exc)
+                logger.warning('YouTube search page fetch failed for %r: %s', query, type(exc).__name__)
                 complete = False
                 break
             try:
@@ -417,7 +430,7 @@ class YouTubeClient:
                 resp = self._session.get(YT_CHANNELS_URL, params=params, timeout=_REQUEST_TIMEOUT)
                 _diag_response(resp, f'YouTube resolve channels n={len(chunk)}')
             except requests.RequestException as exc:
-                logger.warning('YouTube channel resolve failed: %s', exc)
+                logger.warning('YouTube channel resolve failed: %s', type(exc).__name__)
                 continue
             try:
                 data = resp.json()
@@ -573,6 +586,11 @@ class TwitchClient:
                 complete = False
                 break
             items = data.get('data', [])
+            # An empty page means there are no more videos — stop paging
+            # instead of advancing the (stale) cursor and looping forever.
+            if not items:
+                complete = True
+                break
             for v in items:
                 thumb = v.get('thumbnail_url', '').replace('{width}', '446').replace('{height}', '251')
                 raw_views = v.get('view_count', 0) or 0
@@ -614,16 +632,13 @@ def _safe_parse_platforms(raw: Any) -> list[str]:
     except (json.JSONDecodeError, TypeError, ValueError):
         return []
 def load_api_keys(db: DatabaseManager) -> tuple[dict[str, str] | None, str | None]:
-    """Read ``api_keys_json`` from the database.\n\nFalls back to the ``KLEOS_YT_API_KEY`` environment variable when the\nstored YouTube key is missing or fails validation.\n\nReturns ``(keys_dict, None)`` on success or ``(None, error_message)``\nwhen keys are missing or malformed so the UI can show a warning.\n"""
-    raw = db.get_global_setting('api_keys_json')
-    keys = {}
-    if raw and raw != '{}':
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                keys = {k: v for k, v in parsed.items() if isinstance(v, str) and v.strip()}
-        except json.JSONDecodeError:
-            pass
+    """Read ``api_keys_json`` from the database (DPAPI-decrypted via
+    :meth:`DatabaseManager.get_api_keys`).\n\nFalls back to the ``KLEOS_YT_API_KEY`` environment variable when the\nstored YouTube key is missing or fails validation.\n\nReturns ``(keys_dict, None)`` on success or ``(None, error_message)``\nwhen keys are missing or malformed so the UI can show a warning.\n"""
+    try:
+        stored = db.get_api_keys()
+    except Exception:
+        stored = {}
+    keys = {k: v for k, v in stored.items() if isinstance(v, str) and v.strip()}
     env_yt = os.environ.get('KLEOS_YT_API_KEY', '').strip()
     if env_yt and _is_valid_yt_key(env_yt):
         keys.setdefault('youtube', env_yt)
@@ -851,7 +866,7 @@ data contamination.
             try:
                 videos, fetch_complete = client.fetch_latest(channel_id, uploads_playlist_id=uploads_pid, cancel_check=self._cancel.is_set, max_videos=max_videos)
             except requests.RequestException as exc:
-                logger.warning('YouTube fetch failed for %s: %s', c['nickname'], exc)
+                logger.warning('YouTube fetch failed for %s: %s', c['nickname'], type(exc).__name__)
                 self.error.emit(f"YouTube error ({c['nickname']}): {exc}")
                 videos = []
             batch = []
@@ -869,6 +884,11 @@ data contamination.
                 })
                 yt_ids.add(v.content_id)
                 count += 1
+            # Re-check the profile immediately before writing: the network
+            # fetch above can take arbitrarily long, and a switch_profile mid-
+            # fetch would otherwise redirect these writes into the new profile.
+            if self._abort_if_profile_changed():
+                return count
             if batch:
                 self._db.upsert_media_batch(batch)
             # Only prune stale videos when we fetched ALL videos successfully
@@ -878,6 +898,9 @@ data contamination.
             # is a subset — pruning would delete videos we simply haven't
             # fetched yet.
             if max_videos is None and fetch_complete and yt_ids and not self._cancel.is_set():
+                # A second re-check guards the destructive prune specifically.
+                if self._abort_if_profile_changed():
+                    return count
                 self._db.prune_stale_media(c['id'], 'youtube', yt_ids)
             elif not fetch_complete and yt_ids:
                 logger.info('YouTube fetch for %s was incomplete (%d videos saved); skipping prune to preserve existing data', c['nickname'], len(yt_ids))
@@ -967,6 +990,12 @@ data contamination.
                     })
                     tw_ids.add(v.content_id)
                     count += 1
+            # Re-check the profile immediately before writing: the network
+            # fetches above can take arbitrarily long, and a switch_profile
+            # mid-fetch would otherwise redirect these writes into the new
+            # profile.
+            if self._abort_if_profile_changed():
+                return count
             if batch:
                 self._db.upsert_media_batch(batch)
             # If cancelled mid-creator, save what we have and return.
@@ -978,5 +1007,8 @@ data contamination.
             # that still exists on the platform.
             if (max_videos is None and tw_ids and streams_ok and videos_ok
                     and not self._cancel.is_set()):
+                # A second re-check guards the destructive prune specifically.
+                if self._abort_if_profile_changed():
+                    return count
                 self._db.prune_stale_media(c['id'], 'twitch', tw_ids)
         return count

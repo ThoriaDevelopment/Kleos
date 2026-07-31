@@ -17,15 +17,16 @@ from core.db_manager import DatabaseManager
 from core.keyword_verify import KeywordVerifyWorker
 from core.verify_worker import VerifyWorker
 from core.ai_client import prepare_verify
+from core.local_llm import _LIVE_LIST_WORKERS
 from ui.verify_dialog import VerifyDialog, VerifyResult
 logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
 from ui.components.creator_card import CreatorCard, format_subscriber_count
-from ui.components.history_dialog import HistoryDialog
+from ui.components.history_dialog import HistoryDialog, _RETIRED_VERIFY_WORKERS
 from ui.dialog_utils import dark_question, dark_warning, dark_info, handle_fullscreen_keypress, apply_native_title_bar
 from ui.settings_dialog import SettingsDialog
 from ui.analytics_window import AnalyticsWindow
-from ui.discover_window import DiscoverWindow
+from ui.discover_window import DiscoverWindow, _RETIRING_WORKERS
 from ui.notification import NotificationToast
 class GradientCanvasV2(QWidget):
     """Full-window underlay widget that paints a slow-breathing gradient\nusing design-system colour tokens.\n\nThe gradient alternates between C.BG_BASE and C.BG_DEEP at ±4% opacity\nover a 10-second sinusoidal loop driven by QVariantAnimation.\nNo layout geometry is recalculated — only a paint event fires.\n"""
@@ -37,6 +38,11 @@ class GradientCanvasV2(QWidget):
         self._breathe = 0.0
         self._col_a = QColor(C.BG_BASE)
         self._col_b = QColor(C.BG_DEEP)
+        # Last painted RGB, tracked so _on_value only triggers a repaint when
+        # the interpolated colour actually changes by a visible amount — the
+        # QVariantAnimation fires ~60×/s but the breathing delta between ticks
+        # is usually sub-1 RGB unit, so this drops most repaints.
+        self._last_rgb: tuple[int, int, int] | None = None
         self._anim = QVariantAnimation(self)
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
@@ -58,7 +64,16 @@ class GradientCanvasV2(QWidget):
         self._anim.start()
     def _on_value(self, val: float) -> None:
         self._breathe = val
-        self.update()
+        # Only repaint when the interpolated colour has actually changed by at
+        # least one RGB unit since the last paint; the animation ticks far
+        # faster than the breathing colour moves, so this coalesces most
+        # updates and keeps the dashboard idle-CPU low.
+        r = int(self._col_a.red() + (self._col_b.red() - self._col_a.red()) * val)
+        g = int(self._col_a.green() + (self._col_b.green() - self._col_a.green()) * val)
+        b = int(self._col_a.blue() + (self._col_b.blue() - self._col_a.blue()) * val)
+        if self._last_rgb != (r, g, b):
+            self._last_rgb = (r, g, b)
+            self.update()
     def showEvent(self, event) -> None:
         """Resume breathing animation when the window becomes visible."""
         super().showEvent(event)
@@ -92,6 +107,9 @@ class GradientCanvasV2(QWidget):
         """Update gradient colours after a theme change and repaint."""
         self._col_a = QColor(C.BG_BASE)
         self._col_b = QColor(C.BG_DEEP)
+        # Invalidate the coalescing cache so the next tick repaints with the
+        # new palette even if the breathing value hasn't moved.
+        self._last_rgb = None
         self.update()
 class _InlineEditDialog(QDialog):
     _CALENDAR_QSS = None  # Built dynamically in __init__ for theme support
@@ -531,9 +549,9 @@ class MainWindow(QMainWindow):
         self._pending_card_data = []
         last_activity = self._db.bulk_last_activity()
         new_activity_ids = self._db.bulk_new_activity_creators()
-        self._sub_counts = self._db.bulk_subscriber_counts()
-        sub_counts = self._sub_counts
         creators = self._db.get_creators()
+        self._sub_counts = self._db.bulk_subscriber_counts(creators)
+        sub_counts = self._sub_counts
         roles = {r['id']: r for r in self._db.get_roles()}
         roles_list = list(roles.values())
         # Activity sparkline data
@@ -703,16 +721,13 @@ class MainWindow(QMainWindow):
         for cid, card in self._cards.items():
             role_match = (self._active_filter_role_id is None
                           or card.role_id == self._active_filter_role_id)
-            # Search matches nickname or tags
+            # Search matches nickname or tags.  Tags are pre-cached on the card
+            # (card._tags_lower) so this stays O(1) per card per keystroke
+            # instead of json.loads-ing every card on every key.
             nickname_match = (not self._search_text
                               or self._search_text in card.creator.get('nickname', '').lower())
-            tags_str = ' '.join(
-                json.loads(card.creator.get('tags', '[]'))
-                if isinstance(card.creator.get('tags', '[]'), str)
-                else card.creator.get('tags', [])
-            ).lower()
             tag_match = (not self._search_text
-                         or self._search_text in tags_str)
+                         or self._search_text in getattr(card, '_tags_lower', ''))
             card.setVisible(role_match and (nickname_match or tag_match))
     def _refresh_profile_combo(self) -> None:
         """Repopulate the profile dropdown without triggering a switch."""
@@ -1265,23 +1280,19 @@ class MainWindow(QMainWindow):
         """Check for subscriber and view milestones after a fetch."""
         if (self._db.get_setting('notifications_enabled') or '0') != '1':
             return
-        sub_counts = self._db.bulk_subscriber_counts()
         creators = self._db.get_creators()
+        sub_counts = self._db.bulk_subscriber_counts(creators)
         view_totals = self._db.bulk_view_totals()
+        # Parse the view thresholds once instead of re-reading the setting per
+        # creator (the old check_view_thresholds read it on every call).
+        thresholds_str = self._db.get_setting('notification_view_thresholds') or '10000,100000,1000000'
+        view_thresholds = [int(t.strip()) for t in thresholds_str.split(',') if t.strip().isdigit()]
         names = {c['id']: c.get('nickname', 'Unknown') for c in creators}
+        # Bulk milestone checks: one existing-alerts SELECT + one add_alerts
+        # INSERT each, instead of N per-creator has_alert/add_alert round-trips.
         pending_alerts = []
-        for c in creators:
-            cid = c['id']
-            counts = sub_counts.get(cid, {})
-            yt_subs = counts.get('youtube', 0)
-            tw_follows = counts.get('twitch', 0)
-            max_subs = max(yt_subs, tw_follows)
-            if max_subs > 0:
-                pending_alerts.extend(self._db.check_subscriber_milestones(cid, max_subs))
-            # Check per-creator total views (one bulk query instead of N get_media calls)
-            total_views = view_totals.get(cid, 0)
-            if total_views > 0:
-                pending_alerts.extend(self._db.check_view_thresholds(cid, total_views))
+        pending_alerts.extend(self._db.check_subscriber_milestones_bulk(creators, sub_counts))
+        pending_alerts.extend(self._db.check_view_thresholds_bulk(creators, view_totals, view_thresholds))
         for alert in pending_alerts:
             name = names.get(alert['creator_id'], 'Unknown')
             if alert['type'] == 'subscriber_milestone':
@@ -1485,12 +1496,35 @@ class MainWindow(QMainWindow):
                     return
         super().dropEvent(event)
 
+    def _drain_retired_workers(self) -> None:
+        """Wait briefly for retired background workers to finish so they don't
+        touch the database after we close it on shutdown.
+
+        Covers the module-level retire registries: Discover/VideoSearch workers,
+        per-creator verify workers, local-model list probes, and model pulls.
+        """
+        buckets = [_RETIRING_WORKERS, _RETIRED_VERIFY_WORKERS, _LIVE_LIST_WORKERS]
+        try:
+            from ui.install_local_models_dialog import _RETIRING_PULL_WORKERS
+            buckets.append(_RETIRING_PULL_WORKERS)
+        except Exception:
+            pass
+        for bucket in buckets:
+            for w in list(bucket):
+                try:
+                    if not sip.isdeleted(w) and w.isRunning():
+                        w.wait(2000)
+                except (RuntimeError, TypeError):
+                    pass
+
     def closeEvent(self, event) -> None:
         running_workers = []
         if self._fetch_worker is not None and self._fetch_worker.isRunning():
             running_workers.append(self._fetch_worker)
         if self._verify_worker is not None and self._verify_worker.isRunning():
             running_workers.append(self._verify_worker)
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            running_workers.append(self._keyword_worker)
 
         if not running_workers:
             self._timer.stop()
@@ -1501,6 +1535,7 @@ class MainWindow(QMainWindow):
                 except (RuntimeError, TypeError):
                     pass
             save_geometry(self, 'MainWindow', self._db, global_store=True)
+            self._drain_retired_workers()
             self._db.close()
             super().closeEvent(event)
             return
@@ -1536,6 +1571,7 @@ class MainWindow(QMainWindow):
         still_running = (
             (self._fetch_worker is not None and self._fetch_worker.isRunning())
             or (self._verify_worker is not None and self._verify_worker.isRunning())
+            or (self._keyword_worker is not None and self._keyword_worker.isRunning())
         )
         if not still_running:
             self._timer.stop()
@@ -1545,6 +1581,7 @@ class MainWindow(QMainWindow):
                     self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
                 except (RuntimeError, TypeError):
                     pass
+            self._drain_retired_workers()
             self._db.close()
             self.close()
 

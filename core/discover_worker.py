@@ -299,6 +299,11 @@ class DiscoverWorker(QThread):
         results.sort(key=lambda r: r['potential_score'], reverse=True)
 
         # ── 7. Persist ──
+        # Re-check the profile immediately before writing: the scoring loop
+        # above can take a while, and a switch_profile would otherwise persist
+        # this search's results into the new profile's database.
+        if self._profile_changed():
+            return []
         self._persist(query, results)
         return results
 
@@ -551,6 +556,10 @@ class VideoSearchWorker(QThread):
 
         # ── 6. Cache (no discovered_creators persistence — video results are
         #    session-scoped; re-running reads from the cache for 0 units). ──
+        # Re-check the profile before writing the cache so a switch_profile
+        # can't store these results under the new profile's cache key.
+        if self._profile_changed():
+            return []
         params_json = json.dumps(self._params, default=str)
         self._db.save_cached_search(
             DiscoverWorker.params_hash(self._params), params_json, json.dumps(results),

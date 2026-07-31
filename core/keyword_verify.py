@@ -111,43 +111,50 @@ class KeywordVerifyWorker(QThread):
 
         verified_count = 0
 
-        for i, row in enumerate(unverified, start=1):
-            if self._cancel.is_set():
-                break
-
-            # Abort if the user switched profiles mid-verification.
-            if self._db.current_profile != self._expected_profile:
-                logger.warning(
-                    'Profile changed from \'%s\' to \'%s\' during keyword verification — aborting.',
-                    self._expected_profile, self._db.current_profile,
-                )
-                self.aborted.emit()
-                return
-
-            self.progress.emit(i, total)
-            self.progress_text.emit(f"Checking {i}/{total} videos…")
-
-            content_id = row["content_id"]
-            title = (row.get("title") or "").strip()
-            description = (row.get("description") or "").strip()
-
-            # Check title and description against all keyword patterns.
-            matched = False
-            for pattern in patterns:
-                if pattern.search(title) or pattern.search(description):
-                    matched = True
+        try:
+            for i, row in enumerate(unverified, start=1):
+                if self._cancel.is_set():
                     break
 
-            if matched:
-                # Cooperative guard: verify the profile hasn't changed.
+                # Abort if the user switched profiles mid-verification.
                 if self._db.current_profile != self._expected_profile:
                     logger.warning(
-                        'Profile changed during keyword verification — aborting.'
+                        'Profile changed from \'%s\' to \'%s\' during keyword verification — aborting.',
+                        self._expected_profile, self._db.current_profile,
                     )
                     self.aborted.emit()
                     return
-                self._db.set_verified(content_id, True)
-                self.video_verified.emit(content_id)
-                verified_count += 1
+
+                self.progress.emit(i, total)
+                self.progress_text.emit(f"Checking {i}/{total} videos…")
+
+                content_id = row["content_id"]
+                title = (row.get("title") or "").strip()
+                description = (row.get("description") or "").strip()
+
+                # Check title and description against all keyword patterns.
+                matched = False
+                for pattern in patterns:
+                    if pattern.search(title) or pattern.search(description):
+                        matched = True
+                        break
+
+                if matched:
+                    # Atomic profile guard + write: set_verified_if_profile checks
+                    # the profile and updates the row under a single lock so a
+                    # switch_profile can't redirect the write into the wrong DB.
+                    if not self._db.set_verified_if_profile(content_id, True, self._expected_profile):
+                        logger.warning(
+                            'Profile changed during keyword verification — aborting.'
+                        )
+                        self.aborted.emit()
+                        return
+                    self.video_verified.emit(content_id)
+                    verified_count += 1
+        except RuntimeError:
+            # The database was closed under us during shutdown — fail quiet
+            # instead of raising an unhandled worker-thread exception.
+            logger.debug('KeywordVerifyWorker aborted: database closed during shutdown.')
+            return
 
         self.done.emit(verified_count, total)

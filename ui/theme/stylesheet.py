@@ -217,6 +217,12 @@ def build_main_window_qss() -> str:
         f'QLabel#emptyDesc {{ font-size: 13px; color: {C.TEXT_SECONDARY}; background: transparent; }}\n'
         f'QPushButton#emptyBtn {{ background: {C.ACCENT}; color: {C.TEXT_ON_ACCENT}; border: none; border-radius: {M.RADIUS_LG}px; padding: 10px {M.SPACE_XL}px; font-size: 14px; font-weight: bold; }}\n'
         f'QPushButton#emptyBtn:hover {{ background: {C.ACCENT_HOVER}; }}\n'
+        # Focus ring for CreatorCard is driven by a dynamic ``focused`` property
+        # (toggled in focusInEvent/focusOutEvent + qss_refresh) instead of
+        # rebuilding the per-card stylesheet on every focus change.  The
+        # per-card stylesheet sets border-left (role colour); this selector
+        # sets the other three sides when focused.
+        f'CreatorCard[focused="true"] {{ border: 2px solid {C.ACCENT}; }}\n'
     )
 
 

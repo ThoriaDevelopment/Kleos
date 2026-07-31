@@ -26,6 +26,9 @@ _REQUEST_TIMEOUT = 15
 # Pre-scaling dimensions: 2× the display size (160×90) for HiDPI screens.
 _THUMB_SCALE_W = 320
 _THUMB_SCALE_H = 180
+# Profile pictures are shown at ~32px in CreatorCards; pre-scale to 64×64 (2× for
+# HiDPI) so the card decodes a tiny image instead of a multi-megabyte original.
+_PFP_SIZE = 64
 # Per-URL locks prevent concurrent downloads of the same thumbnail.
 # Without this, two threads can write to the same .tmp file and race
 # on os.replace(), causing PermissionError on Windows.
@@ -102,6 +105,47 @@ def _scale_and_save(tmp_path: Path, dest_path: Path) -> bool:
         return True
     except Exception as exc:
         logger.warning('Thumbnail scaling failed, using original: %s', exc)
+        try:
+            os.replace(str(tmp_path), str(dest_path))
+            return True
+        except OSError:
+            return False
+
+
+def _scale_and_save_pfp(tmp_path: Path, dest_path: Path) -> bool:
+    """Scale the profile picture at *tmp_path* to 64×64 and save to *dest_path*.
+
+    Mirrors :func:`_scale_and_save` but square-crops to the avatar size so
+    CreatorCard decodes a tiny image rather than a multi-megabyte original.
+    Falls back to a plain ``os.replace`` on any failure so the PFP still shows.
+    """
+    try:
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtGui import QImage
+        img = QImage(str(tmp_path))
+        if img.isNull():
+            os.replace(str(tmp_path), str(dest_path))
+            return True
+        scaled = img.scaled(
+            _PFP_SIZE, _PFP_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        ext = dest_path.suffix.lower()
+        fmt = 'PNG' if ext == '.png' else 'JPG'
+        if scaled.save(str(dest_path), fmt, quality=85):
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return True
+        os.replace(str(tmp_path), str(dest_path))
+        return True
+    except ImportError:
+        os.replace(str(tmp_path), str(dest_path))
+        return True
+    except Exception as exc:
+        logger.warning('PFP scaling failed, using original: %s', exc)
         try:
             os.replace(str(tmp_path), str(dest_path))
             return True
@@ -201,7 +245,9 @@ def ensure_pfp(url: str, nickname: str, creator_id: int | None = None) -> Option
                 with open(tmp, 'wb') as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         f.write(chunk)
-                tmp.replace(local)
+                # Pre-scale to 64×64 so CreatorCard decodes a tiny image
+                # instead of a full-resolution original each render.
+                _scale_and_save_pfp(tmp, local)
             return str(local)
         except (requests.RequestException, OSError) as exc:
             logger.warning('PFP download failed for %s: %s', url, exc)
