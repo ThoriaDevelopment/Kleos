@@ -463,6 +463,20 @@ class CreatorCard(CreatorCardAnimMixin, QFrame):
             self._shadow.setColor(_SHADOW_INIT)
         self.setGraphicsEffect(self._shadow)
         self._base_pos = self.pos()
+
+    def cancel_cascade(self) -> None:
+        """Release the cascade flag without touching the current graphics effect.
+
+        Used when a staggered cascade launch can't run because the card's
+        cascade opacity effect was already replaced (e.g. the card was
+        pressed, or the grid was rebuilt mid-cascade).  Leaves whatever
+        effect is currently installed in place — so we don't fight a
+        running press animation — and simply clears the flag so hover
+        interactions work again.
+        """
+        if sip.isdeleted(self):
+            return
+        self._cascade_animating = False
     def _run_pos_anim(self, target: QPoint, duration: int, curve: QEasingCurve.Type) -> None:
         if self._hover_anim:
             if sip.isdeleted(self._hover_anim):

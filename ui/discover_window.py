@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
 from core.db_manager import DatabaseManager
 from core.discover_ai_worker import EvaluateWorker
 from core.discover_worker import DiscoverWorker, VideoSearchWorker
+from core.local_llm import get_ollama_host, ListLocalModelsWorker
 from ui.verify_dialog import _PROVIDERS as _VERIFY_PROVIDERS  # reuse the model list
 from ui.video_search_stats import VideoSearchStatsDialog
 from ui.candidate_pool import CandidatePoolDialog
@@ -78,7 +80,12 @@ _VIDEO_SORTS = [
 
 
 def _all_ai_models() -> list[tuple[str, str]]:
-    """Flatten the verify-dialog provider model list to (id, label) pairs."""
+    """Flatten the verify-dialog cloud provider model list to (id, label) pairs.
+
+    Local (Ollama) models are NOT included here — they are appended
+    asynchronously by the Evaluate dialog so opening it never blocks on a
+    network round-trip to Ollama.
+    """
     out: list[tuple[str, str]] = []
     for prov in _VERIFY_PROVIDERS.values():
         for mid, label, _desc in prov['models']:
@@ -87,8 +94,9 @@ def _all_ai_models() -> list[tuple[str, str]]:
 
 
 def _populate_model_combo(combo: QComboBox, db: DatabaseManager) -> None:
-    """Fill an AI-model combo with every available model and select the
-    saved one.
+    """Fill an AI-model combo with the cloud models and select the saved one.
+
+    Local models are appended later by :meth:`EvaluateDialog._load_local_models_async`.
 
     Reads the Discover-specific ``discover_ai_model`` setting first, then
     falls back to the Verify tab's ``auto_verify_model`` so a user who has
@@ -348,7 +356,7 @@ class DiscoverWindow(QDialog):
         self._candidates_btn.clicked.connect(self._on_open_candidates)
         header.addWidget(self._candidates_btn)
         vbox.addLayout(header)
-        hint = QLabel('Search YouTube for small, high-potential creators in a niche. No monitoring — just discovery.')
+        hint = QLabel('Search YouTube for small, high-potential creators in a niche.')
         hint.setObjectName('hintLabel')
         vbox.addWidget(hint)
 
@@ -434,6 +442,8 @@ class DiscoverWindow(QDialog):
         row1.setSpacing(8)
         self._v_kw_edit = QLineEdit()
         self._v_kw_edit.setPlaceholderText('Keywords, e.g. "minecraft SMP server"')
+        self._prefilled_kw = (self._db.get_setting('verify_keywords') or '').strip()
+        self._v_kw_edit.setText(self._prefilled_kw)
         self._v_kw_edit.setMinimumWidth(260)
         row1.addWidget(QLabel('Keywords:'))
         row1.addWidget(self._v_kw_edit, 1)
@@ -572,6 +582,8 @@ class DiscoverWindow(QDialog):
 
         self._kw_edit = QLineEdit()
         self._kw_edit.setPlaceholderText('Keywords, e.g. "minecraft SMP server"')
+        self._prefilled_kw = (self._db.get_setting('verify_keywords') or '').strip()
+        self._kw_edit.setText(self._prefilled_kw)
         self._kw_edit.setMinimumWidth(260)
         row.addWidget(QLabel('Keywords:'))
         row.addWidget(self._kw_edit, 1)
@@ -747,7 +759,12 @@ class DiscoverWindow(QDialog):
             'video_category_id': self._category_combo.currentData() or None,
         }
         query = self._kw_edit.text().strip()
-        if query:
+        # Only send an explicit query when the user has edited the box away
+        # from the prefilled community keywords; an unedited prefill behaves
+        # as an empty box so the search falls back to the community keywords
+        # exactly as before the prefill (preserving the worker's short-token
+        # filter and the cached-result key).
+        if query and query != self._prefilled_kw:
             params['query'] = query
         seeds = [s.strip() for s in self._seed_edit.text().split(',') if s.strip()]
         if seeds:
@@ -859,7 +876,10 @@ class DiscoverWindow(QDialog):
                 self._v_timeframe_combo.currentData() or 'all'),
         }
         q = (query if query is not None else self._v_kw_edit.text()).strip()
-        if q:
+        # Treat an unedited prefilled box as empty (see _on_run_search) so a
+        # plain Run Search falls back to community keywords as before; an
+        # explicit query arg (e.g. Media Coverage) is always honored.
+        if q and (query is not None or q != self._prefilled_kw):
             params['query'] = q
         return params
 
@@ -1218,6 +1238,8 @@ class EvaluateDialog(QDialog):
         self._db = db
         self._data = data
         self._worker: QThread | None = None
+        self._list_worker: QThread | None = None
+        self._saved_model: str | None = None
         self.setWindowTitle('AI Evaluation')
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(520, 460)
@@ -1237,6 +1259,13 @@ class EvaluateDialog(QDialog):
         model_row.addWidget(QLabel('Model:'))
         self._model_combo = QComboBox()
         _populate_model_combo(self._model_combo, self._db)
+        # Remember the saved selection so a local model can be re-selected once
+        # the async local-models fetch appends it.
+        self._saved_model = (
+            self._db.get_setting('discover_ai_model')
+            or self._db.get_setting('auto_verify_model') or None
+        )
+        self._load_local_models_async()
         model_row.addWidget(self._model_combo, 1)
         vbox.addLayout(model_row)
 
@@ -1309,12 +1338,57 @@ class EvaluateDialog(QDialog):
         self._worker.finished.connect(lambda: self._run_btn.setEnabled(True))
         self._worker.start()
 
+    def _load_local_models_async(self) -> None:
+        """Fetch installed local models off the GUI thread and append them to
+        the combo when Ollama responds, so opening this dialog never blocks.
+        """
+        worker = ListLocalModelsWorker(get_ollama_host(self._db))
+        self._list_worker = worker
+        worker.done.connect(self._on_local_models_done)
+        worker.error.connect(self._on_local_models_error)
+        worker.finished.connect(self._retire_list_worker)
+        worker.start()
+
+    def _on_local_models_done(self, tags: list) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self._model_combo):
+            return
+        for tag in tags:
+            self._model_combo.addItem(f'Local {tag}', f'ollama:{tag}')
+        # Re-select the saved model if it's a local one that just appeared — but
+        # only if the user hasn't already moved off the cloud fallback
+        # (currentIndex == 0 means the saved model wasn't a cloud one, so the
+        # combo was left on the first cloud item). We never override a
+        # deliberate pick made while waiting for Ollama.
+        if (self._saved_model and self._saved_model.startswith('ollama:')
+                and self._model_combo.currentIndex() == 0):
+            for i in range(self._model_combo.count()):
+                if self._model_combo.itemData(i) == self._saved_model:
+                    self._model_combo.setCurrentIndex(i)
+                    break
+
+    def _on_local_models_error(self, _msg: str) -> None:
+        # Ollama not running → no local models to append; nothing to do.
+        pass
+
+    def _retire_list_worker(self) -> None:
+        self._list_worker = None
+
     def closeEvent(self, event) -> None:  # noqa: N802
         # Don't let a running AI worker be destroyed with the dialog.
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             _retire_worker(self._worker)
         self._worker = None
+        # Drop an in-flight local-models fetch too; it self-retires via the
+        # module-level registry in core.local_llm.
+        w = self._list_worker
+        if w is not None and not sip.isdeleted(w):
+            for name in ('done', 'error', 'finished'):
+                try:
+                    getattr(w, name).disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._list_worker = None
         super().closeEvent(event)
 
     def _on_done(self, verdict: str, rationale: str, raw: str) -> None:

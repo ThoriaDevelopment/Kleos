@@ -75,10 +75,12 @@ class KeywordVerifyWorker(QThread):
         db: DatabaseManager,
         keywords: list[str],
         parent: Any | None = None,
+        creator_id: int | None = None,
     ) -> None:
         super().__init__(parent)
         self._db = db
         self._keywords = keywords
+        self._creator_id = creator_id
         self._cancel = threading.Event()
         self._expected_profile = ''
 
@@ -101,7 +103,7 @@ class KeywordVerifyWorker(QThread):
             self.done.emit(0, 0)
             return
 
-        unverified = self._db.get_unverified_media()
+        unverified = self._db.get_unverified_media(creator_id=self._creator_id)
         total = len(unverified)
         if total == 0:
             self.done.emit(0, 0)

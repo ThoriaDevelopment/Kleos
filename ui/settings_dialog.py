@@ -1,11 +1,16 @@
 from __future__ import annotations
 import json
 from typing import Any
+from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QColorDialog, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from PyQt6.QtGui import QColor
 from core.db_manager import DatabaseManager
+from core.cache_manager import clear_untracked_thumbnails
+from core.local_llm import get_ollama_host, ListLocalModelsWorker
 from ui.dialog_utils import dark_info, dark_question, dark_warning
+from ui.install_local_models_dialog import InstallLocalModelsDialog
+from ui.verify_dialog import _PROVIDERS as _VERIFY_PROVIDERS
 from ui.discover_window import _SHORTS_MODES, _SORTS
 from ui.geometry import restore_geometry, save_geometry
 from ui.theme.stylesheet import build_dialog_qss, qss_refresh
@@ -88,18 +93,111 @@ class _ApiKeysTab(QWidget):
 class _VerifyTab(QWidget):
     """Community description, AI model selection, and keyword verification settings."""
     _MAX_WORDS = 300
-    _MODELS = [
-        ('Haiku 4.5 (fastest, cheapest)', 'claude-haiku-4-5-20251001'),
-        ('Sonnet 4.6 (balanced)', 'claude-sonnet-4-6'),
-        ('Opus 4.8 (most thorough)', 'claude-opus-4-8'),
-        ('Gemini 2.5 Flash (fast)', 'gemini-2.5-flash'),
-        ('Gemini 2.5 Pro (balanced)', 'gemini-2.5-pro'),
-        ('Gemini 2.5 Flash Lite (lightweight)', 'gemini-2.5-flash-lite'),
-        ('Gemini 3.5 Flash (latest)', 'gemini-3.5-flash'),
-    ]
+    @staticmethod
+    def _base_models() -> list[tuple[str, str]]:
+        """Cloud models, sourced from the single verify-dialog provider list.
+
+        Returns ``(label, model_id)`` pairs.  Deriving from
+        ``_VERIFY_PROVIDERS`` keeps the IDs in sync with the Verify dialog and
+        the Discover combo (one source of truth) and avoids the swapped-tuple
+        drift a separate hand-maintained list would risk.  Providers are
+        iterated in a fixed order so the combo keeps its Claude-then-Gemini
+        ordering regardless of dict insertion order.
+        """
+        models: list[tuple[str, str]] = []
+        for key in ('claude', 'gemini'):
+            prov = _VERIFY_PROVIDERS[key]
+            for mid, short, desc in prov['models']:
+                models.append((f"{prov['label']} {short} ({desc})", mid))
+        return models
+    def _populate_cloud_models(self, saved_model: str | None = None) -> None:
+        """Fill the combo with cloud models instantly (no network)."""
+        self._model_combo.clear()
+        saved = saved_model or (self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001')
+        for i, (label, model_id) in enumerate(self._base_models()):
+            self._model_combo.addItem(label, model_id)
+            if model_id == saved:
+                self._model_combo.setCurrentIndex(i)
+    def _apply_local_models(self, tags: list[str]) -> None:
+        """Append/replace the local-model portion of the combo without
+        disturbing the cloud selection.
+
+        ``tags`` is the list of bare Ollama tags (empty when Ollama is off or
+        has no models installed).  The user's current selection is preserved
+        only if it still exists afterwards.
+        """
+        if sip.isdeleted(self) or sip.isdeleted(self._model_combo):
+            return
+        current = self._model_combo.currentData()
+        # Drop any previously-appended local entries.
+        i = 0
+        while i < self._model_combo.count():
+            data = self._model_combo.itemData(i)
+            if isinstance(data, str) and data.startswith('ollama:'):
+                self._model_combo.removeItem(i)
+            else:
+                i += 1
+        for tag in tags:
+            self._model_combo.addItem(f"{tag} (local)", f"ollama:{tag}")
+
+        if self._auto_select_saved_local:
+            # First load: honour a saved local model now that it's available.
+            self._auto_select_saved_local = False
+            saved = self._db.get_setting('auto_verify_model')
+            if saved and saved.startswith('ollama:'):
+                for j in range(self._model_combo.count()):
+                    if self._model_combo.itemData(j) == saved:
+                        self._model_combo.setCurrentIndex(j)
+                        return
+                # Saved local model not installed — fall through to preserve
+                # the cloud fallback already set by _populate_cloud_models.
+
+        # Preserve the current selection (saved cloud model set by
+        # _populate_cloud_models, or a deliberate pick made while the tab was
+        # open) only if it still exists afterwards.
+        if current:
+            for j in range(self._model_combo.count()):
+                if self._model_combo.itemData(j) == current:
+                    self._model_combo.setCurrentIndex(j)
+                    break
+    def _refresh_local_models_async(self) -> None:
+        """Fetch installed local models off the GUI thread and apply them
+        when Ollama responds.  If a fetch is already in flight, queue another
+        for when it finishes so a refresh requested mid-fetch isn't lost.
+        """
+        if self._list_worker is not None:
+            self._pending_refresh = True
+            return
+        worker = ListLocalModelsWorker(get_ollama_host(self._db))
+        self._list_worker = worker
+        worker.done.connect(self._on_local_models_done)
+        worker.error.connect(self._on_local_models_error)
+        worker.finished.connect(self._retire_list_worker)
+        worker.start()
+    def _on_local_models_done(self, tags: list) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self._model_combo):
+            return
+        self._apply_local_models(list(tags))
+    def _on_local_models_error(self, _msg: str) -> None:
+        if sip.isdeleted(self) or sip.isdeleted(self._model_combo):
+            return
+        self._apply_local_models([])
+    def _retire_list_worker(self) -> None:
+        self._list_worker = None
+        if self._pending_refresh:
+            self._pending_refresh = False
+            self._refresh_local_models_async()
     def __init__(self, db: DatabaseManager, parent: QWidget | None=None) -> None:
         super().__init__(parent)
         self._db = db
+        self._list_worker: ListLocalModelsWorker | None = None
+        self._pending_refresh = False
+        # On the very first async local-model load we re-select the saved model
+        # if it's a local one (matching the old synchronous populate, which
+        # selected saved cloud-or-local in one go). Subsequent refreshes
+        # (tab re-show, post-install) only preserve the user's current pick —
+        # we never override a deliberate selection made while the tab was open.
+        self._auto_select_saved_local = True
         layout = QVBoxLayout(self)
         name_label = QLabel('Community Name:')
         name_label.setObjectName('formLabel')
@@ -147,12 +245,22 @@ class _VerifyTab(QWidget):
         model_label.setObjectName('formLabel')
         layout.addWidget(model_label)
         self._model_combo = QComboBox()
-        saved_model = db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
-        for i, (label, model_id) in enumerate(_VerifyTab._MODELS):
-            self._model_combo.addItem(label, model_id)
-            if model_id == saved_model:
-                self._model_combo.setCurrentIndex(i)
-        layout.addWidget(self._model_combo)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(8)
+        model_row.addWidget(self._model_combo, 1)
+        self._install_local_btn = QPushButton('Install Local AI Models')
+        self._install_local_btn.setToolTip(
+            "Download a small AI model that runs locally via Ollama — no "
+            "cloud API key needed. Requires the free Ollama app."
+        )
+        self._install_local_btn.clicked.connect(self._on_install_local_models)
+        model_row.addWidget(self._install_local_btn)
+        layout.addLayout(model_row)
+        # Cloud models populate instantly; installed local models are fetched
+        # off the GUI thread and appended when Ollama responds so opening this
+        # tab never blocks on a network round-trip.
+        self._populate_cloud_models()
+        self._refresh_local_models_async()
         layout.addSpacing(12)
         kw_label = QLabel('Verification Keywords:')
         kw_label.setObjectName('formLabel')
@@ -171,6 +279,22 @@ class _VerifyTab(QWidget):
         self._keywords_edit.setPlaceholderText('e.g. arch.mc, ArchMC, ArchMC Network, mc.arch.lol')
         layout.addWidget(self._keywords_edit)
         layout.addStretch(1)
+    def _on_install_local_models(self) -> None:
+        """Open the local-model installer, then refresh the model dropdown."""
+        dlg = InstallLocalModelsDialog(self._db, self)
+        dlg.exec()
+        # A model may have been installed/removed — re-fetch the installed set
+        # off the GUI thread.  The user's current (possibly unsaved) selection
+        # is preserved by _apply_local_models.
+        self._refresh_local_models_async()
+
+    def showEvent(self, event) -> None:
+        # Reflect the current Ollama state each time the tab is shown — fetched
+        # off the GUI thread so the tab opens instantly.  The cloud combo is
+        # already built in __init__; this only refreshes the local entries.
+        self._refresh_local_models_async()
+        super().showEvent(event)
+
     def _update_word_count(self) -> None:
         text = self._desc_edit.toPlainText()
         word_count = len(text.split()) if text.strip() else 0
@@ -244,6 +368,17 @@ class _ProfilesTab(QWidget):
         io_row.addWidget(import_creator_btn)
         io_row.addStretch(1)
         layout.addLayout(io_row)
+        backup_row = QHBoxLayout()
+        clear_backups_btn = QPushButton('Clear Backups')
+        clear_backups_btn.setObjectName('danger')
+        clear_backups_btn.setToolTip(
+            'Delete all stored profile backup files from the AppData storage '
+            'folder. This frees disk space but removes the automatic '
+            'point-in-time backups; new backups are created on future changes.')
+        clear_backups_btn.clicked.connect(self._on_clear_backups)
+        backup_row.addWidget(clear_backups_btn)
+        backup_row.addStretch(1)
+        layout.addLayout(backup_row)
         layout.addStretch(1)
     def _refresh_list(self) -> None:
         self._list.clear()
@@ -362,6 +497,18 @@ class _ProfilesTab(QWidget):
         self._refresh_list()
         dark_info(self, 'Imported', f'Profile "{name}" imported successfully.')
 
+    def _on_clear_backups(self) -> None:
+        """Delete all stored profile backup files from the AppData folder."""
+        result = dark_question(
+            self, 'Clear Backups',
+            'This permanently deletes all stored profile backup files from '
+            'the AppData storage folder. New backups will be created '
+            'automatically on future changes.\n\nContinue?')
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        removed = self._db.clear_backups()
+        dark_info(self, 'Backups Cleared', f'Deleted {removed} backup file(s).')
+
     def _on_import_creator(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, 'Import Creator', '', 'JSON Files (*.json)')
@@ -420,7 +567,7 @@ class _RoleManagerTab(QWidget):
         self._name_input = QLineEdit()
         self._name_input.setPlaceholderText('Role name…')
         form.addWidget(self._name_input, 1)
-        self._color_hex = QLineEdit('#C83232')
+        self._color_hex = QLineEdit(C.ACCENT)
         self._color_hex.setFixedWidth(90)
         self._color_hex.setAlignment(Qt.AlignmentFlag.AlignCenter)
         form.addWidget(self._color_hex)
@@ -439,6 +586,14 @@ class _RoleManagerTab(QWidget):
         edit_btn = QPushButton('Edit Selected Role')
         edit_btn.clicked.connect(self._on_edit)
         layout.addWidget(edit_btn)
+        clear_btn = QPushButton('Clear Cache')
+        clear_btn.setToolTip(
+            'Delete cached video thumbnails and profile pictures that are no '
+            'longer tracked by any profile. Files still in use — including '
+            'those tracked by other profiles — are kept. Removed files are '
+            're-downloaded on the next fetch if needed.')
+        clear_btn.clicked.connect(self._on_clear_cache)
+        layout.addWidget(clear_btn)
         layout.addStretch(1)
     def _refresh_list(self) -> None:
         self._list.clear()
@@ -447,10 +602,24 @@ class _RoleManagerTab(QWidget):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, role['id'])
             self._list.addItem(item)
+    def _on_clear_cache(self) -> None:
+        """Delete cached thumbnails/PFPs not tracked by any profile."""
+        result = dark_question(
+            self, 'Clear Cache',
+            'This deletes cached video thumbnails and profile pictures that '
+            'are no longer tracked by any profile. Files still in use — '
+            'including those tracked by other profiles — are kept. Removed '
+            'files are re-downloaded on the next fetch if needed.\n\nContinue?')
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        removed = clear_untracked_thumbnails(self._db)
+        dark_info(
+            self, 'Cache Cleared',
+            f'Deleted {removed} untracked cached image file(s).')
     def _pick_color(self) -> None:
         current = QColor(self._color_hex.text())
         if not current.isValid():
-            current = QColor('#C83232')
+            current = QColor(C.ACCENT)
         color = QColorDialog.getColor(current, self, 'Choose Role Color')
         if color.isValid():
             self._color_hex.setText(color.name())
@@ -516,7 +685,7 @@ class _RoleManagerTab(QWidget):
         def pick():
             current = QColor(color_hex.text())
             if not current.isValid():
-                current = QColor('#C83232')
+                current = QColor(C.ACCENT)
             color = QColorDialog.getColor(current, dlg, 'Choose Role Color')
             if color.isValid():
                 color_hex.setText(color.name())
@@ -620,6 +789,14 @@ class _NotificationsTab(QWidget):
         self._db = db
         layout = QVBoxLayout(self)
 
+        # Master notifications toggle (off by default)
+        self._enabled_check = QCheckBox('Enable notifications')
+        self._enabled_check.setChecked((db.get_setting('notifications_enabled') or '0') == '1')
+        self._enabled_check.setToolTip('When off, no milestone, rapid-growth, or inactivity alerts are shown.')
+        layout.addWidget(self._enabled_check)
+
+        layout.addSpacing(16)
+
         # View count thresholds
         view_label = QLabel('View Count Alert Thresholds:')
         view_label.setObjectName('formLabel')
@@ -678,6 +855,10 @@ class _NotificationsTab(QWidget):
                 dark_warning(self, 'Invalid Thresholds',
                              'Enter comma-separated positive numbers (e.g. 10000,100000,1000000)')
                 return False
+        # Commit both settings only after validation passes, so a failed
+        # save (and any later Cancel) can't leave the toggle persisted while
+        # the thresholds were rejected.
+        self._db.set_setting('notifications_enabled', '1' if self._enabled_check.isChecked() else '0')
         self._db.set_setting('notification_view_thresholds', text)
         return True
 

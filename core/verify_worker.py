@@ -18,14 +18,13 @@ except ImportError:
 
 try:
     from google import genai as google_genai
-    from google.genai import types as genai_types
-    from google.genai import errors as genai_errors
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
 
-from .ai_client import is_gemini_model, load_ai_api_key
+from .ai_client import call_ai, is_gemini_model, load_ai_api_key
 from .db_manager import DatabaseManager
+from .local_llm import is_local_model
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +39,6 @@ _SYSTEM_PROMPT = (
     "or additional text."
 )
 
-_MAX_RETRIES = 3
-_RETRY_DELAYS = (1.0, 2.0, 4.0)
 # Delay between consecutive API calls to avoid hitting rate limits.
 # Gemini free tier is much stricter — needs a longer pause between requests.
 _REQUEST_DELAY_ANTHROPIC = 0.5
@@ -91,11 +88,13 @@ class VerifyWorker(QThread):
         community_description: str,
         model: str,
         parent: Any | None = None,
+        creator_id: int | None = None,
     ) -> None:
         super().__init__(parent)
         self._db = db
         self._community_description = community_description
         self._model = model
+        self._creator_id = creator_id
         self._cancel = threading.Event()
         self._expected_profile = ''
 
@@ -105,17 +104,21 @@ class VerifyWorker(QThread):
 
     def run(self) -> None:
         is_gemini = is_gemini_model(self._model)
+        is_local = is_local_model(self._model)
 
-        # Check that the required SDK is installed.
-        if is_gemini:
-            if not GEMINI_AVAILABLE:
-                self.error.emit(
-                    "The 'google-genai' Python package is not installed. "
-                    "Install it with: pip install google-genai"
-                )
-                return
-        else:
-            if not ANTHROPIC_AVAILABLE:
+        # Check that the required SDK is installed (local models use Ollama
+        # instead — no SDK, no key).  The SDK check is in-process (no network);
+        # local skips it and lets call_ai surface "Ollama is not running" on the
+        # first request, avoiding an extra /api/tags round-trip.
+        if not is_local:
+            if is_gemini:
+                if not GEMINI_AVAILABLE:
+                    self.error.emit(
+                        "The 'google-genai' Python package is not installed. "
+                        "Install it with: pip install google-genai"
+                    )
+                    return
+            elif not ANTHROPIC_AVAILABLE:
                 self.error.emit(
                     "The 'anthropic' Python package is not installed. "
                     "Install it with: pip install anthropic"
@@ -123,19 +126,23 @@ class VerifyWorker(QThread):
                 return
 
         # Read the appropriate API key (shared loader — same logic the
-        # Discover AI workers use, so the key source stays consistent).
-        api_key, _err = load_ai_api_key(self._db, self._model)
-        if not api_key:
-            self.api_key_missing.emit()
-            return
+        # Discover AI workers use, so the key source stays consistent).  Local
+        # models need no key, so skip the load entirely (no sentinel).
+        if is_local:
+            api_key = ""
+        else:
+            api_key, _err = load_ai_api_key(self._db, self._model)
+            if not api_key:
+                self.api_key_missing.emit()
+                return
 
         # Build the system prompt.
         system_prompt = _SYSTEM_PROMPT.format(
             community_description=self._community_description.replace('{', '{{').replace('}', '}}')
         )
 
-        # Only evaluate unverified videos.
-        unverified = self._db.get_unverified_media()
+        # Only evaluate unverified videos (optionally scoped to one creator).
+        unverified = self._db.get_unverified_media(creator_id=self._creator_id)
         total = len(unverified)
         if total == 0:
             self.done.emit(0)
@@ -143,12 +150,6 @@ class VerifyWorker(QThread):
 
         # Snapshot the active profile so we can detect mid-run switches.
         self._expected_profile = self._db.current_profile
-
-        # Create the appropriate client.
-        if is_gemini:
-            client = google_genai.Client(api_key=api_key)
-        else:
-            client = anthropic.Anthropic(api_key=api_key)
 
         verified_count = 0
 
@@ -177,22 +178,27 @@ class VerifyWorker(QThread):
                 user_message += f'Description: "{description}"\n\n'
             user_message += "Does this video fit the community described above?"
 
-            # Dispatch to the correct provider.
-            if is_gemini:
-                response_text = self._call_gemini(
-                    client, system_prompt, user_message, i, title
-                )
-            else:
-                response_text = self._call_anthropic(
-                    client, system_prompt, user_message, i, title
-                )
+            # Dispatch to the provider via the shared helper.  call_ai handles
+            # retries, rate-limit backoff, auth/network errors, and (for local)
+            # the Ollama host — so this worker no longer keeps its own
+            # per-provider call methods.  max_tokens=10 matches the YES/NO task.
+            response_text, err = call_ai(
+                model=self._model,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                api_key=api_key,
+                max_tokens=10,
+                cancel_check=self._cancel.is_set,
+                db=self._db,
+            )
 
             if response_text is None:
-                if self._cancel.is_set():
-                    # Cancelled mid-retry — fall through to done.emit()
-                    break
-                # Fatal error already emitted; abort.
-                return
+                if err:
+                    # Fatal error from the provider.
+                    self.error.emit(err)
+                    return
+                # Cancelled mid-call — fall through to done.emit().
+                break
 
             if self._cancel.is_set():
                 break
@@ -213,9 +219,12 @@ class VerifyWorker(QThread):
                 verified_count += 1
 
             # Pace requests to avoid hitting rate limits.
-            # Sleep between videos, but not after the last one.
+            # Local models run locally — no rate limit, no pacing.
             if i < total and not self._cancel.is_set():
-                delay = _REQUEST_DELAY_GEMINI if is_gemini else _REQUEST_DELAY_ANTHROPIC
+                if is_local:
+                    delay = 0
+                else:
+                    delay = _REQUEST_DELAY_GEMINI if is_gemini else _REQUEST_DELAY_ANTHROPIC
                 if delay > 0:
                     end_time = time.monotonic() + delay
                     while time.monotonic() < end_time:
@@ -224,155 +233,3 @@ class VerifyWorker(QThread):
                         time.sleep(0.1)
 
         self.done.emit(verified_count)
-
-    # ── Anthropic (Claude) ─────────────────────────────────────────────
-
-    def _call_anthropic(
-        self,
-        client: anthropic.Anthropic,
-        system_prompt: str,
-        user_message: str,
-        index: int,
-        title: str,
-    ) -> str | None:
-        """Call the Anthropic Claude API with exponential backoff on rate-limit errors.
-
-        Returns the response text on success, or ``None`` if a fatal
-        error was emitted (authentication, network, etc.).
-        """
-        create_kwargs: dict[str, Any] = {
-            "model": self._model,
-            "max_tokens": 10,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}],
-        }
-        if self._model.startswith("claude-haiku"):
-            create_kwargs["temperature"] = 0
-
-        for attempt in range(_MAX_RETRIES + 1):
-            if self._cancel.is_set():
-                return None
-            try:
-                response = client.messages.create(**create_kwargs)
-                return response.content[0].text
-            except anthropic.AuthenticationError:
-                self.error.emit(
-                    "Invalid Anthropic API key. "
-                    "Please check your key in Settings → API Keys."
-                )
-                return None
-            except anthropic.RateLimitError:
-                if attempt < _MAX_RETRIES:
-                    delay = _RETRY_DELAYS[attempt]
-                    logger.info(
-                        "Rate limited on video %d (%s), retrying in %.1fs",
-                        index, title, delay,
-                    )
-                    # Sleep in small increments so cancel is responsive.
-                    end_time = time.monotonic() + delay
-                    while time.monotonic() < end_time:
-                        if self._cancel.is_set():
-                            return None
-                        time.sleep(0.1)
-                else:
-                    self.error.emit(
-                        "Anthropic API rate limit exceeded. "
-                        "Please wait a moment and try again."
-                    )
-                    return None
-            except anthropic.APIConnectionError:
-                self.error.emit(
-                    "Network error connecting to Anthropic. "
-                    "Check your internet connection."
-                )
-                return None
-            except anthropic.APIStatusError as exc:
-                self.error.emit(f"Anthropic API error: {exc}")
-                return None
-            except anthropic.APITimeoutError:
-                self.error.emit(
-                    "Anthropic API request timed out. "
-                    "Check your internet connection and try again."
-                )
-                return None
-            except anthropic.BadRequestError as exc:
-                self.error.emit(f"Anthropic request error: {exc}")
-                return None
-            except Exception as exc:
-                self.error.emit(f"Unexpected error during verification: {exc}")
-                return None
-
-    # ── Google Gemini ──────────────────────────────────────────────────
-
-    def _call_gemini(
-        self,
-        client: Any,
-        system_prompt: str,
-        user_message: str,
-        index: int,
-        title: str,
-    ) -> str | None:
-        """Call the Google Gemini API with exponential backoff on rate-limit errors.
-
-        Returns the response text on success, or ``None`` if a fatal
-        error was emitted (authentication, network, etc.).
-        """
-        config = genai_types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            max_output_tokens=10,
-            temperature=0,
-        )
-        # Longer retry delays for Gemini free-tier rate limits.
-        # Gemini resets rate limits per-minute, so we need to wait long
-        # enough for the window to roll over before retrying.
-        _gemini_retry_delays = (10.0, 30.0, 60.0)
-
-        for attempt in range(_MAX_RETRIES + 1):
-            if self._cancel.is_set():
-                return None
-            try:
-                response = client.models.generate_content(
-                    model=self._model,
-                    contents=user_message,
-                    config=config,
-                )
-                return response.text
-            except genai_errors.APIError as exc:
-                code = getattr(exc, 'code', None) or 0
-                if code in (401, 403):
-                    self.error.emit(
-                        "Invalid Gemini API key. "
-                        "Please check your key in Settings → API Keys."
-                    )
-                    return None
-                if code == 429:
-                    # Rate limit — retry with exponential backoff
-                    if attempt < _MAX_RETRIES:
-                        delay = _gemini_retry_delays[attempt]
-                        logger.info(
-                            "Gemini rate limited on video %d (%s), retrying in %.1fs",
-                            index, title, delay,
-                        )
-                        end_time = time.monotonic() + delay
-                        while time.monotonic() < end_time:
-                            if self._cancel.is_set():
-                                return None
-                            time.sleep(0.1)
-                    else:
-                        self.error.emit(
-                            "Gemini API rate limit exceeded. "
-                            "Please wait a moment and try again."
-                        )
-                        return None
-                else:
-                    self.error.emit(f"Gemini API error: {exc}")
-                    return None
-            except ConnectionError:
-                self.error.emit(
-                    "Network error connecting to Gemini. "
-                    "Check your internet connection."
-                )
-                return None
-            except Exception as exc:
-                self.error.emit(f"Unexpected error during verification: {exc}")
-                return None

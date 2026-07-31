@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from enum import IntEnum
 
+from PyQt6 import sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QDialog,
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.db_manager import DatabaseManager
+from core.local_llm import get_ollama_host, ListLocalModelsWorker
 from ui.dialog_utils import dark_warning, enable_window_maximize
 from ui.geometry import restore_geometry, save_geometry
 from ui.theme import C
@@ -64,6 +66,12 @@ _PROVIDERS = {
             ('claude-opus-4-8', 'Opus 4.8', 'Most thorough'),
         ],
     },
+    'local': {
+        'label': 'Local',
+        'icon': '🖥',
+        'subtitle': 'Runs via Ollama (free)',
+        'models': [],   # populated dynamically from installed Ollama models
+    },
 }
 
 # ── Card button styles ────────────────────────────────────────────────
@@ -84,9 +92,13 @@ class VerifyDialog(QDialog):
     * ``keywords``     — comma-separated keyword string (when result is KEYWORD)
     """
 
-    def __init__(self, db: DatabaseManager, parent: QWidget | None = None) -> None:
+    def __init__(self, db: DatabaseManager, parent: QWidget | None = None,
+                 creator_id: int | None = None) -> None:
         super().__init__(parent)
         self._db = db
+        # When launched from a creator's Media History, scope the "N unverified
+        # videos will be checked" count to that creator so it isn't misleading.
+        self._creator_id = creator_id
 
         # Result attributes — read by the caller after exec().
         self.result: VerifyResult = VerifyResult.CANCEL
@@ -94,6 +106,8 @@ class VerifyDialog(QDialog):
         self.keywords: str = ''
 
         self._selected_provider: str = ''
+        self._list_worker: ListLocalModelsWorker | None = None
+        self._local_loading_label: QLabel | None = None
 
         self.setWindowTitle('Verify')
         self.setMinimumWidth(500)
@@ -199,7 +213,7 @@ class VerifyDialog(QDialog):
         layout.addWidget(hint)
 
         layout.addSpacing(8)
-        unverified = self._db.get_unverified_media()
+        unverified = self._db.get_unverified_media(creator_id=self._creator_id)
         count = len(unverified)
         if count == 0:
             count_text = 'No unverified videos to check.'
@@ -256,7 +270,20 @@ class VerifyDialog(QDialog):
                 item.widget().deleteLater()
 
         info = _PROVIDERS[provider_key]
-        provider_label = info['label']
+
+        # Local models are queried live from Ollama rather than read from the
+        # static ``models`` list, since the user installs them on demand.  The
+        # query runs off the GUI thread so picking the Local card never freezes
+        # the dialog — a "Loading…" hint is shown instantly and replaced with
+        # cards (or a not-running/empty hint) when Ollama responds.
+        if provider_key == 'local':
+            loading = QLabel('Loading local models…')
+            loading.setObjectName('hintLabel')
+            loading.setWordWrap(True)
+            self._model_layout.insertWidget(self._model_layout.count() - 1, loading)
+            self._local_loading_label = loading
+            self._start_local_list()
+            return
 
         # Insert cards before the stretch.
         for model_id, model_name, speed in info['models']:
@@ -264,6 +291,59 @@ class VerifyDialog(QDialog):
             btn.setObjectName('verifyModelCard')
             btn.clicked.connect(lambda checked, mid=model_id: self._on_model_selected(mid))
             self._model_layout.insertWidget(self._model_layout.count() - 1, btn)
+
+    # ── Local (Ollama) async loading ────────────────────────────────
+
+    def _start_local_list(self) -> None:
+        """Kick off the off-GUI-thread fetch of installed local models."""
+        worker = ListLocalModelsWorker(get_ollama_host(self._db))
+        self._list_worker = worker
+        worker.done.connect(self._on_local_list_done)
+        worker.error.connect(self._on_local_list_error)
+        worker.finished.connect(self._retire_list_worker)
+        worker.start()
+
+    def _on_local_list_done(self, tags: list) -> None:
+        if sip.isdeleted(self):
+            return
+        self._discard_loading_label()
+        if not tags:
+            lbl = QLabel(
+                'No local models installed yet. Go to Settings → Verify → '
+                'Install Local AI Models to install one.'
+            )
+            lbl.setObjectName('hintLabel')
+            lbl.setWordWrap(True)
+            self._model_layout.insertWidget(self._model_layout.count() - 1, lbl)
+            return
+        for tag in tags:
+            model_id = f'ollama:{tag}'
+            btn = QPushButton(f'{tag}  —  Local')
+            btn.setObjectName('verifyModelCard')
+            btn.clicked.connect(lambda checked, mid=model_id: self._on_model_selected(mid))
+            self._model_layout.insertWidget(self._model_layout.count() - 1, btn)
+
+    def _on_local_list_error(self, _msg: str) -> None:
+        if sip.isdeleted(self):
+            return
+        self._discard_loading_label()
+        lbl = QLabel(
+            'Ollama is not running. Start the Ollama app, or install '
+            'models via Settings → Verify → Install Local AI Models.'
+        )
+        lbl.setObjectName('hintLabel')
+        lbl.setWordWrap(True)
+        self._model_layout.insertWidget(self._model_layout.count() - 1, lbl)
+
+    def _discard_loading_label(self) -> None:
+        lbl = self._local_loading_label
+        self._local_loading_label = None
+        if lbl is not None and not sip.isdeleted(lbl):
+            lbl.setParent(None)
+            lbl.deleteLater()
+
+    def _retire_list_worker(self) -> None:
+        self._list_worker = None
 
     # ── Navigation ──────────────────────────────────────────────────
 
@@ -320,3 +400,16 @@ class VerifyDialog(QDialog):
     def reject(self) -> None:
         self.result = VerifyResult.CANCEL
         super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        # Don't let an in-flight local-models fetch touch a dying dialog; the
+        # worker self-retires via its module-level registry.
+        w = self._list_worker
+        if w is not None and not sip.isdeleted(w):
+            for name in ('done', 'error', 'finished'):
+                try:
+                    getattr(w, name).disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+        self._list_worker = None
+        super().closeEvent(event)

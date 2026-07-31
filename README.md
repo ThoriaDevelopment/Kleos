@@ -27,7 +27,7 @@
 
 ## Overview
 
-Kleos is designed for community managers who need to monitor a roster of content creators and streamers. It maintains a local SQLite database per-profile, pulls public metadata from the YouTube Data API v3 and Twitch Helix API, caches thumbnails and profile pictures locally, and exposes everything through a themeable PyQt6 GUI (default **Kleos Soft** — a light red-and-white palette matching thoria.fyi/Kleos, with dark and other themes selectable in Settings → Appearance) with matplotlib-powered charts.
+Kleos is designed for community managers who need to monitor a roster of content creators and streamers. It maintains a local SQLite database per-profile, pulls public metadata from the YouTube Data API v3 and Twitch Helix API, caches thumbnails and profile pictures locally, and exposes everything through a themeable PyQt6 GUI (default **DORFic** — an industrial minimalist black/white + orange palette, with other themes selectable in Settings → Appearance) with matplotlib-powered charts.
 
 Key design goals:
 - **Offline-first**: Once data is fetched, the entire dashboard and history work without internet.

@@ -38,6 +38,15 @@ def _diag_response(resp: requests.Response, context: str) -> None:
         body = resp.text[:2000]
         logger.warning('%s — HTTP %d %s: %s', context, resp.status_code, resp.reason, body[:500])
         resp.raise_for_status()
+
+
+def _api_error_reason(resp: requests.Response) -> str | None:
+    """Return the Google API error ``reason`` for a non-200 response, if any."""
+    try:
+        errors = resp.json().get('error', {}).get('errors', [])
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return errors[0].get('reason') if errors else None
 class YouTubeVideo:
     __slots__ = ('content_id', 'title', 'thumbnail_url', 'upload_date', 'view_count', 'is_short', 'is_stream', 'description')
     def __init__(self, content_id: str, title: str, thumbnail_url: str, upload_date: str, view_count: int, is_short: bool, is_stream: bool = False, description: str = '') -> None:
@@ -111,6 +120,20 @@ class YouTubeClient:
                 params['pageToken'] = next_page_token
             try:
                 resp = self._session.get(YT_PLAYLIST_ITEMS_URL, params=params, timeout=_REQUEST_TIMEOUT)
+            except requests.RequestException as exc:
+                logger.warning('YouTube playlistItems request failed for %s: %s', channel_id, exc)
+                complete = False
+                break
+            # A 404 playlistNotFound means the channel's uploads playlist
+            # doesn't exist — the channel has no public uploads, was removed/
+            # terminated, or doesn't expose uploads via the UU-prefix
+            # derivation.  Nothing left to page through; log one concise line
+            # instead of the full JSON error dump + URL and stop paging.
+            if resp.status_code == 404 and _api_error_reason(resp) == 'playlistNotFound':
+                logger.warning('YouTube uploads playlist not found for %s — channel has no public uploads or was removed; skipping', channel_id)
+                complete = False
+                break
+            try:
                 _diag_response(resp, f'YouTube playlistItems playlist={playlist_id} page={next_page_token!r}')
             except requests.RequestException as exc:
                 logger.warning('YouTube playlistItems page fetch failed for %s: %s', channel_id, exc)

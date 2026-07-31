@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import QCalendarWidget, QCheckBox, QComboBox, QDialog, QDia
 from core.api_client import FetchWorker, load_api_keys
 from core.db_manager import DatabaseManager
 from core.keyword_verify import KeywordVerifyWorker
-from core.verify_worker import ANTHROPIC_AVAILABLE, GEMINI_AVAILABLE, VerifyWorker
+from core.verify_worker import VerifyWorker
+from core.ai_client import prepare_verify
 from ui.verify_dialog import VerifyDialog, VerifyResult
 logger = logging.getLogger(__name__)
 from ui.app_icon import create_app_icon
@@ -299,7 +300,7 @@ class MainWindow(QMainWindow):
         self._cooldown_remaining = 0
         self._pending_profile = None
         self._pending_import = None
-        self.setWindowTitle('Kleos — Media Dashboard')
+        self.setWindowTitle('Kleos')
         self.setWindowIcon(create_app_icon())
         self.setMinimumSize(800, 520)
         self.resize(960, 640)
@@ -572,6 +573,12 @@ class MainWindow(QMainWindow):
             first_cards.append(card)
         self._apply_filter()
         self._apply_sort()
+        # Force a synchronous layout pass so card geometry is computed before
+        # cascade_cards reads each card's pos(). Without this, newly added
+        # widgets report a stale (pre-layout) position and the cascade pos
+        # animation stacks them on top of each other, leaving gaps in the
+        # real layout slots until an interaction forces a relayout.
+        self._card_layout.activate()
         self._card_container.updateGeometry()
         self._scroll.updateGeometry()
         if hasattr(self, '_scroll') and scroll_pos:
@@ -618,6 +625,9 @@ class MainWindow(QMainWindow):
             new_cards.append(card)
         self._apply_filter()
         self._apply_sort()
+        # Synchronous layout pass before cascade_cards reads card positions
+        # (see _refresh_cards for the rationale).
+        self._card_layout.activate()
         if new_cards:
             self.cascade_cards(new_cards)
         if self._pending_card_data:
@@ -639,7 +649,15 @@ class MainWindow(QMainWindow):
                 if t in self._cascade_timers:
                     self._cascade_timers.remove(t)
                 t.deleteLater()
-                if sip.isdeleted(c):
+                if sip.isdeleted(c) or sip.isdeleted(eff):
+                    # The card or its cascade opacity effect was destroyed or
+                    # replaced before this staggered launch fired (e.g. the
+                    # card was pressed, or the grid was rebuilt mid-cascade).
+                    # Animating a deleted effect raises RuntimeError, so just
+                    # release the cascade flag and bail out — the card is
+                    # already visible under whatever effect replaced it.
+                    if not sip.isdeleted(c):
+                        c.cancel_cascade()
                     return None
                 else:
                     op_anim = QPropertyAnimation(eff, b'opacity', c)
@@ -1006,35 +1024,12 @@ class MainWindow(QMainWindow):
 
     def _start_ai_verify(self, model: str) -> None:
         """Launch AI verification with the given model."""
-        is_gemini = model.startswith('gemini-')
-        if is_gemini:
-            if not GEMINI_AVAILABLE:
-                dark_warning(self, 'Package Missing',
-                             "The 'google-genai' Python package is not installed.\n"
-                             "Install it with: pip install google-genai")
-                return
-        else:
-            if not ANTHROPIC_AVAILABLE:
-                dark_warning(self, 'Package Missing',
-                             "The 'anthropic' Python package is not installed.\n"
-                             "Install it with: pip install anthropic")
-                return
-        community_desc = (self._db.get_setting('community_description') or '').strip()
-        if not community_desc:
-            dark_warning(self, 'No Community Description',
-                         'Please enter a community description in Settings → Verify first.')
-            return
-        raw = self._db.get_global_setting('api_keys_json') or '{}'
-        try:
-            parsed = json.loads(raw)
-            key_field = 'gemini' if is_gemini else 'anthropic'
-            api_key = parsed.get(key_field, '').strip() if isinstance(parsed, dict) else ''
-        except (json.JSONDecodeError, AttributeError):
-            api_key = ''
-        if not api_key:
-            provider = 'Gemini' if is_gemini else 'Anthropic'
-            dark_warning(self, f'No {provider} API Key',
-                         f'Please enter your {provider} API key in Settings → API Keys first.')
+        # Shared preflight (SDK availability, community description, API key).
+        # Local models skip the SDK + key checks — the worker surfaces
+        # "Ollama is not running" off the GUI thread, so this never blocks.
+        ok, err_title, err_msg, community_desc = prepare_verify(self._db, model)
+        if not ok:
+            dark_warning(self, err_title, err_msg)
             return
         if self._verify_worker is not None and self._verify_worker.isRunning():
             return
@@ -1268,6 +1263,8 @@ class MainWindow(QMainWindow):
 
     def _check_milestones(self) -> None:
         """Check for subscriber and view milestones after a fetch."""
+        if (self._db.get_setting('notifications_enabled') or '0') != '1':
+            return
         sub_counts = self._db.bulk_subscriber_counts()
         creators = self._db.get_creators()
         view_totals = self._db.bulk_view_totals()
@@ -1501,7 +1498,7 @@ class MainWindow(QMainWindow):
                 self._bg_canvas._anim.stop()
                 try:
                     self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
-                except RuntimeError:
+                except (RuntimeError, TypeError):
                     pass
             save_geometry(self, 'MainWindow', self._db, global_store=True)
             self._db.close()
@@ -1526,7 +1523,7 @@ class MainWindow(QMainWindow):
                 # Already finished — handle directly.
                 try:
                     worker.finished.disconnect(self._on_worker_finished_for_close)
-                except RuntimeError:
+                except (RuntimeError, TypeError):
                     pass
                 self._on_worker_finished_for_close()
             else:
@@ -1546,7 +1543,7 @@ class MainWindow(QMainWindow):
                 self._bg_canvas._anim.stop()
                 try:
                     self._bg_canvas._anim.finished.disconnect(self._bg_canvas._ping_pong)
-                except RuntimeError:
+                except (RuntimeError, TypeError):
                     pass
             self._db.close()
             self.close()

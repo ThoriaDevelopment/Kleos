@@ -269,3 +269,34 @@ def prune_cache(db: Any | None = None, max_orphan_files: int = 200) -> int:
         for f in to_remove:
             f.unlink(missing_ok=True)
         return len(to_remove)
+
+
+def clear_untracked_thumbnails(db: Any) -> int:
+    """Delete cached image files not referenced by ANY profile's database.
+
+    The thumbnail cache (THUMBNAILS_DIR) is shared across all profiles, so a
+    file is only safe to remove when no profile references it — either as a
+    creator's ``pfp_url`` or a ``media_content.thumbnail_path``.  Files that
+    are still tracked by another profile are kept.
+
+    In-progress downloads (``*.tmp``) and non-image files are left untouched.
+    Returns the number of files removed.
+    """
+    _img_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+    in_use = {str(Path(p)) for p in db.get_all_inuse_thumbnail_paths()}
+    THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for f in THUMBNAILS_DIR.iterdir():
+        if not f.is_file():
+            continue
+        suffix = f.suffix.lower()
+        if suffix == '.tmp' or suffix not in _img_exts:
+            continue
+        if str(f) in in_use:
+            continue
+        try:
+            f.unlink(missing_ok=True)
+            removed += 1
+        except OSError as exc:
+            logger.warning('Failed to delete orphan thumbnail %s: %s', f, exc)
+    return removed

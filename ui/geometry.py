@@ -48,3 +48,29 @@ def restore_geometry(widget: QWidget, key: str, db: DatabaseManager, *,
         return False
     ba = QByteArray.fromBase64(blob.encode('ascii'))
     return widget.restoreGeometry(ba)
+
+
+def fit_to_layout_minimum(widget: QWidget) -> None:
+    """Grow ``widget``'s height to at least its layout's minimum for its width.
+
+    A saved geometry from an older layout (fewer or smaller rows) can be
+    shorter than the current content's minimum height.  ``restore_geometry``
+    runs before the layout is built, so it applies the stale short height
+    without complaint; then the layout raises the minimum, and on show Qt on
+    Windows logs ``QWindowsWindow::setGeometry: Unable to set geometry …`` as
+    it snaps the window up to the real minimum.
+
+    Call this once the layout is fully built (after ``restore_geometry`` and
+    after the content rows are added).  It keeps the saved width/position and
+    only bumps the height to ``layout.minimumHeightForWidth(width)``, so the
+    dialog is never shown shorter than its contents and the warning never
+    fires.
+    """
+    if sip.isdeleted(widget):
+        return
+    lay = widget.layout()
+    if lay is None:
+        return
+    need_h = lay.minimumHeightForWidth(widget.width())
+    if need_h > 0 and widget.height() < need_h:
+        widget.resize(widget.width(), need_h)

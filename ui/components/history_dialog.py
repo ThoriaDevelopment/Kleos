@@ -10,14 +10,18 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.dates import date2num
 from matplotlib.figure import Figure
 from PyQt6 import sip
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap
-from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QStackedWidget, QTabWidget, QTextEdit, QVBoxLayout, QWidget
 from core.cache_manager import ensure_thumbnail
 from core.db_manager import DatabaseManager
+from core.keyword_verify import KeywordVerifyWorker
+from core.verify_worker import VerifyWorker
+from core.ai_client import prepare_verify
 from ui.app_icon import create_app_icon
-from ui.components.creator_card import relative_time, format_subscriber_count
-from ui.dialog_utils import dark_question, enable_window_maximize, handle_fullscreen_keypress
+from ui.components.creator_card import relative_time, format_subscriber_count, _circular_pixmap, _default_avatar_pixmap
+from ui.dialog_utils import dark_info, dark_question, dark_warning, enable_window_maximize, handle_fullscreen_keypress
+from ui.verify_dialog import VerifyDialog, VerifyResult
 from ui.chart_common import apply_style, build_conditions, smooth_mpl_patch
 from ui.chart_utils import _ZoomableFigureCanvas
 from ui.geometry import restore_geometry, save_geometry
@@ -42,6 +46,35 @@ def _placeholder_pixmap(w: int=120, h: int=68) -> QPixmap:
     px = QPixmap(w, h)
     px.fill(QColor(C.DIALOG_BG))
     return px
+def _channel_url(creator: dict[str, Any]) -> str:
+    """Return the best-effort URL for a creator's channel, or '' if unknown.
+
+    Prefers the original link the user entered (handles ``@handle``, ``/c/``,
+    ``/user/`` and full URLs), then falls back to the resolved channel ID,
+    then to the Twitch link.
+    """
+    yt_link = (creator.get('youtube_link') or '').strip()
+    yt_cid = (creator.get('youtube_channel_id') or '').strip()
+    tw_link = (creator.get('twitch_link') or '').strip()
+    if yt_link:
+        return yt_link
+    if yt_cid:
+        return f'https://www.youtube.com/channel/{yt_cid}'
+    if tw_link:
+        return tw_link
+    return ''
+class _ClickableLabel(QLabel):
+    """A QLabel that emits ``clicked`` on a left-button press."""
+    clicked = pyqtSignal()
+    def __init__(self, text: str='', parent: QWidget | None=None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 class _ContentRow(QFrame):
     """One row in the history list representing a single piece of media."""
     thumbnail_loaded = pyqtSignal(str)
@@ -420,6 +453,36 @@ class _CreatorBarChart(_ZoomableFigureCanvas, FigureCanvas):
             self._fig.tight_layout()
             self.draw()
             self._save_home_limits()
+# Holds verify/keyword workers that were cancelled mid-run as the dialog
+# closed, so they are not garbage-collected (and thus destroyed by Qt) while
+# still running.  Each retired worker removes itself on ``finished`` and
+# schedules its own deletion.  Mirrors the retire pattern in discover_window.
+_RETIRED_VERIFY_WORKERS: set = set()
+
+
+def _retire_verify_worker(worker: QThread) -> None:
+    """Disconnect a verify/keyword worker's GUI-mutating signals and let it
+    finish and self-delete after the dialog that started it has closed.
+
+    The worker is kept alive by :data:`_RETIRED_VERIFY_WORKERS` so it is never
+    destroyed mid-run, and its ``finished`` signal schedules its own deletion
+    once ``run()`` returns.  No DB writes happen after cancel — the worker's
+    loop breaks at the next ``cancel_check``.
+    """
+    for sig_name in ('progress', 'progress_text', 'video_verified', 'done',
+                     'error', 'api_key_missing', 'aborted', 'finished'):
+        sig = getattr(worker, sig_name, None)
+        if sig is not None:
+            try:
+                sig.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+    _RETIRED_VERIFY_WORKERS.add(worker)
+    worker.finished.connect(
+        lambda *_: (_RETIRED_VERIFY_WORKERS.discard(worker), worker.deleteLater())
+    )
+
+
 class HistoryDialog(QDialog):
     """Modal showing chronological media history for a single creator.
 
@@ -445,6 +508,11 @@ keeping the UI responsive even with 1000+ videos.
         self._display_media: list[dict[str, Any]] = []
         self._rendered_count = 0
         self._on_refresh = on_refresh
+        # Verify workers (creator-scoped batch AI/keyword verify). Held as
+        # instance refs so a second Verify click while one is running is
+        # ignored; cleared by ``_on_worker_finished`` once run() returns.
+        self._verify_worker: VerifyWorker | None = None
+        self._keyword_worker: KeywordVerifyWorker | None = None
         nickname = creator.get('nickname', 'Unknown')
         self.setWindowTitle(f'Media History — {nickname}')
         self.setWindowIcon(create_app_icon())
@@ -453,6 +521,10 @@ keeping the UI responsive even with 1000+ videos.
         self.reapply_theme()
         restore_geometry(self, 'HistoryDialog', self._db)
         self.finished.connect(lambda _r: save_geometry(self, 'HistoryDialog', self._db))
+        # Retire any still-running verify worker on every close path (Close
+        # button = accept, X = reject, Esc) so it winds down quietly instead
+        # of being destroyed mid-run.
+        self.finished.connect(self._cleanup_verify_on_close)
         self._build_ui()
         self._animated = False
         self._opacity_effect = QGraphicsOpacityEffect(self)
@@ -466,6 +538,9 @@ keeping the UI responsive even with 1000+ videos.
         for chart in (getattr(self, '_creator_timeline', None), getattr(self, '_creator_bar', None)):
             if chart is not None and not sip.isdeleted(chart):
                 chart._render()
+        # Refresh the avatar so the silhouette fallback picks up new tokens.
+        if hasattr(self, '_avatar_label') and not sip.isdeleted(self._avatar_label):
+            self._load_avatar()
     def _animate_entry(self) -> None:
         """Scale + fade in from screen center using OutExpo curve."""
         final_geo = self.geometry()
@@ -501,6 +576,26 @@ keeping the UI responsive even with 1000+ videos.
         vbox.setContentsMargins(16, 12, 16, 12)
         vbox.setSpacing(10)
         self._build_header(vbox)
+        # Progress bar area for the creator-scoped Verify button (hidden until
+        # a verify run starts). Mirrors the dashboard's verify progress area.
+        self._verify_progress_area = QWidget()
+        self._verify_progress_area.setVisible(False)
+        progress_layout = QHBoxLayout(self._verify_progress_area)
+        progress_layout.setContentsMargins(12, 2, 12, 2)
+        self._verify_progress_label = QLabel('')
+        self._verify_progress_label.setObjectName('verifyProgress')
+        progress_layout.addWidget(self._verify_progress_label)
+        self._verify_progress_bar = QProgressBar()
+        self._verify_progress_bar.setMinimum(0)
+        self._verify_progress_bar.setMaximum(100)
+        self._verify_progress_bar.setTextVisible(False)
+        self._verify_progress_bar.setFixedHeight(16)
+        progress_layout.addWidget(self._verify_progress_bar, 1)
+        self._verify_cancel_btn = QPushButton('Cancel')
+        self._verify_cancel_btn.setFixedWidth(80)
+        self._verify_cancel_btn.clicked.connect(self._on_verify_cancel)
+        progress_layout.addWidget(self._verify_cancel_btn)
+        vbox.addWidget(self._verify_progress_area)
         self._tabs = QTabWidget()
         self._tabs.currentChanged.connect(self._on_tab_changed)
         vbox.addWidget(self._tabs, 1)
@@ -645,14 +740,26 @@ keeping the UI responsive even with 1000+ videos.
         h_layout.setSpacing(4)
         h_layout.setContentsMargins(12, 10, 12, 10)
         name_row = QHBoxLayout()
+        # Avatar + name both open the creator's channel in the browser.
+        self._avatar_label = _ClickableLabel()
+        self._avatar_label.setFixedSize(40, 40)
+        self._avatar_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._load_avatar()
+        self._avatar_label.clicked.connect(self._open_channel)
+        name_row.addWidget(self._avatar_label)
         nick = self._creator.get('nickname', 'Unknown')
-        name_label = QLabel(nick)
+        name_label = _ClickableLabel(nick)
         name_font = QFont()
         name_font.setBold(True)
         name_font.setPointSize(14)
         name_label.setFont(name_font)
         name_label.setObjectName('cardName')
+        name_label.clicked.connect(self._open_channel)
         name_row.addWidget(name_label)
+        if _channel_url(self._creator):
+            tip = 'Open channel in browser'
+            self._avatar_label.setToolTip(tip)
+            name_label.setToolTip(tip)
         sub_counts = self._db.bulk_subscriber_counts().get(self._creator['id'], {})
         sub_text = format_subscriber_count(sub_counts.get('youtube', 0), sub_counts.get('twitch', 0))
         if sub_text != 'N/A':
@@ -660,6 +767,12 @@ keeping the UI responsive even with 1000+ videos.
             sub_label.setObjectName('countLabel')
             name_row.addWidget(sub_label)
         name_row.addStretch(1)
+        self._verify_btn = QPushButton('✓ Verify')
+        self._verify_btn.setObjectName('verifyCreatorBtn')
+        self._verify_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._verify_btn.setToolTip('Verify this member’s videos using keywords or AI')
+        self._verify_btn.clicked.connect(self._on_verify)
+        name_row.addWidget(self._verify_btn)
         self._refresh_btn = QPushButton('Refresh Content')
         self._refresh_btn.setObjectName('refreshContentBtn')
         self._refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -712,6 +825,21 @@ keeping the UI responsive even with 1000+ videos.
             self._last_verified_label.setText(f'Last verified content: {elapsed}')
         else:
             self._last_verified_label.setText('No verified content yet')
+    def _load_avatar(self) -> None:
+        """Load the creator's PFP into the header avatar, falling back to a
+        generic silhouette when no profile picture is cached."""
+        pfp = self._creator.get('pfp_url')
+        if pfp:
+            px = QPixmap(pfp)
+            if not px.isNull():
+                self._avatar_label.setPixmap(_circular_pixmap(px, 40))
+                return
+        self._avatar_label.setPixmap(_default_avatar_pixmap(40))
+    def _open_channel(self) -> None:
+        """Open the creator's channel in the default browser."""
+        url = _channel_url(self._creator)
+        if url:
+            threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
     def _load_content(self) -> None:
         """Clear existing rows, populate _all_media, then apply sort/filter."""
         # Remove only content rows from the list layout
@@ -958,6 +1086,178 @@ keeping the UI responsive even with 1000+ videos.
     def refresh_times(self) -> None:
         for row in self._rows:
             row.refresh_time()
+
+    # ── Creator-scoped Verify (same flow as the dashboard's ✓ Verify) ──────
+
+    def _on_verify(self) -> None:
+        """Open the Verify dialog and dispatch based on the user's choice.
+
+        Identical to the dashboard flow, but the workers are scoped to this
+        creator via ``creator_id``.
+        """
+        if ((self._verify_worker is not None and self._verify_worker.isRunning())
+                or (self._keyword_worker is not None and self._keyword_worker.isRunning())):
+            return
+        dlg = VerifyDialog(self._db, self, creator_id=self._creator['id'])
+        dlg.exec()
+        if dlg.result == VerifyResult.KEYWORD:
+            self._start_keyword_verify(dlg.keywords)
+        elif dlg.result == VerifyResult.AI:
+            self._start_ai_verify(dlg.selected_model)
+
+    def _start_ai_verify(self, model: str) -> None:
+        """Launch AI verification scoped to this creator."""
+        ok, err_title, err_msg, community_desc = prepare_verify(self._db, model)
+        if not ok:
+            dark_warning(self, err_title, err_msg)
+            return
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            return
+        unverified = self._db.get_unverified_media(creator_id=self._creator['id'])
+        if not unverified:
+            dark_info(self, 'All Verified',
+                      'All of this member’s videos are already verified.')
+            return
+        self._verify_worker = VerifyWorker(
+            self._db, community_desc, model, creator_id=self._creator['id'],
+        )
+        self._verify_worker.progress.connect(self._on_verify_progress)
+        self._verify_worker.progress_text.connect(self._on_verify_progress_text)
+        self._verify_worker.video_verified.connect(self._on_video_verified)
+        self._verify_worker.done.connect(self._on_verify_done)
+        self._verify_worker.error.connect(self._on_verify_error)
+        self._verify_worker.api_key_missing.connect(self._on_verify_api_key_missing)
+        self._verify_worker.aborted.connect(self._on_verify_aborted)
+        self._verify_worker.finished.connect(self._on_worker_finished)
+        self._verify_progress_bar.setValue(0)
+        self._verify_progress_label.setText('Preparing…')
+        self._verify_progress_area.setVisible(True)
+        self._verify_btn.setEnabled(False)
+        self._verify_worker.start()
+
+    def _start_keyword_verify(self, keywords_str: str) -> None:
+        """Launch keyword verification scoped to this creator."""
+        keywords = [kw.strip() for kw in keywords_str.split(',') if kw.strip()]
+        if not keywords:
+            dark_warning(self, 'No Keywords Set',
+                         'Please enter at least one keyword, or go back and choose AI verification.')
+            return
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            return
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            return
+        unverified = self._db.get_unverified_media(creator_id=self._creator['id'])
+        if not unverified:
+            dark_info(self, 'All Verified',
+                      'All of this member’s videos are already verified.')
+            return
+        self._keyword_worker = KeywordVerifyWorker(
+            self._db, keywords, creator_id=self._creator['id'],
+        )
+        self._keyword_worker.progress.connect(self._on_verify_progress)
+        self._keyword_worker.progress_text.connect(self._on_verify_progress_text)
+        self._keyword_worker.video_verified.connect(self._on_video_verified)
+        self._keyword_worker.done.connect(self._on_keyword_verify_done)
+        self._keyword_worker.aborted.connect(self._on_verify_aborted)
+        self._keyword_worker.finished.connect(self._on_worker_finished)
+        self._verify_progress_bar.setValue(0)
+        self._verify_progress_label.setText('Preparing…')
+        self._verify_progress_area.setVisible(True)
+        self._verify_btn.setEnabled(False)
+        self._keyword_worker.start()
+
+    def _on_verify_progress(self, current: int, total: int) -> None:
+        if total > 0:
+            self._verify_progress_bar.setValue(int(current / total * 100))
+
+    def _on_verify_progress_text(self, msg: str) -> None:
+        self._verify_progress_label.setText(msg)
+
+    def _on_video_verified(self, _content_id: str) -> None:
+        # Defer the media-list rebuild until the batch completes, matching the
+        # dashboard (avoids rebuilding hundreds of rows mid-run).
+        pass
+
+    def _on_verify_done(self, count: int) -> None:
+        self._finish_verify()
+        dark_info(self, 'Auto-Verify Complete',
+                  f'Verified {count} video{"s" if count != 1 else ""}.')
+
+    def _on_keyword_verify_done(self, verified_count: int, total: int) -> None:
+        self._finish_verify()
+        dark_info(self, 'Keyword Verify Complete',
+                  f'Keyword-matched {verified_count} of {total} '
+                  f'video{"s" if total != 1 else ""}.')
+
+    def _on_verify_error(self, msg: str) -> None:
+        self._finish_verify()
+        dark_warning(self, 'Auto-Verify Error', msg)
+
+    def _on_verify_api_key_missing(self) -> None:
+        self._finish_verify()
+        model = self._db.get_setting('auto_verify_model') or 'claude-haiku-4-5-20251001'
+        provider = 'Gemini' if model.startswith('gemini-') else 'Anthropic'
+        dark_warning(self, f'No {provider} API Key',
+                     f'Please enter your {provider} API key in Settings → API Keys.')
+
+    def _on_verify_aborted(self) -> None:
+        self._finish_verify()
+        dark_warning(self, 'Verification Aborted',
+                     'Auto-verify was stopped because the active profile was switched.')
+
+    def _on_verify_cancel(self) -> None:
+        if self._verify_worker is not None and self._verify_worker.isRunning():
+            self._verify_worker.cancel()
+            self._verify_cancel_btn.setEnabled(False)
+        if self._keyword_worker is not None and self._keyword_worker.isRunning():
+            self._keyword_worker.cancel()
+            self._verify_cancel_btn.setEnabled(False)
+        self._verify_progress_label.setText('Cancelling…')
+
+    def _on_worker_finished(self) -> None:
+        """Clear the worker reference once ``run()`` has fully returned.
+
+        Connected to each worker's ``finished`` signal so the QThread is never
+        dropped while still running (which would emit "QThread: Destroyed
+        while thread is running"). The UI was already updated in the
+        ``done``/``error``/``aborted`` handler; this only releases the ref.
+        """
+        w = self.sender()
+        if w is self._verify_worker:
+            self._verify_worker = None
+        elif w is self._keyword_worker:
+            self._keyword_worker = None
+
+    def _finish_verify(self) -> None:
+        """Reset the progress UI, refresh the dialog, and notify the dashboard."""
+        self._verify_progress_area.setVisible(False)
+        self._verify_btn.setEnabled(True)
+        self._verify_cancel_btn.setEnabled(True)
+        # Re-render the media list so verified badges flip to "In Community",
+        # refresh the last-verified label, and re-apply the Stats filters.
+        self._load_content()
+        self._update_last_verified()
+        verified_only = self._verified_check.isChecked()
+        content_type = self._stats_type_combo.currentData() if hasattr(self, '_stats_type_combo') else None
+        if self._creator_timeline is not None and not sip.isdeleted(self._creator_timeline):
+            self._creator_timeline.set_verified_only(verified_only)
+            self._creator_timeline.set_content_type(content_type)
+        if self._creator_bar is not None and not sip.isdeleted(self._creator_bar):
+            self._creator_bar.set_verified_only(verified_only)
+            self._creator_bar.set_content_type(content_type)
+        # Let the dashboard refresh its creator cards (verified counts, etc.).
+        self.verified_changed.emit()
+
+    def _cleanup_verify_on_close(self) -> None:
+        """Cancel and retire any still-running verify worker on dialog close."""
+        for attr in ('_verify_worker', '_keyword_worker'):
+            w = getattr(self, attr, None)
+            if w is None or sip.isdeleted(w):
+                continue
+            if w.isRunning():
+                w.cancel()
+                _retire_verify_worker(w)
+            setattr(self, attr, None)
 
     def closeEvent(self, event) -> None:
         """Shut down the thumbnail thread pool when the dialog closes."""

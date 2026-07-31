@@ -37,7 +37,7 @@ def _validate_profile_name(name: str) -> None:
         )
 
 _GLOBAL_LOCK = threading.Lock()
-_GLOBAL_DEFAULTS: dict[str, str] = {'last_profile': 'default', 'api_keys_json': '{}', 'first_run_complete': ''}
+_GLOBAL_DEFAULTS: dict[str, str] = {'last_profile': 'default', 'api_keys_json': '{}', 'first_run_complete': '', 'ollama_host': ''}
 
 
 def _read_global_settings() -> dict[str, str]:
@@ -75,7 +75,7 @@ _MODEL_ID_MIGRATION = {
     'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
 }
 
-_DEFAULT_SETTINGS = {'community_name': '', 'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'verify_keywords': '', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notification_view_thresholds': '10000,100000,1000000', 'discover_sub_ceiling': '0', 'discover_min_subscribers': '0', 'discover_min_views_per_sub': '10', 'discover_default_sort': 'potential', 'discover_shorts': 'ask', 'discover_notifications': '1'}
+_DEFAULT_SETTINGS = {'community_name': '', 'community_description': '', 'auto_verify_model': 'claude-haiku-4-5-20251001', 'verify_keywords': '', 'fetch_video_limit': '50', 'thumbnail_quality': 'low', 'notifications_enabled': '0', 'notification_view_thresholds': '10000,100000,1000000', 'discover_sub_ceiling': '0', 'discover_min_subscribers': '0', 'discover_min_views_per_sub': '10', 'discover_default_sort': 'potential', 'discover_shorts': 'ask', 'discover_notifications': '1'}
 class DatabaseManager:
     """Thread-safe SQLite manager with profile switching and auto-backup.
 
@@ -408,6 +408,24 @@ class DatabaseManager:
             except OSError as exc:
                 logger.warning('Failed to delete %s: %s', path, exc)
 
+    def clear_backups(self) -> int:
+        """Delete every profile backup file in BACKUPS_DIR.
+
+        Backups are the timestamped ``*.db.bak`` files written by
+        :meth:`_backup_locked`.  Removing them frees disk space but loses
+        the automatic point-in-time snapshots; new backups are created on
+        future writes.  Returns the number of backup files removed.
+        """
+        removed = 0
+        if BACKUPS_DIR.exists():
+            for f in BACKUPS_DIR.glob('*.db.bak'):
+                try:
+                    f.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    logger.warning('Failed to delete backup %s: %s', f, exc)
+        return removed
+
     def get_all_thumbnail_paths(self) -> list[str]:
         """Return all non-empty thumbnail_path values from media_content."""
         return [
@@ -415,6 +433,41 @@ class DatabaseManager:
             for row in self._read("SELECT thumbnail_path FROM media_content WHERE thumbnail_path != ''")
             if row['thumbnail_path']
         ]
+    def get_all_inuse_thumbnail_paths(self) -> list[str]:
+        """Return cached-image file paths referenced by ANY profile's database.
+
+        The thumbnail cache (THUMBNAILS_DIR) is shared across all profiles, so
+        cache pruning must consider every profile — a file still referenced
+        by another profile is in use and must not be deleted.  Returns the
+        union of ``creators.pfp_url`` and ``media_content.thumbnail_path``
+        across every profile database, opening each read-only so the active
+        profile is never disturbed.
+        """
+        paths: set[str] = set()
+        for profile in self.list_profiles():
+            db_path = STORAGE_DIR / f'{profile}.db'
+            if not db_path.exists():
+                continue
+            try:
+                conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5.0, check_same_thread=False)
+            except sqlite3.Error:
+                continue
+            try:
+                try:
+                    for (p,) in conn.execute("SELECT pfp_url FROM creators WHERE pfp_url IS NOT NULL AND pfp_url <> ''"):
+                        if p:
+                            paths.add(p)
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    for (p,) in conn.execute("SELECT thumbnail_path FROM media_content WHERE thumbnail_path IS NOT NULL AND thumbnail_path <> ''"):
+                        if p:
+                            paths.add(p)
+                except sqlite3.OperationalError:
+                    pass
+            finally:
+                conn.close()
+        return list(paths)
     def _backup(self) -> None:
         """Create a timestamped backup and prune to MAX_BACKUPS.
 
@@ -840,9 +893,19 @@ class DatabaseManager:
                 (content_id,),
             )
 
-    def get_unverified_media(self) -> list[dict[str, Any]]:
-        """Return all media rows where is_verified = 0."""
-        return self._read('SELECT content_id, title, description FROM media_content WHERE is_verified = 0')
+    def get_unverified_media(self, creator_id: int | None = None) -> list[dict[str, Any]]:
+        """Return media rows where is_verified = 0.
+
+        When *creator_id* is given, only that creator's unverified media is
+        returned (used by the per-creator Verify button in Media History);
+        otherwise every unverified row across all creators is returned.
+        """
+        if creator_id is None:
+            return self._read('SELECT content_id, title, description FROM media_content WHERE is_verified = 0')
+        return self._read(
+            'SELECT content_id, title, description FROM media_content WHERE is_verified = 0 AND creator_id = ?',
+            (creator_id,),
+        )
     _SQL_VARIABLE_LIMIT = 500
 
     def prune_stale_media(self, creator_id: int, platform: str, current_ids: set[str]) -> int:

@@ -131,7 +131,7 @@ class CandidatePoolDialog(QDialog):
         title = QLabel('Candidate Pool')
         title.setObjectName('dialogTitle')
         vbox.addWidget(title)
-        self._hint = QLabel('Creators you flagged from Discover. Notes are your freeform status — write whatever you want.')
+        self._hint = QLabel('Creators you flagged from Discover.')
         self._hint.setObjectName('hintLabel')
         vbox.addWidget(self._hint)
 

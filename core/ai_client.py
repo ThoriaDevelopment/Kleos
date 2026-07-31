@@ -25,6 +25,8 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
+from .local_llm import is_local_model
+
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
@@ -37,6 +39,8 @@ def is_gemini_model(model: str) -> bool:
 
 
 def provider_name(model: str) -> str:
+    if is_local_model(model):
+        return 'local'
     return 'gemini' if is_gemini_model(model) else 'claude'
 
 
@@ -55,6 +59,7 @@ def call_ai(
     api_key: str,
     max_tokens: int = 512,
     cancel_check: Callable[[], bool] | None = None,
+    db: Any | None = None,
 ) -> tuple[str | None, str | None]:
     """Send a single prompt to the AI.  Returns ``(text, error)``.
 
@@ -62,7 +67,14 @@ def call_ai(
     ``error`` is a human-readable message suitable for emitting to the UI.
     A cancellation returns ``(None, None)`` so the caller can distinguish
     "cancelled" from "errored".
+
+    Local (Ollama) models ignore ``api_key`` and route through
+    :func:`_call_local`; ``db`` is threaded down so the Ollama host can be
+    read from the global ``ollama_host`` setting.
     """
+    if is_local_model(model):
+        return _call_local(model, system_prompt, user_message, max_tokens, cancel_check, db)
+
     is_gemini = is_gemini_model(model)
 
     if is_gemini and not GEMINI_AVAILABLE:
@@ -78,6 +90,15 @@ def call_ai(
     if is_gemini:
         return _call_gemini(client, model, system_prompt, user_message, max_tokens, cancel_check)
     return _call_anthropic(client, model, system_prompt, user_message, max_tokens, cancel_check)
+
+
+def _call_local(model, system_prompt, user_message, max_tokens, cancel_check, db=None) -> tuple[str | None, str | None]:
+    """Route a single prompt to the local Ollama model."""
+    from .local_llm import ollama_chat
+    return ollama_chat(
+        model=model, system_prompt=system_prompt, user_message=user_message,
+        max_tokens=max_tokens, cancel_check=cancel_check, db=db,
+    )
 
 
 def _call_anthropic(client, model, system_prompt, user_message, max_tokens, cancel_check) -> tuple[str | None, str | None]:
@@ -162,6 +183,9 @@ def load_ai_api_key(db, model: str) -> tuple[str | None, str | None]:
 
     Reads the global ``api_keys_json`` setting (shared across profiles),
     matching ``verify_worker``.
+
+    Only resolves cloud (Gemini/Anthropic) keys.  Callers must gate on
+    ``is_local_model(model)`` themselves for local models, which need no key.
     """
     import json
     raw = db.get_global_setting('api_keys_json') or '{}'
@@ -175,3 +199,55 @@ def load_ai_api_key(db, model: str) -> tuple[str | None, str | None]:
         provider = 'Gemini' if is_gemini_model(model) else 'Anthropic'
         return None, f"No {provider} API key found. Open Settings → API Keys."
     return api_key, None
+
+
+def prepare_verify(db, model: str) -> tuple[bool, str, str, str]:
+    """Pre-flight checks for an AI verify run.
+
+    Returns ``(ok, error_title, error_message, community_description)``.
+    On success ``ok`` is True, the two error fields are empty, and
+    ``community_description`` is ready to hand to :class:`VerifyWorker`.
+    On failure ``ok`` is False and ``error_title`` / ``error_message``
+    describe the first failing check; the caller shows them to the user.
+
+    Centralises the SDK-availability / community-description / API-key checks
+    that the dashboard's ``_start_ai_verify`` used to do inline, so the
+    per-creator Verify button in Media History can share them.  Local
+    (Ollama) models skip the SDK and key checks — the worker surfaces
+    "Ollama is not running" on the first request.
+    """
+    is_gemini = is_gemini_model(model)
+    is_local = is_local_model(model)
+
+    if not is_local:
+        if is_gemini:
+            if not GEMINI_AVAILABLE:
+                return (
+                    False, 'Package Missing',
+                    "The 'google-genai' Python package is not installed.\n"
+                    "Install it with: pip install google-genai", '',
+                )
+        elif not ANTHROPIC_AVAILABLE:
+            return (
+                False, 'Package Missing',
+                "The 'anthropic' Python package is not installed.\n"
+                "Install it with: pip install anthropic", '',
+            )
+
+    community_desc = (db.get_setting('community_description') or '').strip()
+    if not community_desc:
+        return (
+            False, 'No Community Description',
+            'Please enter a community description in Settings → Verify first.', '',
+        )
+
+    if not is_local:
+        api_key, err = load_ai_api_key(db, model)
+        if not api_key:
+            provider = 'Gemini' if is_gemini else 'Anthropic'
+            return (
+                False, f'No {provider} API Key',
+                err or f'Please enter your {provider} API key in Settings → API Keys first.', '',
+            )
+
+    return True, '', '', community_desc

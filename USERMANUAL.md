@@ -584,10 +584,11 @@ See [Working with Profiles](#working-with-profiles) above.
 See [Roles](#roles) above.
 
 ### Appearance
-- **Theme** — Pick the colour scheme for the whole app. The default **Default (Kleos Soft)** is a light red-and-white palette matching the Kleos website (thoria.fyi/Kleos). Other options include **Midnight Blue** (the previous dark default), **Biophilic**, **Frutiger Aero**, **DORFic**, **Indigo Citrus**, and **Y2K Futurism**. A colour-swatch preview updates as you change the selection; click **Apply** to switch. The HTML report export uses whichever theme is active.
+- **Theme** — Pick the colour scheme for the whole app. The default **DORFic** is an industrial minimalist black/white + orange palette. Other options include **Midnight Blue**, **Biophilic**, **Frutiger Aero**, **Indigo Citrus**, and **Y2K Futurism**. A colour-swatch preview updates as you change the selection; click **Apply** to switch. The HTML report export uses whichever theme is active.
 - **Thumbnail Quality** — Choose between Low (uses cached thumbnails, faster) or High (re-downloads original thumbnails, sharper but slower).
 
 ### Notifications
+- **Enable notifications** — Master toggle for the whole notifications feature. Off by default; turn it on to receive milestone, rapid-growth, and inactivity alerts. When off, no alerts are evaluated or shown, and the settings below have no effect until you switch it back on.
 - **View Count Alert Thresholds** — Comma-separated numbers (for example, `10000,100000,1000000`). Kleos will notify you when a creator's total views cross each threshold.
 - **Subscriber Milestones** — Informational display showing the fixed milestones (1K, 5K, etc.).
 - **Reset All Triggered Alerts** — Clears all previously-triggered alerts so they can fire again on the next data refresh.
